@@ -6,6 +6,8 @@ Developed with OpenAI codex
 
 ## Overview
 
+<!-- HUMAN -->
+
 A blockchain models a distributed ledger of transactions transferring coins
 between participants. Validation rules prevent double spends, and proof-of-work
 makes it costly to replace a chain with a conflicting one. This allows the
@@ -32,6 +34,8 @@ https://bitcoin.org/bitcoin.pdf
 
 See [design](docs/design.md).
 
+<!-- END HUMAN -->
+
 ## CLI
 
 The current CLI is intentionally small:
@@ -40,6 +44,7 @@ The current CLI is intentionally small:
 wobble init <snapshot>
 wobble info <snapshot>
 wobble utxos <snapshot>
+wobble submit-payment <snapshot> <sender_lock_tag> <recipient_lock_tag> <amount> <uniqueness>
 wobble submit-transfer <snapshot> <txid> <vout> <amount> <uniqueness> <lock_tag>
 wobble mine-coinbase <snapshot> <reward> <uniqueness> [bits]
 wobble mine-pending <snapshot> <reward> <uniqueness> <max_transactions> [bits]
@@ -51,7 +56,7 @@ Example:
 wobble init /tmp/wobble.bin
 wobble mine-coinbase /tmp/wobble.bin 50 0
 wobble utxos /tmp/wobble.bin
-wobble submit-transfer /tmp/wobble.bin <txid> 0 30 1 99
+wobble submit-payment /tmp/wobble.bin 0 99 30 1
 wobble mine-pending /tmp/wobble.bin 50 2 100
 wobble info /tmp/wobble.bin
 ```
