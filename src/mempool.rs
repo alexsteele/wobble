@@ -1,10 +1,11 @@
 //! In-memory pool of transactions waiting to be mined into a block.
 //!
 //! The mempool admits only transactions that are valid against the current
-//! active UTXO set and that do not conflict with other pending transactions by
-//! spending the same input. It does not yet support package acceptance or
-//! parent-child dependency chains, so every admitted transaction must stand on
-//! its own against the active chain state.
+//! active UTXO set. If a new transaction conflicts with a pending transaction,
+//! it may replace that transaction only when it spends exactly the same input
+//! set and pays a strictly higher fee. It does not yet support package
+//! acceptance or parent-child dependency chains, so every admitted transaction
+//! must stand on its own against the active chain state.
 
 use std::collections::HashMap;
 
@@ -19,6 +20,7 @@ use crate::{
 pub enum MempoolError {
     DuplicateTransaction(Txid),
     ConflictingInput(OutPoint),
+    ReplacementFeeTooLow { existing: u64, replacement: u64 },
     InvalidTransaction(ValidationError),
 }
 
@@ -48,8 +50,13 @@ impl Mempool {
     /// Validates `tx` against the current active UTXO state before admission.
     ///
     /// Admission rejects duplicate transaction ids, transactions that fail
-    /// active-chain validation, and transactions whose inputs are already
-    /// claimed by another pending transaction.
+    /// active-chain validation, and transactions with non-replaceable input
+    /// conflicts against existing mempool entries.
+    ///
+    /// If a new transaction spends exactly the same inputs as an existing
+    /// pending transaction, the higher-fee transaction wins and replaces the
+    /// lower-fee one. Partial-overlap conflicts are still rejected because the
+    /// mempool does not track dependency packages or more advanced policy.
     ///
     /// Gap: this does not yet admit dependent transactions whose parents live
     /// only in the mempool.
@@ -59,19 +66,39 @@ impl Mempool {
             return Err(MempoolError::DuplicateTransaction(txid));
         }
 
-        utxos
-            .validate_transaction(&tx)
+        let replacement_fee = utxos
+            .transaction_fee(&tx)
             .map_err(MempoolError::InvalidTransaction)?;
-        for input in &tx.inputs {
-            if self.transactions.values().any(|pending| {
-                pending
-                    .inputs
-                    .iter()
-                    .any(|spent| spent.previous_output == input.previous_output)
-            }) {
-                return Err(MempoolError::ConflictingInput(input.previous_output));
+        let conflicting_ids = self.conflicting_transactions(&tx);
+        if !conflicting_ids.is_empty() {
+            if !self.conflicts_are_replaceable(&tx, &conflicting_ids) {
+                let outpoint = first_conflicting_input(&tx, &self.transactions)
+                    .expect("conflicting transaction set should expose an input");
+                return Err(MempoolError::ConflictingInput(outpoint));
             }
+
+            let existing_fee = conflicting_ids
+                .iter()
+                .map(|existing_txid| {
+                    let pending = self
+                        .transactions
+                        .get(existing_txid)
+                        .expect("conflicting transaction must exist");
+                    utxos
+                        .transaction_fee(pending)
+                        .expect("pending transactions should remain valid against active UTXOs")
+                })
+                .max()
+                .expect("replaceable conflicts should include at least one transaction");
+            if replacement_fee <= existing_fee {
+                return Err(MempoolError::ReplacementFeeTooLow {
+                    existing: existing_fee,
+                    replacement: replacement_fee,
+                });
+            }
+            self.remove_many(&conflicting_ids);
         }
+
         self.transactions.insert(txid, tx);
         Ok(txid)
     }
@@ -122,6 +149,24 @@ impl Mempool {
     pub fn prune_invalid(&mut self, utxos: &UtxoSet) {
         self.transactions
             .retain(|_, tx| utxos.validate_transaction(tx).is_ok());
+    }
+
+    fn conflicting_transactions(&self, tx: &Transaction) -> Vec<Txid> {
+        self.transactions
+            .iter()
+            .filter(|(_, pending)| transactions_conflict(tx, pending))
+            .map(|(txid, _)| *txid)
+            .collect()
+    }
+
+    fn conflicts_are_replaceable(&self, tx: &Transaction, conflicting_ids: &[Txid]) -> bool {
+        conflicting_ids.iter().all(|txid| {
+            let pending = self
+                .transactions
+                .get(txid)
+                .expect("conflicting transaction must exist");
+            same_input_set(tx, pending)
+        })
     }
 
     pub fn remove_many(&mut self, txids: &[Txid]) {
@@ -176,6 +221,33 @@ mod tests {
         tx
     }
 
+    fn tx_with_inputs(inputs: Vec<OutPoint>, value: u64, uniqueness: u32) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: inputs
+                .into_iter()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    unlocking_data: Vec::new(),
+                })
+                .collect(),
+            outputs: vec![TxOut {
+                value,
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
+            }],
+            lock_time: uniqueness,
+        };
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
+        let signature = crypto::sign_message(&signing_key, &tx.signing_digest()).to_vec();
+        for input in &mut tx.inputs {
+            input.unlocking_data = signature.clone();
+        }
+        tx
+    }
+
     #[test]
     fn admits_valid_transaction() {
         let utxo = spendable_utxo(10);
@@ -208,19 +280,68 @@ mod tests {
 
     #[test]
     fn rejects_transaction_that_conflicts_with_pending_input() {
-        let utxo = spendable_utxo(10);
+        let left_utxo = spendable_utxo(10);
+        let right_utxo = Utxo {
+            outpoint: OutPoint {
+                txid: Txid::new([0x20; 32]),
+                vout: 0,
+            },
+            output: left_utxo.output.clone(),
+            created_at_height: 1,
+            is_coinbase: false,
+        };
         let mut utxos = crate::state::UtxoSet::new();
-        utxos.insert(utxo.clone());
+        utxos.insert(left_utxo.clone());
+        utxos.insert(right_utxo.clone());
         let mut mempool = Mempool::new();
-        let left = tx(utxo.outpoint, 6, 1);
-        let right = tx(utxo.outpoint, 6, 2);
+        let left = tx(left_utxo.outpoint, 6, 1);
+        let right = tx_with_inputs(vec![left_utxo.outpoint, right_utxo.outpoint], 12, 2);
 
         mempool.submit(&utxos, left.clone()).unwrap();
 
         assert_eq!(
             mempool.submit(&utxos, right.clone()),
-            Err(MempoolError::ConflictingInput(utxo.outpoint))
+            Err(MempoolError::ConflictingInput(left_utxo.outpoint))
         );
+    }
+
+    #[test]
+    fn replaces_pending_transaction_with_higher_fee_on_same_inputs() {
+        let utxo = spendable_utxo(10);
+        let mut utxos = crate::state::UtxoSet::new();
+        utxos.insert(utxo.clone());
+        let mut mempool = Mempool::new();
+        let lower_fee = tx(utxo.outpoint, 9, 1);
+        let higher_fee = tx(utxo.outpoint, 7, 2);
+
+        mempool.submit(&utxos, lower_fee.clone()).unwrap();
+        let replacement_id = mempool.submit(&utxos, higher_fee.clone()).unwrap();
+
+        assert_eq!(replacement_id, higher_fee.txid());
+        assert_eq!(mempool.len(), 1);
+        assert!(mempool.get(&lower_fee.txid()).is_none());
+        assert!(mempool.get(&higher_fee.txid()).is_some());
+    }
+
+    #[test]
+    fn rejects_replacement_when_fee_is_not_higher() {
+        let utxo = spendable_utxo(10);
+        let mut utxos = crate::state::UtxoSet::new();
+        utxos.insert(utxo.clone());
+        let mut mempool = Mempool::new();
+        let existing = tx(utxo.outpoint, 8, 1);
+        let replacement = tx(utxo.outpoint, 8, 2);
+
+        mempool.submit(&utxos, existing.clone()).unwrap();
+
+        assert_eq!(
+            mempool.submit(&utxos, replacement),
+            Err(MempoolError::ReplacementFeeTooLow {
+                existing: 2,
+                replacement: 2,
+            })
+        );
+        assert!(mempool.get(&existing.txid()).is_some());
     }
 
     #[test]
@@ -261,4 +382,40 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected_ids.len(), 1);
     }
+}
+
+fn transactions_conflict(left: &Transaction, right: &Transaction) -> bool {
+    left.inputs.iter().any(|left_input| {
+        right
+            .inputs
+            .iter()
+            .any(|right_input| right_input.previous_output == left_input.previous_output)
+    })
+}
+
+fn same_input_set(left: &Transaction, right: &Transaction) -> bool {
+    left.inputs.len() == right.inputs.len()
+        && left.inputs.iter().all(|left_input| {
+            right
+                .inputs
+                .iter()
+                .any(|right_input| right_input.previous_output == left_input.previous_output)
+        })
+}
+
+fn first_conflicting_input(
+    tx: &Transaction,
+    pending: &HashMap<Txid, Transaction>,
+) -> Option<OutPoint> {
+    for input in &tx.inputs {
+        if pending.values().any(|other| {
+            other
+                .inputs
+                .iter()
+                .any(|spent| spent.previous_output == input.previous_output)
+        }) {
+            return Some(input.previous_output);
+        }
+    }
+    None
 }
