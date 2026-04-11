@@ -13,8 +13,8 @@ use crate::crypto;
 #[derive(Debug)]
 pub enum AliasError {
     Io(io::Error),
-    Encode(bincode::error::EncodeError),
-    Decode(bincode::error::DecodeError),
+    Serialize(serde_json::Error),
+    Parse(serde_json::Error),
     InvalidPublicKey,
     UnknownAlias(String),
 }
@@ -25,16 +25,18 @@ impl From<io::Error> for AliasError {
     }
 }
 
-impl From<bincode::error::EncodeError> for AliasError {
-    fn from(error: bincode::error::EncodeError) -> Self {
-        Self::Encode(error)
+impl From<serde_json::Error> for AliasError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Parse(error)
     }
 }
 
-impl From<bincode::error::DecodeError> for AliasError {
-    fn from(error: bincode::error::DecodeError) -> Self {
-        Self::Decode(error)
-    }
+/// Human-readable alias file stored as JSON.
+///
+/// Keys are alias names and values are hex-encoded 32-byte Ed25519 public keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AliasFile {
+    entries: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -68,16 +70,43 @@ impl AliasBook {
 }
 
 pub fn save_alias_book(path: &Path, book: &AliasBook) -> Result<(), AliasError> {
-    let bytes = bincode::serde::encode_to_vec(book, bincode::config::standard())?;
-    fs::write(path, bytes)?;
+    let file = AliasFile {
+        entries: book
+            .entries
+            .iter()
+            .map(|(alias, bytes)| (alias.clone(), encode_public_key(*bytes)))
+            .collect(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(AliasError::Serialize)?;
+    fs::write(path, json)?;
     Ok(())
 }
 
 pub fn load_alias_book(path: &Path) -> Result<AliasBook, AliasError> {
-    let bytes = fs::read(path)?;
-    let (book, _): (AliasBook, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
-    Ok(book)
+    let json = fs::read_to_string(path)?;
+    let file: AliasFile = serde_json::from_str(&json).map_err(AliasError::Parse)?;
+    let mut entries = BTreeMap::new();
+    for (alias, value) in file.entries {
+        let bytes = parse_public_key_hex(&value)?;
+        entries.insert(alias, bytes);
+    }
+    Ok(AliasBook { entries })
+}
+
+fn encode_public_key(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn parse_public_key_hex(value: &str) -> Result<[u8; 32], AliasError> {
+    if value.len() != 64 {
+        return Err(AliasError::InvalidPublicKey);
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).map_err(|_| AliasError::InvalidPublicKey)?;
+        bytes[index] = u8::from_str_radix(hex, 16).map_err(|_| AliasError::InvalidPublicKey)?;
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -99,7 +128,7 @@ mod tests {
             .expect("system time is after unix epoch")
             .as_nanos();
         path.push(format!(
-            "wobble-alias-test-{}-{}.bin",
+            "wobble-alias-test-{}-{}.json",
             std::process::id(),
             nanos
         ));
@@ -118,5 +147,20 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert_eq!(loaded.resolve("recipient").unwrap(), recipient);
+    }
+
+    #[test]
+    fn alias_book_is_human_readable_json() {
+        let mut book = AliasBook::new();
+        let recipient = crypto::generate_signing_key().verifying_key();
+        book.insert("recipient".to_string(), recipient);
+
+        let path = temp_alias_path();
+        save_alias_book(&path, &book).unwrap();
+        let json = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(json.contains("\"entries\""));
+        assert!(json.contains("\"recipient\""));
     }
 }

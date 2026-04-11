@@ -49,7 +49,9 @@ wobble balance <sqlite_path> <public_key>
 wobble utxos <sqlite_path>
 wobble generate-key
 wobble create-wallet <wallet_path>
+wobble wallet-address [--home <dir>]
 wobble wallet-address <wallet_path>
+wobble wallet-balance [--home <dir>]
 wobble wallet-balance <sqlite_path> <wallet_path>
 wobble create-alias-book <alias_book>
 wobble alias-add <alias_book> <name> <public_key>
@@ -58,9 +60,12 @@ wobble serve <listen_addr> <network> [--home <dir>] [--node_name <name>] [--peer
 wobble get-tip <peer_addr> <network> [--node_name <name>]
 wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]
 wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]
+wobble submit-payment <recipient_public_key|@alias_book:name> <amount> <uniqueness> [--home <dir>]
 wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>
 wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>
+wobble mine-coinbase <reward> [uniqueness] [bits] [--home <dir>]
 wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]
+wobble mine-pending <reward> <uniqueness> <max_transactions> [bits] [--home <dir>]
 wobble mine-pending <sqlite_path> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]
 ```
 
@@ -69,15 +74,16 @@ Example:
 ```shell
 wobble init
 wobble create-wallet /tmp/recipient.wallet
-wobble create-alias-book /tmp/recipients.aliases
+wobble wallet-address
 wobble wallet-address /tmp/recipient.wallet
-wobble alias-add /tmp/recipients.aliases recipient <recipient_public_key>
-wobble mine-coinbase ~/.wobble/node.sqlite 50 ~/.wobble/wallet.bin 0
-wobble wallet-balance ~/.wobble/node.sqlite ~/.wobble/wallet.bin
+wobble create-alias-book /tmp/recipients.json
+wobble alias-add /tmp/recipients.json recipient <recipient_public_key>
+wobble mine-coinbase 50
+wobble wallet-balance
 wobble utxos ~/.wobble/node.sqlite
-wobble submit-payment ~/.wobble/node.sqlite ~/.wobble/wallet.bin @/tmp/recipients.aliases:recipient 30 1
-wobble mine-pending ~/.wobble/node.sqlite 50 ~/.wobble/wallet.bin 2 100
-wobble wallet-balance ~/.wobble/node.sqlite ~/.wobble/wallet.bin
+wobble submit-payment @/tmp/recipients.json:recipient 30 1
+wobble mine-pending 50 2 100
+wobble wallet-balance
 wobble wallet-balance ~/.wobble/node.sqlite /tmp/recipient.wallet
 wobble info ~/.wobble/node.sqlite
 ```
@@ -85,7 +91,7 @@ wobble info ~/.wobble/node.sqlite
 `wobble init` creates a default node home at `~/.wobble` with:
 - `node.sqlite`
 - `wallet.bin`
-- `aliases.bin`
+- `aliases.json`
 - `peers.json`
 
 Peer bootstrap file example:

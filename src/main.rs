@@ -135,13 +135,9 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "wallet-address" => {
-            if args.len() != 3 {
-                return Err(usage());
-            }
-
-            let path = Path::new(&args[2]);
+            let path = parse_wallet_address_path(&args[2..])?;
             let wallet =
-                wallet::load_wallet(path).map_err(|err| format!("wallet load failed: {err:?}"))?;
+                wallet::load_wallet(&path).map_err(|err| format!("wallet load failed: {err:?}"))?;
             println!(
                 "{}",
                 encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
@@ -149,15 +145,10 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "wallet-balance" => {
-            if args.len() != 4 {
-                return Err(usage());
-            }
-
-            let sqlite_path = Path::new(&args[2]);
-            let wallet_path = Path::new(&args[3]);
-            let wallet = wallet::load_wallet(wallet_path)
+            let local = parse_wallet_balance_paths(&args[2..])?;
+            let wallet = wallet::load_wallet(&local.wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let state = load_sqlite_state(sqlite_path)?;
+            let state = load_sqlite_state(&local.state_path)?;
             println!("{}", state.balance_for_key(&wallet.verifying_key()));
             Ok(())
         }
@@ -476,59 +467,42 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "submit-payment" => {
-            if args.len() != 7 {
-                return Err(usage());
-            }
-
-            let path = Path::new(&args[2]);
-            let sender_wallet_path = Path::new(&args[3]);
-            let recipient_verifying_key = parse_public_key_or_alias(&args[4])?;
-            let amount = parse_u64(&args[5], "amount")?;
-            let uniqueness = parse_u32(&args[6], "uniqueness")?;
-            let sender_wallet = wallet::load_wallet(sender_wallet_path)
+            let parsed = parse_local_submit_payment_args(&args[2..])?;
+            let recipient_verifying_key = parse_public_key_or_alias(&parsed.recipient)?;
+            let sender_wallet = wallet::load_wallet(&parsed.wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state = load_sqlite_state(path)?;
+            let mut state = load_sqlite_state(&parsed.state_path)?;
             let submitted = state
                 .submit_payment(
                     sender_wallet.signing_key(),
                     &recipient_verifying_key,
-                    amount,
-                    uniqueness,
+                    parsed.amount,
+                    parsed.uniqueness,
                 )
                 .map_err(|err| format!("submit failed: {err:?}"))?;
-            save_sqlite_state(path, &state)?;
+            save_sqlite_state(&parsed.state_path, &state)?;
 
             println!("queued payment {}", submitted);
             println!("mempool txs: {}", state.mempool().len());
             Ok(())
         }
         "mine-coinbase" => {
-            if args.len() != 5 && args.len() != 6 {
-                return Err(usage());
-            }
-
-            let path = Path::new(&args[2]);
-            let reward = parse_u64(&args[3], "reward")?;
-            let miner_wallet_path = Path::new(&args[4]);
-            let uniqueness = if args.len() == 6 {
-                parse_u32(&args[5], "uniqueness")?
-            } else {
-                0
-            };
-            let bits = if let Some(raw_bits) = args.get(6) {
-                parse_bits(raw_bits)?
-            } else {
-                0x207f_ffff
-            };
-            let miner_wallet = wallet::load_wallet(miner_wallet_path)
+            let parsed = parse_local_mine_coinbase_args(&args[2..])?;
+            let miner_wallet = wallet::load_wallet(&parsed.wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state = load_sqlite_state(path)?;
+            let mut state = load_sqlite_state(&parsed.state_path)?;
             let block_hash = state
-                .mine_block(reward, &miner_wallet.verifying_key(), uniqueness, bits, 0)
+                .mine_block(
+                    parsed.reward,
+                    &miner_wallet.verifying_key(),
+                    parsed.uniqueness,
+                    parsed.bits,
+                    0,
+                )
                 .map_err(|err| format!("block rejected: {err:?}"))?;
-            save_sqlite_state(path, &state)?;
+            save_sqlite_state(&parsed.state_path, &state)?;
 
             println!("mined block {}", block_hash);
             println!("new best tip: {}", format_hash(state.chain().best_tip()));
@@ -539,36 +513,21 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "mine-pending" => {
-            if args.len() != 7 && args.len() != 8 {
-                return Err(usage());
-            }
-
-            let path = Path::new(&args[2]);
-            let reward = parse_u64(&args[3], "reward")?;
-            let miner_wallet_path = Path::new(&args[4]);
-            let uniqueness = parse_u32(&args[5], "uniqueness")?;
-            let max_transactions = args[6]
-                .parse::<usize>()
-                .map_err(|_| format!("invalid max_transactions: {}", args[6]))?;
-            let bits = if let Some(raw_bits) = args.get(7) {
-                parse_bits(raw_bits)?
-            } else {
-                0x207f_ffff
-            };
-            let miner_wallet = wallet::load_wallet(miner_wallet_path)
+            let parsed = parse_local_mine_pending_args(&args[2..])?;
+            let miner_wallet = wallet::load_wallet(&parsed.wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state = load_sqlite_state(path)?;
+            let mut state = load_sqlite_state(&parsed.state_path)?;
             let block_hash = state
                 .mine_block(
-                    reward,
+                    parsed.reward,
                     &miner_wallet.verifying_key(),
-                    uniqueness,
-                    bits,
-                    max_transactions,
+                    parsed.uniqueness,
+                    parsed.bits,
+                    parsed.max_transactions,
                 )
                 .map_err(|err| format!("block rejected: {err:?}"))?;
-            save_sqlite_state(path, &state)?;
+            save_sqlite_state(&parsed.state_path, &state)?;
 
             println!("mined block {}", block_hash);
             println!("new best tip: {}", format_hash(state.chain().best_tip()));
@@ -589,7 +548,9 @@ fn usage() -> String {
         "  wobble utxos <sqlite_path>",
         "  wobble generate-key",
         "  wobble create-wallet <wallet_path>",
+        "  wobble wallet-address [--home <dir>]",
         "  wobble wallet-address <wallet_path>",
+        "  wobble wallet-balance [--home <dir>]",
         "  wobble wallet-balance <sqlite_path> <wallet_path>",
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
@@ -598,9 +559,12 @@ fn usage() -> String {
         "  wobble get-tip <peer_addr> <network> [--node_name <name>]",
         "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]",
         "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]",
+        "  wobble submit-payment <recipient_public_key|@alias_book:name> <amount> <uniqueness> [--home <dir>]",
         "  wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
+        "  wobble mine-coinbase <reward> [uniqueness] [bits] [--home <dir>]",
         "  wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]",
+        "  wobble mine-pending <reward> <uniqueness> <max_transactions> [bits] [--home <dir>]",
         "  wobble mine-pending <sqlite_path> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
     ]
     .join("\n")
@@ -754,11 +718,203 @@ fn parse_optional_home_flag(args: &[String]) -> Result<Option<PathBuf>, String> 
     }
 }
 
+fn split_trailing_optional_home_flag(
+    args: &[String],
+) -> Result<(&[String], Option<PathBuf>), String> {
+    match args {
+        [rest @ .., flag, value] if flag == "--home" => Ok((rest, Some(PathBuf::from(value)))),
+        [rest @ .., flag] if flag == "--home" => Err("missing value for --home".to_string()),
+        _ => Ok((args, None)),
+    }
+}
+
 fn resolve_node_home(path: Option<&Path>) -> Result<NodeHome, String> {
     match path {
         Some(path) => Ok(NodeHome::new(path)),
         None => NodeHome::from_default_dir().map_err(|err| format!("home resolve failed: {err:?}")),
     }
+}
+
+#[derive(Debug, Clone)]
+struct LocalNodePaths {
+    state_path: PathBuf,
+    wallet_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LocalSubmitPaymentArgs {
+    state_path: PathBuf,
+    wallet_path: PathBuf,
+    recipient: String,
+    amount: u64,
+    uniqueness: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LocalMineCoinbaseArgs {
+    state_path: PathBuf,
+    wallet_path: PathBuf,
+    reward: u64,
+    uniqueness: u32,
+    bits: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LocalMinePendingArgs {
+    state_path: PathBuf,
+    wallet_path: PathBuf,
+    reward: u64,
+    uniqueness: u32,
+    max_transactions: usize,
+    bits: u32,
+}
+
+// TODO: The local command parsing is still more complicated than it should be.
+// Consolidate the explicit-path and home-default forms behind a smaller shared
+// command model instead of maintaining several shape-specific helpers here.
+fn resolve_local_node_paths(home_override: Option<&Path>) -> Result<LocalNodePaths, String> {
+    let home = resolve_node_home(home_override)?;
+    Ok(LocalNodePaths {
+        state_path: home.state_path(),
+        wallet_path: home.wallet_path(),
+    })
+}
+
+fn parse_wallet_address_path(args: &[String]) -> Result<PathBuf, String> {
+    match args {
+        [] => Ok(resolve_local_node_paths(None)?.wallet_path),
+        [flag] if flag == "--home" => Err("missing value for --home".to_string()),
+        [flag, value] if flag == "--home" => {
+            Ok(resolve_local_node_paths(Some(Path::new(value)))?.wallet_path)
+        }
+        [path] => Ok(PathBuf::from(path)),
+        _ => Err(usage()),
+    }
+}
+
+fn parse_wallet_balance_paths(args: &[String]) -> Result<LocalNodePaths, String> {
+    match args {
+        [] => resolve_local_node_paths(None),
+        [flag, value] if flag == "--home" => resolve_local_node_paths(Some(Path::new(value))),
+        [sqlite_path, wallet_path] => Ok(LocalNodePaths {
+            state_path: PathBuf::from(sqlite_path),
+            wallet_path: PathBuf::from(wallet_path),
+        }),
+        [flag] if flag == "--home" => Err("missing value for --home".to_string()),
+        _ => Err(usage()),
+    }
+}
+
+fn parse_submit_payment_paths(args: &[String]) -> Result<(LocalNodePaths, &[String]), String> {
+    let (command_args, home_override) = split_trailing_optional_home_flag(args)?;
+    if command_args.len() == 3 {
+        return Ok((
+            resolve_local_node_paths(home_override.as_deref())?,
+            command_args,
+        ));
+    }
+    if args.len() == 5 && args.get(3).map(String::as_str) != Some("--home") {
+        return Ok((
+            LocalNodePaths {
+                state_path: PathBuf::from(&args[0]),
+                wallet_path: PathBuf::from(&args[1]),
+            },
+            &args[2..],
+        ));
+    }
+    Err(usage())
+}
+
+fn parse_local_submit_payment_args(args: &[String]) -> Result<LocalSubmitPaymentArgs, String> {
+    let (local, command_args) = parse_submit_payment_paths(args)?;
+    Ok(LocalSubmitPaymentArgs {
+        state_path: local.state_path,
+        wallet_path: local.wallet_path,
+        recipient: command_args[0].clone(),
+        amount: parse_u64(&command_args[1], "amount")?,
+        uniqueness: parse_u32(&command_args[2], "uniqueness")?,
+    })
+}
+
+fn parse_local_mine_coinbase_args(args: &[String]) -> Result<LocalMineCoinbaseArgs, String> {
+    let (command_args, home_override) = split_trailing_optional_home_flag(args)?;
+    let (local, reward_arg, uniqueness_arg, bits_arg) =
+        if !command_args.is_empty() && parse_u64(&command_args[0], "reward").is_ok() {
+            if command_args.len() > 3 {
+                return Err(usage());
+            }
+            (
+                resolve_local_node_paths(home_override.as_deref())?,
+                &command_args[0],
+                command_args.get(1),
+                command_args.get(2),
+            )
+        } else if (3..=5).contains(&command_args.len()) {
+            (
+                LocalNodePaths {
+                    state_path: PathBuf::from(&command_args[0]),
+                    wallet_path: PathBuf::from(&command_args[2]),
+                },
+                &command_args[1],
+                command_args.get(3),
+                command_args.get(4),
+            )
+        } else {
+            return Err(usage());
+        };
+    Ok(LocalMineCoinbaseArgs {
+        state_path: local.state_path,
+        wallet_path: local.wallet_path,
+        reward: parse_u64(reward_arg, "reward")?,
+        uniqueness: uniqueness_arg
+            .map(|value| parse_u32(value, "uniqueness"))
+            .transpose()?
+            .unwrap_or(0),
+        bits: bits_arg
+            .map(|value| parse_bits(value))
+            .transpose()?
+            .unwrap_or(0x207f_ffff),
+    })
+}
+
+fn parse_local_mine_pending_args(args: &[String]) -> Result<LocalMinePendingArgs, String> {
+    let (command_args, home_override) = split_trailing_optional_home_flag(args)?;
+    let (local, reward_arg, uniqueness_arg, max_transactions_arg, bits_arg) =
+        if command_args.len() == 3 || command_args.len() == 4 {
+            (
+                resolve_local_node_paths(home_override.as_deref())?,
+                &command_args[0],
+                &command_args[1],
+                &command_args[2],
+                command_args.get(3),
+            )
+        } else if command_args.len() == 5 || command_args.len() == 6 {
+            (
+                LocalNodePaths {
+                    state_path: PathBuf::from(&command_args[0]),
+                    wallet_path: PathBuf::from(&command_args[2]),
+                },
+                &command_args[1],
+                &command_args[3],
+                &command_args[4],
+                command_args.get(5),
+            )
+        } else {
+            return Err(usage());
+        };
+    Ok(LocalMinePendingArgs {
+        state_path: local.state_path,
+        wallet_path: local.wallet_path,
+        reward: parse_u64(reward_arg, "reward")?,
+        uniqueness: parse_u32(uniqueness_arg, "uniqueness")?,
+        max_transactions: max_transactions_arg
+            .parse::<usize>()
+            .map_err(|_| format!("invalid max_transactions: {max_transactions_arg}"))?,
+        bits: bits_arg
+            .map(|value| parse_bits(value))
+            .transpose()?
+            .unwrap_or(0x207f_ffff),
+    })
 }
 
 /// Parses an optional `--node_name <name>` flag used by remote CLI commands.

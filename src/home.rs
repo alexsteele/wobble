@@ -23,7 +23,7 @@ use crate::{
 pub const DEFAULT_HOME_DIRNAME: &str = ".wobble";
 const STATE_FILENAME: &str = "node.sqlite";
 const WALLET_FILENAME: &str = "wallet.bin";
-const ALIASES_FILENAME: &str = "aliases.bin";
+const ALIASES_FILENAME: &str = "aliases.json";
 const PEERS_FILENAME: &str = "peers.json";
 
 /// Errors returned while resolving or initializing a node home.
@@ -175,7 +175,7 @@ mod tests {
         );
         assert_eq!(
             home.aliases_path(),
-            std::path::PathBuf::from("/tmp/wobble-node/aliases.bin")
+            std::path::PathBuf::from("/tmp/wobble-node/aliases.json")
         );
         assert_eq!(
             home.peers_path(),
