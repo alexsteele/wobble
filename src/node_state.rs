@@ -1,8 +1,8 @@
 //! Integrated in-memory node state for the active chain tip.
 //!
 //! This module combines the chain index and active UTXO set so a node can
-//! accept blocks and advance the current best chain. Side branches are indexed,
-//! but reorging UTXO state onto a new best branch is not implemented yet.
+//! accept blocks and advance the current best chain. It keeps an in-memory
+//! UTXO snapshot per indexed block so the active view can switch across forks.
 
 use std::collections::HashMap;
 
@@ -10,7 +10,7 @@ use crate::{
     chain::{ChainError, ChainIndex},
     consensus::{self, ConsensusError},
     state::UtxoSet,
-    types::{Block, BlockHash},
+    types::{Block, BlockHash, BlockHeight},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,10 +18,7 @@ pub enum NodeStateError {
     Chain(ChainError),
     Consensus(ConsensusError),
     MissingIndexedBlock(BlockHash),
-    ReorgRequired {
-        from: Option<BlockHash>,
-        to: BlockHash,
-    },
+    MissingParentState(BlockHash),
 }
 
 /// Tracks indexed blocks together with the active-chain UTXO view.
@@ -30,6 +27,7 @@ pub struct NodeState {
     chain: ChainIndex,
     active_utxos: UtxoSet,
     blocks: HashMap<BlockHash, Block>,
+    utxo_snapshots: HashMap<BlockHash, UtxoSet>,
 }
 
 impl NodeState {
@@ -49,48 +47,57 @@ impl NodeState {
         self.blocks.get(hash)
     }
 
-    /// Indexes `block` and applies it to active state if it extends the current best tip.
-    ///
-    /// If the block would make a side branch become best, the chain metadata is updated
-    /// but UTXO reorging is deferred and reported as `ReorgRequired`.
+    /// Indexes `block`, derives its UTXO state from its parent snapshot, and
+    /// updates the active view if this block becomes the best tip.
     pub fn accept_block(&mut self, block: Block) -> Result<(), NodeStateError> {
-        let previous_best = self.chain.best_tip();
         let entry = self
             .chain
             .insert_block(&block)
             .map_err(NodeStateError::Chain)?;
         let block_hash = entry.block_hash;
         self.blocks.entry(block_hash).or_insert(block);
+        self.ensure_snapshot(block_hash, entry.parent, entry.height)?;
 
-        let new_best = self.chain.best_tip();
-        if new_best != Some(block_hash) {
+        if self.chain.best_tip() == Some(block_hash) {
+            self.active_utxos = self
+                .utxo_snapshots
+                .get(&block_hash)
+                .ok_or(NodeStateError::MissingParentState(block_hash))?
+                .clone();
+        }
+
+        Ok(())
+    }
+
+    /// Materializes the UTXO view for `block_hash` by cloning its parent's
+    /// snapshot and applying the block at `height`.
+    fn ensure_snapshot(
+        &mut self,
+        block_hash: BlockHash,
+        parent: Option<BlockHash>,
+        height: BlockHeight,
+    ) -> Result<(), NodeStateError> {
+        if self.utxo_snapshots.contains_key(&block_hash) {
             return Ok(());
         }
 
-        match previous_best {
-            None => {
-                let best_block = self
-                    .blocks
-                    .get(&block_hash)
-                    .ok_or(NodeStateError::MissingIndexedBlock(block_hash))?;
-                consensus::apply_block(&mut self.active_utxos, best_block, entry.height)
-                    .map_err(NodeStateError::Consensus)?;
-                Ok(())
-            }
-            Some(previous_tip) if entry.parent == Some(previous_tip) => {
-                let best_block = self
-                    .blocks
-                    .get(&block_hash)
-                    .ok_or(NodeStateError::MissingIndexedBlock(block_hash))?;
-                consensus::apply_block(&mut self.active_utxos, best_block, entry.height)
-                    .map_err(NodeStateError::Consensus)?;
-                Ok(())
-            }
-            _ => Err(NodeStateError::ReorgRequired {
-                from: previous_best,
-                to: block_hash,
-            }),
-        }
+        let mut utxos = match parent {
+            None => UtxoSet::new(),
+            Some(parent_hash) => self
+                .utxo_snapshots
+                .get(&parent_hash)
+                .ok_or(NodeStateError::MissingParentState(parent_hash))?
+                .clone(),
+        };
+
+        let block = self
+            .blocks
+            .get(&block_hash)
+            .ok_or(NodeStateError::MissingIndexedBlock(block_hash))?;
+        consensus::apply_block(&mut utxos, block, height).map_err(NodeStateError::Consensus)?;
+        self.utxo_snapshots.insert(block_hash, utxos);
+
+        Ok(())
     }
 }
 
@@ -98,7 +105,7 @@ impl NodeState {
 mod tests {
     use crate::types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
 
-    use super::{NodeState, NodeStateError};
+    use super::NodeState;
 
     fn coinbase(value: u64, uniqueness: u32) -> Transaction {
         Transaction {
@@ -220,24 +227,27 @@ mod tests {
     }
 
     #[test]
-    fn reports_when_reorg_would_be_required() {
+    fn reorgs_active_utxos_when_better_branch_arrives() {
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
         let genesis_hash = genesis.header.block_hash();
         let easy_child = mine_block(genesis_hash, 0x207f_ffff, vec![coinbase(50, 1)]);
         let harder_child = mine_block(genesis_hash, 0x1f00ffff, vec![coinbase(50, 2)]);
-        let easy_hash = easy_child.header.block_hash();
         let harder_hash = harder_child.header.block_hash();
         let mut state = NodeState::new();
 
         state.accept_block(genesis).unwrap();
         state.accept_block(easy_child).unwrap();
+        state.accept_block(harder_child.clone()).unwrap();
 
-        assert_eq!(
-            state.accept_block(harder_child),
-            Err(NodeStateError::ReorgRequired {
-                from: Some(easy_hash),
-                to: harder_hash,
-            })
+        assert_eq!(state.chain().best_tip(), Some(harder_hash));
+        assert!(
+            state
+                .active_utxos()
+                .get(&OutPoint {
+                    txid: harder_child.transactions[0].txid(),
+                    vout: 0
+                })
+                .is_some()
         );
     }
 }

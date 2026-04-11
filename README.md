@@ -25,4 +25,6 @@ wins.
 
 A UTXO is an unspent coint. The current set of UTXOs form the chain state.
 
+https://bitcoin.org/bitcoin.pdf
+
 See [design](docs/design.md).
