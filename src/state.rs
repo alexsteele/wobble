@@ -47,6 +47,10 @@ impl UtxoSet {
         self.entries.get(outpoint)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&OutPoint, &Utxo)> {
+        self.entries.iter()
+    }
+
     pub fn insert(&mut self, utxo: Utxo) -> Option<Utxo> {
         self.entries.insert(utxo.outpoint, utxo)
     }

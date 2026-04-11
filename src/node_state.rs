@@ -11,14 +11,16 @@ use serde::{Deserialize, Serialize};
 use crate::{
     chain::{ChainError, ChainIndex},
     consensus::{self, ConsensusError},
+    mempool::{Mempool, MempoolError},
     state::UtxoSet,
-    types::{Block, BlockHash, BlockHeight},
+    types::{Block, BlockHash, BlockHeader, BlockHeight, OutPoint, Transaction, TxOut, Txid},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeStateError {
     Chain(ChainError),
     Consensus(ConsensusError),
+    Mempool(MempoolError),
     MissingIndexedBlock(BlockHash),
     MissingParentState(BlockHash),
 }
@@ -28,6 +30,7 @@ pub enum NodeStateError {
 pub struct NodeState {
     chain: ChainIndex,
     active_utxos: UtxoSet,
+    mempool: Mempool,
     blocks: HashMap<BlockHash, Block>,
     utxo_snapshots: HashMap<BlockHash, UtxoSet>,
 }
@@ -45,8 +48,49 @@ impl NodeState {
         &self.active_utxos
     }
 
+    pub fn mempool(&self) -> &Mempool {
+        &self.mempool
+    }
+
     pub fn get_block(&self, hash: &BlockHash) -> Option<&Block> {
         self.blocks.get(hash)
+    }
+
+    pub fn active_outpoints(&self) -> Vec<OutPoint> {
+        let mut outpoints: Vec<OutPoint> = self
+            .active_utxos
+            .iter()
+            .map(|(outpoint, _)| *outpoint)
+            .collect();
+        outpoints.sort_by_key(|outpoint| (outpoint.txid.to_string(), outpoint.vout));
+        outpoints
+    }
+
+    /// Validates and queues a pending transaction against the active chain state.
+    pub fn submit_transaction(&mut self, tx: Transaction) -> Result<Txid, NodeStateError> {
+        self.mempool
+            .submit(&self.active_utxos, tx)
+            .map_err(NodeStateError::Mempool)
+    }
+
+    /// Mines a block on the current best tip using the coinbase plus currently
+    /// valid pending transactions, then accepts it into node state.
+    pub fn mine_block(
+        &mut self,
+        reward: u64,
+        uniqueness: u32,
+        bits: u32,
+        max_transactions: usize,
+    ) -> Result<BlockHash, NodeStateError> {
+        let prev = self.chain.best_tip().unwrap_or_default();
+        let (pending, included_ids) = self
+            .mempool
+            .collect_valid(&self.active_utxos, max_transactions);
+        let block = mine_block_from_transactions(prev, reward, uniqueness, bits, pending);
+        let block_hash = block.header.block_hash();
+        self.accept_block(block)?;
+        self.mempool.remove_many(&included_ids);
+        Ok(block_hash)
     }
 
     /// Indexes `block`, derives its UTXO state from its parent snapshot, and
@@ -100,6 +144,50 @@ impl NodeState {
         self.utxo_snapshots.insert(block_hash, utxos);
 
         Ok(())
+    }
+}
+
+fn coinbase_transaction(reward: u64, uniqueness: u32) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: Vec::new(),
+        outputs: vec![TxOut {
+            value: reward,
+            locking_data: uniqueness.to_le_bytes().to_vec(),
+        }],
+        lock_time: uniqueness,
+    }
+}
+
+fn mine_block_from_transactions(
+    prev_blockhash: BlockHash,
+    reward: u64,
+    uniqueness: u32,
+    bits: u32,
+    mut transactions: Vec<Transaction>,
+) -> Block {
+    let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
+    full_transactions.push(coinbase_transaction(reward, uniqueness));
+    full_transactions.append(&mut transactions);
+
+    let mut block = Block {
+        header: BlockHeader {
+            version: 1,
+            prev_blockhash,
+            merkle_root: [0; 32],
+            time: 1,
+            bits,
+            nonce: 0,
+        },
+        transactions: full_transactions,
+    };
+    block.header.merkle_root = block.merkle_root();
+
+    loop {
+        if consensus::validate_block(&block).is_ok() {
+            return block;
+        }
+        block.header.nonce = block.header.nonce.wrapping_add(1);
     }
 }
 
@@ -251,5 +339,26 @@ mod tests {
                 })
                 .is_some()
         );
+    }
+
+    #[test]
+    fn mines_pending_transactions_from_mempool() {
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+
+        state.submit_transaction(spend(spendable, 30, 2)).unwrap();
+        let block_hash = state.mine_block(50, 3, 0x207f_ffff, 100).unwrap();
+        let block = state
+            .get_block(&block_hash)
+            .expect("mined block is indexed");
+
+        assert_eq!(block.transactions.len(), 2);
+        assert!(state.active_utxos().get(&spendable).is_none());
+        assert_eq!(state.mempool().len(), 0);
     }
 }

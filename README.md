@@ -39,7 +39,10 @@ The current CLI is intentionally small:
 ```text
 wobble init <snapshot>
 wobble info <snapshot>
+wobble utxos <snapshot>
+wobble submit-transfer <snapshot> <txid> <vout> <amount> <uniqueness> <lock_tag>
 wobble mine-coinbase <snapshot> <reward> <uniqueness> [bits]
+wobble mine-pending <snapshot> <reward> <uniqueness> <max_transactions> [bits]
 ```
 
 Example:
@@ -47,5 +50,8 @@ Example:
 ```text
 wobble init /tmp/wobble.bin
 wobble mine-coinbase /tmp/wobble.bin 50 0
+wobble utxos /tmp/wobble.bin
+wobble submit-transfer /tmp/wobble.bin <txid> 0 30 1 99
+wobble mine-pending /tmp/wobble.bin 50 2 100
 wobble info /tmp/wobble.bin
 ```
