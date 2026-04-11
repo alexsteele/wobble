@@ -6,6 +6,7 @@ pub mod mempool;
 pub mod net;
 pub mod node_state;
 pub mod peer;
+pub mod server;
 pub mod state;
 pub mod store;
 pub mod types;
