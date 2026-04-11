@@ -19,6 +19,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     mempool::Mempool,
+    node_state::{NodeState, NodeStateError},
     state::UtxoSet,
     types::{Block, BlockHash, ChainIndexEntry, OutPoint, Transaction, TxOut, Txid, Utxo},
 };
@@ -28,9 +29,17 @@ pub enum SqliteStoreError {
     Sqlite(rusqlite::Error),
     Encode(bincode::error::EncodeError),
     Decode(bincode::error::DecodeError),
+    NodeState(NodeStateError),
     InvalidHashLength(usize),
     InvalidWorkLength(usize),
     InvalidHashHex(String),
+    MissingBlockForEntry(BlockHash),
+    RebuiltBestTipMismatch {
+        rebuilt: Option<BlockHash>,
+        persisted: Option<BlockHash>,
+    },
+    RebuiltUtxoMismatch,
+    RebuiltMempoolMismatch,
 }
 
 impl From<rusqlite::Error> for SqliteStoreError {
@@ -48,6 +57,12 @@ impl From<bincode::error::EncodeError> for SqliteStoreError {
 impl From<bincode::error::DecodeError> for SqliteStoreError {
     fn from(error: bincode::error::DecodeError) -> Self {
         Self::Decode(error)
+    }
+}
+
+impl From<NodeStateError> for SqliteStoreError {
+    fn from(error: NodeStateError) -> Self {
+        Self::NodeState(error)
     }
 }
 
@@ -264,6 +279,36 @@ impl SqliteStore {
         Ok(Mempool::from_persisted(transactions))
     }
 
+    /// Rebuilds a full in-memory `NodeState` from persisted SQLite data.
+    ///
+    /// The current schema stores the authoritative block history, active UTXO
+    /// view, and mempool contents. This method replays blocks in height order
+    /// to recreate per-block UTXO snapshots needed for reorg handling, then
+    /// checks the rebuilt state against the persisted best tip and active UTXOs.
+    pub fn load_node_state(&self) -> Result<NodeState, SqliteStoreError> {
+        let blocks = self.load_blocks_in_height_order()?;
+        let mempool = self.load_mempool()?;
+        let persisted_best_tip = self.load_best_tip()?;
+        let persisted_utxos = self.load_active_utxos()?;
+        let persisted_mempool = self.load_mempool()?;
+
+        let state = NodeState::from_persisted(blocks, mempool)?;
+        if state.chain().best_tip() != persisted_best_tip {
+            return Err(SqliteStoreError::RebuiltBestTipMismatch {
+                rebuilt: state.chain().best_tip(),
+                persisted: persisted_best_tip,
+            });
+        }
+        if !utxo_sets_match(state.active_utxos(), &persisted_utxos) {
+            return Err(SqliteStoreError::RebuiltUtxoMismatch);
+        }
+        if !mempools_match(state.mempool(), &persisted_mempool) {
+            return Err(SqliteStoreError::RebuiltMempoolMismatch);
+        }
+
+        Ok(state)
+    }
+
     fn initialize_schema(&self) -> Result<(), SqliteStoreError> {
         self.connection.execute_batch(
             "BEGIN;
@@ -298,6 +343,31 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+
+    fn load_blocks_in_height_order(&self) -> Result<Vec<Block>, SqliteStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT chain_entries.block_hash, blocks.block_bytes
+             FROM chain_entries
+             LEFT JOIN blocks ON blocks.block_hash = chain_entries.block_hash
+             ORDER BY chain_entries.height ASC, chain_entries.block_hash ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })?;
+
+        let mut blocks = Vec::new();
+        for row in rows {
+            let (block_hash_text, block_bytes) = row?;
+            let block_hash = parse_block_hash(&block_hash_text)?;
+            let Some(block_bytes) = block_bytes else {
+                return Err(SqliteStoreError::MissingBlockForEntry(block_hash));
+            };
+            let (block, _): (Block, usize) =
+                bincode::serde::decode_from_slice(&block_bytes, bincode::config::standard())?;
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
 }
 
 fn decode_work(bytes: &[u8]) -> Result<u128, SqliteStoreError> {
@@ -325,6 +395,23 @@ fn parse_txid(value: &str) -> Result<Txid, SqliteStoreError> {
         .try_into()
         .map_err(|_| SqliteStoreError::InvalidHashLength(len))?;
     Ok(Txid::new(array))
+}
+
+fn utxo_sets_match(left: &UtxoSet, right: &UtxoSet) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter()
+        .all(|(outpoint, utxo)| right.get(outpoint) == Some(utxo))
+}
+
+fn mempools_match(left: &Mempool, right: &Mempool) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter().all(|(txid, tx)| right.get(txid) == Some(tx))
 }
 
 mod hex {
@@ -505,5 +592,88 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get(&txid), Some(&transaction));
+    }
+
+    #[test]
+    fn rebuilds_node_state_from_sqlite() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let owner = crate::crypto::signing_key_from_bytes([7; 32]);
+        let recipient = crate::crypto::signing_key_from_bytes([9; 32]);
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: [0; 32],
+                time: 1,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: Vec::new(),
+                outputs: vec![TxOut {
+                    value: 50,
+                    locking_data: crate::crypto::verifying_key_bytes(&owner.verifying_key())
+                        .to_vec(),
+                }],
+                lock_time: 0,
+            }],
+        };
+        block.header.merkle_root = block.merkle_root();
+        loop {
+            if crate::consensus::validate_block(&block).is_ok() {
+                break;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let block_hash = block.header.block_hash();
+        let entry = ChainIndexEntry {
+            block_hash,
+            height: 0,
+            cumulative_work: 123,
+            parent: None,
+        };
+        let utxo = Utxo {
+            outpoint: OutPoint {
+                txid: block.transactions[0].txid(),
+                vout: 0,
+            },
+            output: block.transactions[0].outputs[0].clone(),
+            created_at_height: 0,
+            is_coinbase: true,
+        };
+        let mut mempool_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: utxo.outpoint,
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 25,
+                locking_data: crate::crypto::verifying_key_bytes(&recipient.verifying_key())
+                    .to_vec(),
+            }],
+            lock_time: 9,
+        };
+        mempool_tx.inputs[0].unlocking_data =
+            crate::crypto::sign_message(&owner, &mempool_tx.signing_digest()).to_vec();
+        let mempool = Mempool::from_persisted(vec![(mempool_tx.txid(), mempool_tx.clone())]);
+        let mut utxos = UtxoSet::new();
+        utxos.insert(utxo);
+
+        store
+            .save_block_record(&block, &entry, Some(block_hash))
+            .unwrap();
+        store.save_active_utxos(&utxos).unwrap();
+        store.save_mempool(&mempool).unwrap();
+
+        let rebuilt = store.load_node_state().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(rebuilt.chain().best_tip(), Some(block_hash));
+        assert_eq!(rebuilt.active_utxos().len(), 1);
+        assert_eq!(rebuilt.mempool().get(&mempool_tx.txid()), Some(&mempool_tx));
     }
 }

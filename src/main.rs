@@ -202,15 +202,24 @@ fn run() -> Result<(), String> {
             let network = args[4].clone();
             let node_name = args.get(5).cloned();
             let sqlite_path = snapshot_path.with_extension("sqlite");
-            let state = store::load_node_state(snapshot_path)
+            let snapshot_state = store::load_node_state(snapshot_path)
                 .map_err(|err| format!("load failed: {err:?}"))?;
-            validate_sqlite_bootstrap(&sqlite_path, &state)?;
+            let (state, bootstrap_source) = if sqlite_path.exists() {
+                let sqlite_state = SqliteStore::open(&sqlite_path)
+                    .and_then(|store| store.load_node_state())
+                    .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
+                validate_snapshot_against_state(&snapshot_state, &sqlite_state)?;
+                (sqlite_state, "sqlite")
+            } else {
+                (snapshot_state, "snapshot")
+            };
             let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
                 .with_snapshot_path(snapshot_path)
                 .with_sqlite_path(&sqlite_path);
 
             println!("serving snapshot {}", snapshot_path.display());
             println!("sqlite store: {}", sqlite_path.display());
+            println!("bootstrap source: {bootstrap_source}");
             println!("listen addr: {listen_addr}");
             println!("network: {network}");
             if let Some(name) = server.config().node_name.as_deref() {
@@ -220,8 +229,8 @@ fn run() -> Result<(), String> {
                 "best tip: {}",
                 format_hash(server.state().chain().best_tip())
             );
-            if sqlite_path.exists() {
-                println!("sqlite bootstrap: validated");
+            if bootstrap_source == "sqlite" {
+                println!("snapshot cross-check: validated");
             }
 
             server
@@ -570,44 +579,29 @@ fn usage() -> String {
     .join("\n")
 }
 
-fn validate_sqlite_bootstrap(sqlite_path: &Path, snapshot_state: &NodeState) -> Result<(), String> {
-    if !sqlite_path.exists() {
-        return Ok(());
-    }
-
-    let store =
-        SqliteStore::open(sqlite_path).map_err(|err| format!("sqlite load failed: {err:?}"))?;
-    let sqlite_best_tip = store
-        .load_best_tip()
-        .map_err(|err| format!("sqlite best tip load failed: {err:?}"))?;
-    let snapshot_best_tip = snapshot_state.chain().best_tip();
-    if sqlite_best_tip != snapshot_best_tip {
+fn validate_snapshot_against_state(
+    snapshot_state: &NodeState,
+    rebuilt_state: &NodeState,
+) -> Result<(), String> {
+    if snapshot_state.chain().best_tip() != rebuilt_state.chain().best_tip() {
         return Err(format!(
-            "sqlite best tip mismatch: snapshot={} sqlite={}",
-            format_hash(snapshot_best_tip),
-            format_hash(sqlite_best_tip)
+            "bootstrap best tip mismatch: snapshot={} rebuilt={}",
+            format_hash(snapshot_state.chain().best_tip()),
+            format_hash(rebuilt_state.chain().best_tip())
         ));
     }
-
-    let sqlite_utxos = store
-        .load_active_utxos()
-        .map_err(|err| format!("sqlite active UTXO load failed: {err:?}"))?;
-    if !utxo_sets_match(snapshot_state.active_utxos(), &sqlite_utxos) {
+    if !utxo_sets_match(snapshot_state.active_utxos(), rebuilt_state.active_utxos()) {
         return Err(format!(
-            "sqlite active UTXO mismatch: snapshot={} sqlite={}",
+            "bootstrap active UTXO mismatch: snapshot={} rebuilt={}",
             snapshot_state.active_utxos().len(),
-            sqlite_utxos.len()
+            rebuilt_state.active_utxos().len()
         ));
     }
-
-    let sqlite_mempool = store
-        .load_mempool()
-        .map_err(|err| format!("sqlite mempool load failed: {err:?}"))?;
-    if !mempools_match(snapshot_state.mempool(), &sqlite_mempool) {
+    if !mempools_match(snapshot_state.mempool(), rebuilt_state.mempool()) {
         return Err(format!(
-            "sqlite mempool mismatch: snapshot={} sqlite={}",
+            "bootstrap mempool mismatch: snapshot={} rebuilt={}",
             snapshot_state.mempool().len(),
-            sqlite_mempool.len()
+            rebuilt_state.mempool().len()
         ));
     }
 

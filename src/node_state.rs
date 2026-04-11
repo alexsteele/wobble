@@ -51,6 +51,21 @@ impl NodeState {
         Self::default()
     }
 
+    /// Rebuilds in-memory node state from persisted blocks and mempool contents.
+    ///
+    /// Blocks must be supplied in parent-before-child order so snapshots can be
+    /// materialized incrementally. Persisted mempool contents are then attached
+    /// and revalidated against the reconstructed active UTXO view.
+    pub fn from_persisted(blocks: Vec<Block>, mempool: Mempool) -> Result<Self, NodeStateError> {
+        let mut state = Self::new();
+        for block in blocks {
+            state.accept_block(block)?;
+        }
+        state.mempool = mempool;
+        state.mempool.prune_invalid(&state.active_utxos);
+        Ok(state)
+    }
+
     pub fn chain(&self) -> &ChainIndex {
         &self.chain
     }
