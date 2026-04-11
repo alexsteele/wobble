@@ -34,10 +34,10 @@ Implemented in the first slice:
 - ignored integration test target at `tests/testnet_e2e.rs`
 
 Current limitation:
-- the first scripted end-to-end test uses automatic transaction relay, then an
-  explicit `get_block` plus `announce_block` sync step after mining so the
-  scenario stays deterministic
-- fully automatic mined-block relay remains the next networking hardening step
+- relay is still short-lived request/response TCP rather than persistent peer sessions
+- the deterministic test harness must budget for duplicate gossip because nodes
+  currently relay newly accepted objects back to configured peers without
+  origin tracking or inventory suppression
 
 ## Implementation Plan
 
@@ -78,6 +78,7 @@ Two nodes:
 
 Connections:
 - A knows peer B
+- B knows peer A
 
 Flow:
 1. initialize node A and node B state
@@ -86,7 +87,7 @@ Flow:
 4. submit a payment to node A
 5. assert node B learns the transaction through relay
 6. trigger mining on node B
-7. fetch the mined block from node B and announce it to node A
+7. assert node A learns the mined block through relay
 8. assert both nodes share the same best tip
 9. assert the mined block contains the submitted transaction
 

@@ -148,9 +148,13 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     let miner_server = Server::new(
         PeerConfig::new("wobble-local", Some("miner".to_string())),
         miner_state,
-    );
+    )
+    .with_peers(vec![proposer_addr.clone()]);
 
-    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 2));
+    // With bidirectional best-effort relay enabled, this scenario produces:
+    // - proposer inbound: submitter, relayed tx duplicate, relayed mined block
+    // - miner inbound: relayed tx, mining request, relayed block duplicate
+    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 3));
     let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 3));
 
     let mut proposer_client = connect_and_handshake(&proposer_addr, "submitter");
@@ -185,26 +189,9 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     };
     drop(miner_client);
 
-    // Keep the first scripted test deterministic by fetching the mined block
-    // explicitly, then announcing it to the proposer-facing node.
-    let mut miner_fetch = connect_and_handshake(&miner_addr, "block-fetch");
-    net::send_message(&mut miner_fetch, &WireMessage::GetBlock { block_hash }).unwrap();
-    let fetched = net::receive_message(&mut miner_fetch).unwrap();
-    let WireMessage::Block {
-        block: Some(mined_block),
-    } = fetched
-    else {
-        panic!("expected mined block fetch reply");
-    };
-    drop(miner_fetch);
-
-    let mut proposer_sync = connect_and_handshake(&proposer_addr, "block-sync");
-    net::send_message(
-        &mut proposer_sync,
-        &WireMessage::AnnounceBlock { block: mined_block },
-    )
-    .unwrap();
-    drop(proposer_sync);
+    // Give the mined-block relay a brief window to complete before asserting
+    // final convergence across both live servers.
+    thread::sleep(Duration::from_millis(100));
 
     let proposer = proposer_worker.join().unwrap();
     let miner_server = miner_worker.join().unwrap();

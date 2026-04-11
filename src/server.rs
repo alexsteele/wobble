@@ -10,6 +10,8 @@ use std::{
     io,
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
+    thread,
+    time::Duration,
 };
 
 use crate::{
@@ -36,6 +38,12 @@ pub enum ServerError {
     Peer(PeerError),
     SqlitePersist(SqliteStoreError),
 }
+
+/// Retry budget for best-effort outbound relay dialing.
+const RELAY_CONNECT_ATTEMPTS: usize = 3;
+/// Small pause between relay dial attempts so listeners finishing a prior
+/// request can accept the next inbound connection.
+const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 impl Server {
     pub fn new(config: PeerConfig, state: NodeState) -> Self {
@@ -237,7 +245,34 @@ fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
     })
 }
 
+/// Opens a short-lived outbound relay connection, completes the handshake, and
+/// sends one announcement message.
+///
+/// Relay is intentionally best effort. A small bounded retry helps with local
+/// testnet timing where the destination listener may still be unwinding a
+/// previous connection before it accepts the next one.
 fn relay_to_peer(peer_addr: &str, config: &PeerConfig, message: &WireMessage) -> io::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..RELAY_CONNECT_ATTEMPTS {
+        match relay_to_peer_once(peer_addr, config, message) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt + 1 < RELAY_CONNECT_ATTEMPTS {
+                    thread::sleep(RELAY_CONNECT_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("relay attempts should record an error"))
+}
+
+fn relay_to_peer_once(
+    peer_addr: &str,
+    config: &PeerConfig,
+    message: &WireMessage,
+) -> io::Result<()> {
     let mut stream = net::connect(peer_addr)?;
     net::send_message(
         &mut stream,
