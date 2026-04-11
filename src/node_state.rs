@@ -13,7 +13,10 @@ use crate::{
     consensus::{self, ConsensusError},
     mempool::{Mempool, MempoolError},
     state::UtxoSet,
-    types::{Block, BlockHash, BlockHeader, BlockHeight, OutPoint, Transaction, TxOut, Txid},
+    types::{
+        Amount, Block, BlockHash, BlockHeader, BlockHeight, OutPoint, Transaction, TxIn, TxOut,
+        Txid,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +24,10 @@ pub enum NodeStateError {
     Chain(ChainError),
     Consensus(ConsensusError),
     Mempool(MempoolError),
+    InsufficientFunds {
+        requested: Amount,
+        available: Amount,
+    },
     MissingIndexedBlock(BlockHash),
     MissingParentState(BlockHash),
 }
@@ -71,6 +78,74 @@ impl NodeState {
         self.mempool
             .submit(&self.active_utxos, tx)
             .map_err(NodeStateError::Mempool)
+    }
+
+    /// Builds a simple payment transaction by selecting active UTXOs with the
+    /// given `sender_lock_tag`, then submits it to the mempool.
+    ///
+    /// If the selected inputs exceed `amount`, a change output is created back
+    /// to the same sender tag.
+    pub fn submit_payment(
+        &mut self,
+        sender_lock_tag: u32,
+        recipient_lock_tag: u32,
+        amount: Amount,
+        uniqueness: u32,
+    ) -> Result<Txid, NodeStateError> {
+        let sender_locking_data = sender_lock_tag.to_le_bytes().to_vec();
+        let mut selected = Vec::new();
+        let mut total = 0_u64;
+
+        // Find active UTXOs controlled by the sender and gather enough value
+        // to fund the requested payment plus any change output.
+        for outpoint in self.active_outpoints() {
+            let Some(utxo) = self.active_utxos.get(&outpoint) else {
+                continue;
+            };
+            if utxo.output.locking_data != sender_locking_data {
+                continue;
+            }
+
+            selected.push((outpoint, utxo.output.value));
+            total = total.saturating_add(utxo.output.value);
+            if total >= amount {
+                break;
+            }
+        }
+
+        if total < amount {
+            return Err(NodeStateError::InsufficientFunds {
+                requested: amount,
+                available: total,
+            });
+        }
+
+        let mut outputs = vec![TxOut {
+            value: amount,
+            locking_data: recipient_lock_tag.to_le_bytes().to_vec(),
+        }];
+        let change = total - amount;
+        if change > 0 {
+            outputs.push(TxOut {
+                value: change,
+                locking_data: sender_lock_tag.to_le_bytes().to_vec(),
+            });
+        }
+
+        let tx = Transaction {
+            version: 1,
+            inputs: selected
+                .into_iter()
+                .map(|(previous_output, _)| TxIn {
+                    previous_output,
+                    unlocking_data: uniqueness.to_le_bytes().to_vec(),
+                })
+                .collect(),
+            outputs,
+            lock_time: uniqueness,
+        };
+
+        self.submit_transaction(tx)
     }
 
     /// Mines a block on the current best tip using the coinbase plus currently
@@ -195,7 +270,7 @@ fn mine_block_from_transactions(
 mod tests {
     use crate::types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
 
-    use super::NodeState;
+    use super::{NodeState, NodeStateError};
 
     fn coinbase(value: u64, uniqueness: u32) -> Transaction {
         Transaction {
@@ -360,5 +435,38 @@ mod tests {
         assert_eq!(block.transactions.len(), 2);
         assert!(state.active_utxos().get(&spendable).is_none());
         assert_eq!(state.mempool().len(), 0);
+    }
+
+    #[test]
+    fn submits_payment_with_change_output() {
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+
+        let txid = state.submit_payment(0, 99, 30, 7).unwrap();
+        let tx = state
+            .mempool()
+            .get(&txid)
+            .expect("submitted payment is in mempool");
+
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].value, 30);
+        assert_eq!(tx.outputs[1].value, 20);
+    }
+
+    #[test]
+    fn rejects_payment_when_sender_funds_are_insufficient() {
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+
+        assert_eq!(
+            state.submit_payment(123, 99, 30, 7),
+            Err(NodeStateError::InsufficientFunds {
+                requested: 30,
+                available: 0,
+            })
+        );
     }
 }

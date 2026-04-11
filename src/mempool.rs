@@ -34,6 +34,10 @@ impl Mempool {
         self.transactions.is_empty()
     }
 
+    pub fn get(&self, txid: &Txid) -> Option<&Transaction> {
+        self.transactions.get(txid)
+    }
+
     /// Validates `tx` against the current active UTXO state before admission.
     pub fn submit(&mut self, utxos: &UtxoSet, tx: Transaction) -> Result<Txid, MempoolError> {
         let txid = tx.txid();

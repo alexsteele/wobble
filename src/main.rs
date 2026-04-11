@@ -99,6 +99,28 @@ fn run() -> Result<(), String> {
             println!("mempool txs: {}", state.mempool().len());
             Ok(())
         }
+        "submit-payment" => {
+            if args.len() != 7 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            let sender_lock_tag = parse_u32(&args[3], "sender_lock_tag")?;
+            let recipient_lock_tag = parse_u32(&args[4], "recipient_lock_tag")?;
+            let amount = parse_u64(&args[5], "amount")?;
+            let uniqueness = parse_u32(&args[6], "uniqueness")?;
+
+            let mut state =
+                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let submitted = state
+                .submit_payment(sender_lock_tag, recipient_lock_tag, amount, uniqueness)
+                .map_err(|err| format!("submit failed: {err:?}"))?;
+            store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
+
+            println!("queued payment {}", submitted);
+            println!("mempool txs: {}", state.mempool().len());
+            Ok(())
+        }
         "mine-coinbase" => {
             if args.len() != 5 && args.len() != 6 {
                 return Err(usage());
@@ -168,6 +190,7 @@ fn usage() -> String {
         "  wobble init <snapshot>",
         "  wobble info <snapshot>",
         "  wobble utxos <snapshot>",
+        "  wobble submit-payment <snapshot> <sender_lock_tag> <recipient_lock_tag> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <uniqueness> <lock_tag>",
         "  wobble mine-coinbase <snapshot> <reward> <uniqueness> [bits]",
         "  wobble mine-pending <snapshot> <reward> <uniqueness> <max_transactions> [bits]",
