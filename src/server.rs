@@ -101,9 +101,11 @@ mod tests {
     };
 
     use crate::{
+        crypto, net,
         node_state::NodeState,
         peer::PeerConfig,
         server::Server,
+        types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
@@ -119,6 +121,68 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         line
+    }
+
+    fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value,
+                locking_data: crypto::verifying_key_bytes(owner).to_vec(),
+            }],
+            lock_time: uniqueness,
+        }
+    }
+
+    fn mine_block(
+        prev_blockhash: BlockHash,
+        bits: u32,
+        owner: &ed25519_dalek::VerifyingKey,
+        uniqueness: u32,
+    ) -> Block {
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash,
+                merkle_root: [0; 32],
+                time: 1,
+                bits,
+                nonce: 0,
+            },
+            transactions: vec![coinbase(50, owner, uniqueness)],
+        };
+        block.header.merkle_root = block.merkle_root();
+
+        loop {
+            if crate::consensus::validate_block(&block).is_ok() {
+                return block;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+    }
+
+    fn spend(
+        previous_output: OutPoint,
+        signer: &ed25519_dalek::SigningKey,
+        recipient: &ed25519_dalek::VerifyingKey,
+        value: u64,
+        uniqueness: u32,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output,
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value,
+                locking_data: crypto::verifying_key_bytes(recipient).to_vec(),
+            }],
+            lock_time: uniqueness,
+        };
+        tx.inputs[0].unlocking_data = crypto::sign_message(signer, &tx.signing_digest()).to_vec();
+        tx
     }
 
     #[test]
@@ -183,5 +247,54 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn announced_transaction_reaches_server_mempool_end_to_end() {
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let txid = transaction.txid();
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), state);
+        let (mut client, server_stream) = connected_pair();
+
+        let worker = thread::spawn(move || {
+            server.handle_stream(server_stream).unwrap();
+            server
+        });
+
+        // Handshake first so the server accepts later relay messages on this connection.
+        net::send_message(
+            &mut client,
+            &WireMessage::Hello(HelloMessage {
+                network: "wobble-local".to_string(),
+                version: PROTOCOL_VERSION,
+                node_name: Some("client".to_string()),
+                tip: None,
+                height: None,
+            }),
+        )
+        .unwrap();
+        let remote_hello = net::receive_message(&mut client).unwrap();
+        assert!(matches!(remote_hello, WireMessage::Hello(_)));
+
+        net::send_message(&mut client, &WireMessage::AnnounceTx { transaction }).unwrap();
+        drop(client);
+
+        let server = worker.join().unwrap();
+
+        assert!(server.state().mempool().get(&txid).is_some());
     }
 }

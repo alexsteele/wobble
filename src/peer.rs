@@ -107,11 +107,7 @@ mod tests {
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
-    fn coinbase(
-        value: u64,
-        owner: &ed25519_dalek::VerifyingKey,
-        uniqueness: u32,
-    ) -> Transaction {
+    fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
         Transaction {
             version: 1,
             inputs: Vec::new(),
