@@ -3,12 +3,14 @@
 //! A node home groups the files a single node typically needs under one
 //! directory so CLI commands do not have to pass each path separately. The
 //! current layout includes the chain state SQLite file, one default wallet, an
-//! alias book, and a bootstrap peer file.
+//! alias book, a bootstrap peer file, and a small human-readable node config.
 
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
 };
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     aliases::{self, AliasBook, AliasError},
@@ -25,12 +27,33 @@ const STATE_FILENAME: &str = "node.sqlite";
 const WALLET_FILENAME: &str = "wallet.bin";
 const ALIASES_FILENAME: &str = "aliases.json";
 const PEERS_FILENAME: &str = "peers.json";
+const CONFIG_FILENAME: &str = "config.json";
+
+/// Default runtime configuration stored in a node home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub listen_addr: String,
+    pub network: String,
+    pub node_name: Option<String>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "127.0.0.1:9001".to_string(),
+            network: "wobble-local".to_string(),
+            node_name: None,
+        }
+    }
+}
 
 /// Errors returned while resolving or initializing a node home.
 #[derive(Debug)]
 pub enum NodeHomeError {
     MissingBaseHomeDir,
     Io(io::Error),
+    ConfigParse(serde_json::Error),
+    ConfigSerialize(serde_json::Error),
     Sqlite(SqliteStoreError),
     Wallet(WalletError),
     Alias(AliasError),
@@ -104,6 +127,24 @@ impl NodeHome {
         self.root.join(PEERS_FILENAME)
     }
 
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join(CONFIG_FILENAME)
+    }
+
+    /// Loads the node runtime config from disk.
+    pub fn load_config(&self) -> Result<NodeConfig, NodeHomeError> {
+        let contents = fs::read_to_string(self.config_path())?;
+        serde_json::from_str(&contents).map_err(NodeHomeError::ConfigParse)
+    }
+
+    /// Saves a pretty-printed runtime config for this node home.
+    pub fn save_config(&self, config: &NodeConfig) -> Result<(), NodeHomeError> {
+        let contents =
+            serde_json::to_string_pretty(config).map_err(NodeHomeError::ConfigSerialize)?;
+        fs::write(self.config_path(), contents)?;
+        Ok(())
+    }
+
     /// Creates the home directory and any missing default files.
     ///
     /// Initialization is idempotent: existing files are preserved so rerunning
@@ -131,6 +172,11 @@ impl NodeHome {
             peers::save_peer_endpoints(&peers_path, &Vec::<PeerEndpoint>::new())?;
         }
 
+        let config_path = self.config_path();
+        if !config_path.exists() {
+            self.save_config(&NodeConfig::default())?;
+        }
+
         Ok(())
     }
 }
@@ -149,7 +195,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::NodeHome;
+    use super::{NodeConfig, NodeHome};
 
     fn temp_home() -> NodeHome {
         let mut path = std::env::temp_dir();
@@ -181,6 +227,10 @@ mod tests {
             home.peers_path(),
             std::path::PathBuf::from("/tmp/wobble-node/peers.json")
         );
+        assert_eq!(
+            home.config_path(),
+            std::path::PathBuf::from("/tmp/wobble-node/config.json")
+        );
     }
 
     #[test]
@@ -194,6 +244,41 @@ mod tests {
         assert!(home.wallet_path().exists());
         assert!(home.aliases_path().exists());
         assert!(home.peers_path().exists());
+        assert!(home.config_path().exists());
+
+        fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[test]
+    fn initialize_creates_default_node_config() {
+        let home = temp_home();
+
+        home.initialize().unwrap();
+
+        let config = home.load_config().unwrap();
+
+        assert_eq!(config, NodeConfig::default());
+
+        fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[test]
+    fn save_and_load_config_round_trip() {
+        let home = temp_home();
+
+        fs::create_dir_all(home.root()).unwrap();
+        home.save_config(&NodeConfig {
+            listen_addr: "127.0.0.1:9010".to_string(),
+            network: "custom-net".to_string(),
+            node_name: Some("alpha".to_string()),
+        })
+        .unwrap();
+
+        let config = home.load_config().unwrap();
+
+        assert_eq!(config.listen_addr, "127.0.0.1:9010");
+        assert_eq!(config.network, "custom-net");
+        assert_eq!(config.node_name.as_deref(), Some("alpha"));
 
         fs::remove_dir_all(home.root()).unwrap();
     }
