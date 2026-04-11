@@ -3,6 +3,7 @@
 ## Next
 
 - Add wallet balances by public key and by wallet file.
+- Add an owner-to-UTXO index so balance queries and coin selection do not scan the full active UTXO set.
 - Replace raw public-key arguments with named contacts or saved recipient aliases.
 - Add transaction fees and include them in coinbase rewards.
 - Add better mempool conflict handling and eviction rules.

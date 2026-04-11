@@ -1,6 +1,7 @@
 use std::{env, path::Path};
 
 use wobble::{
+    aliases::{self, AliasBook},
     crypto,
     node_state::NodeState,
     store,
@@ -139,6 +140,54 @@ fn run() -> Result<(), String> {
             println!("{}", state.balance_for_key(&wallet.verifying_key()));
             Ok(())
         }
+        "create-alias-book" => {
+            if args.len() != 3 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            aliases::save_alias_book(path, &AliasBook::new())
+                .map_err(|err| format!("alias save failed: {err:?}"))?;
+            println!("created alias book at {}", path.display());
+            Ok(())
+        }
+        "alias-add" => {
+            if args.len() != 5 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            let alias = args[3].clone();
+            let public_key = parse_public_key(&args[4])?;
+            let mut book = if path.exists() {
+                aliases::load_alias_book(path)
+                    .map_err(|err| format!("alias load failed: {err:?}"))?
+            } else {
+                AliasBook::new()
+            };
+            book.insert(alias.clone(), public_key);
+            aliases::save_alias_book(path, &book)
+                .map_err(|err| format!("alias save failed: {err:?}"))?;
+            println!("saved alias {} in {}", alias, path.display());
+            Ok(())
+        }
+        "alias-list" => {
+            if args.len() != 3 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            let book = aliases::load_alias_book(path)
+                .map_err(|err| format!("alias load failed: {err:?}"))?;
+            for (alias, public_key) in book.entries() {
+                println!(
+                    "{} {}",
+                    alias,
+                    encode_hex(&crypto::verifying_key_bytes(&public_key))
+                );
+            }
+            Ok(())
+        }
         "submit-transfer" => {
             if args.len() != 8 {
                 return Err(usage());
@@ -185,7 +234,7 @@ fn run() -> Result<(), String> {
 
             let path = Path::new(&args[2]);
             let sender_wallet_path = Path::new(&args[3]);
-            let recipient_verifying_key = parse_public_key(&args[4])?;
+            let recipient_verifying_key = parse_public_key_or_alias(&args[4])?;
             let amount = parse_u64(&args[5], "amount")?;
             let uniqueness = parse_u32(&args[6], "uniqueness")?;
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
@@ -297,7 +346,10 @@ fn usage() -> String {
         "  wobble create-wallet <wallet_path>",
         "  wobble wallet-address <wallet_path>",
         "  wobble wallet-balance <snapshot> <wallet_path>",
-        "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key> <amount> <uniqueness>",
+        "  wobble create-alias-book <alias_book>",
+        "  wobble alias-add <alias_book> <name> <public_key>",
+        "  wobble alias-list <alias_book>",
+        "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
         "  wobble mine-pending <snapshot> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
@@ -340,6 +392,20 @@ fn format_hash(hash: Option<BlockHash>) -> String {
 fn parse_public_key(value: &str) -> Result<ed25519_dalek::VerifyingKey, String> {
     crypto::parse_verifying_key(&parse_hex_vec(value, "public key")?)
         .ok_or_else(|| format!("invalid public key: {value}"))
+}
+
+fn parse_public_key_or_alias(value: &str) -> Result<ed25519_dalek::VerifyingKey, String> {
+    if let Some(spec) = value.strip_prefix('@') {
+        let (book_path, alias) = spec
+            .split_once(':')
+            .ok_or_else(|| format!("invalid alias reference: {value}"))?;
+        let book = aliases::load_alias_book(Path::new(book_path))
+            .map_err(|err| format!("alias load failed: {err:?}"))?;
+        book.resolve(alias)
+            .map_err(|err| format!("alias resolve failed: {err:?}"))
+    } else {
+        parse_public_key(value)
+    }
 }
 
 fn parse_hex_vec(value: &str, name: &str) -> Result<Vec<u8>, String> {

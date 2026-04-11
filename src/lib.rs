@@ -1,3 +1,4 @@
+pub mod aliases;
 pub mod chain;
 pub mod consensus;
 pub mod crypto;

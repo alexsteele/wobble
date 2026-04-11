@@ -51,7 +51,10 @@ wobble generate-key
 wobble create-wallet <wallet_path>
 wobble wallet-address <wallet_path>
 wobble wallet-balance <snapshot> <wallet_path>
-wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key> <amount> <uniqueness>
+wobble create-alias-book <alias_book>
+wobble alias-add <alias_book> <name> <public_key>
+wobble alias-list <alias_book>
+wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>
 wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>
 wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]
 wobble mine-pending <snapshot> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]
@@ -63,11 +66,13 @@ Example:
 wobble init /tmp/wobble.bin
 wobble create-wallet /tmp/miner.wallet
 wobble create-wallet /tmp/recipient.wallet
+wobble create-alias-book /tmp/recipients.aliases
 wobble wallet-address /tmp/recipient.wallet
+wobble alias-add /tmp/recipients.aliases recipient <recipient_public_key>
 wobble mine-coinbase /tmp/wobble.bin 50 /tmp/miner.wallet 0
 wobble wallet-balance /tmp/wobble.bin /tmp/miner.wallet
 wobble utxos /tmp/wobble.bin
-wobble submit-payment /tmp/wobble.bin /tmp/miner.wallet <recipient_public_key> 30 1
+wobble submit-payment /tmp/wobble.bin /tmp/miner.wallet @/tmp/recipients.aliases:recipient 30 1
 wobble mine-pending /tmp/wobble.bin 50 /tmp/miner.wallet 2 100
 wobble wallet-balance /tmp/wobble.bin /tmp/miner.wallet
 wobble wallet-balance /tmp/wobble.bin /tmp/recipient.wallet
