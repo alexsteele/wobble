@@ -3,6 +3,10 @@ name = "wobble"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+e2e = []
+
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

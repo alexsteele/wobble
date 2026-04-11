@@ -31,7 +31,7 @@ Implemented in the first slice:
 - configured peer set on `Server`
 - best-effort transaction relay for newly accepted transactions
 - best-effort relay hooks for newly accepted and newly mined blocks
-- ignored integration test target at `tests/testnet_e2e.rs`
+- feature-gated integration test target at `tests/testnet_e2e.rs`
 
 Current limitation:
 - relay is still short-lived request/response TCP rather than persistent peer sessions
@@ -56,9 +56,9 @@ Rules:
 
 ### 2. Separate Integration Test Target
 
-Add an ignored integration test under `tests/testnet_e2e.rs`.
+Add a feature-gated integration test under `tests/testnet_e2e.rs`.
 
-Why ignored:
+Why feature-gated:
 - it uses real local TCP sockets
 - it is slower and more orchestration-heavy than unit tests
 - it should not run in the default `cargo test` unit path
@@ -66,7 +66,7 @@ Why ignored:
 Expected command:
 
 ```text
-cargo test --test testnet_e2e -- --ignored
+cargo test --features e2e --test testnet_e2e
 ```
 
 ### 3. First E2E Scenario
@@ -104,6 +104,6 @@ Do not add yet:
 ## Exit Criteria
 
 We consider this slice complete when:
-- a separate ignored integration test proves the proposer-to-miner-to-peer path
+- a separate feature-gated integration test proves the proposer-to-miner-to-peer path
 - the path works over the real TCP protocol
 - normal unit tests stay fast and unchanged

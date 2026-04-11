@@ -1,7 +1,10 @@
 //! End-to-end multi-node testnet flow over the real TCP wire protocol.
 //!
-//! This ignored integration test keeps the slower proposer-to-miner flow out
-//! of the default unit-test path while still exercising the live network stack.
+//! This feature-gated integration test keeps the slower proposer-to-miner flow
+//! out of the default unit-test path while still exercising the live network
+//! stack.
+
+#![cfg(feature = "e2e")]
 
 use std::{net::TcpListener, thread, time::Duration};
 
@@ -113,7 +116,6 @@ fn connect_and_handshake(addr: &str, node_name: &str) -> std::net::TcpStream {
 }
 
 #[test]
-#[ignore = "runs a real two-node TCP scenario outside the default unit-test path"]
 fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     let sender = crypto::signing_key_from_bytes([1; 32]);
     let recipient = crypto::signing_key_from_bytes([2; 32]);

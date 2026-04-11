@@ -82,3 +82,18 @@ wobble wallet-balance /tmp/wobble.sqlite /tmp/miner.wallet
 wobble wallet-balance /tmp/wobble.sqlite /tmp/recipient.wallet
 wobble info /tmp/wobble.sqlite
 ```
+
+## Build And Test
+
+Common development commands:
+
+```text
+cargo build
+cargo test --lib
+cargo test --features e2e --test testnet_e2e
+```
+
+Notes:
+- `cargo build` compiles the library and CLI binary
+- `cargo test --lib` runs the fast library and unit test path
+- `cargo test --features e2e --test testnet_e2e` runs the slower real-TCP integration scenario
