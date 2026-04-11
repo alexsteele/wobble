@@ -7,7 +7,7 @@
 
 use crate::{
     node_state::{NodeState, NodeStateError},
-    wire::{HelloMessage, PROTOCOL_VERSION, WireMessage},
+    wire::{HelloMessage, MinedBlock, PROTOCOL_VERSION, WireMessage},
 };
 
 /// Local peer settings advertised during handshake.
@@ -24,6 +24,8 @@ pub enum PeerError {
     UnsupportedVersion(u32),
     TransactionRejected(NodeStateError),
     BlockRejected(NodeStateError),
+    InvalidMinerPublicKey,
+    MiningRejected(NodeStateError),
 }
 
 impl PeerConfig {
@@ -55,6 +57,7 @@ pub fn local_hello(config: &PeerConfig, state: &NodeState) -> HelloMessage {
 /// - `get_block` returns the indexed block when known
 /// - `announce_tx` validates and inserts the transaction into the live mempool
 /// - `announce_block` validates and accepts the block into the local chain state
+/// - `mine_pending` mines a block from the current mempool for local testnet use
 /// - other messages are ignored for now and will be handled in later network slices
 ///
 /// Gap: this does not yet fan accepted objects out to other peers, track peer
@@ -94,6 +97,20 @@ pub fn handle_message(
                 .map_err(PeerError::BlockRejected)?;
             Ok(Vec::new())
         }
+        WireMessage::MinePending(request) => {
+            let miner = crate::crypto::parse_verifying_key(&request.miner_public_key)
+                .ok_or(PeerError::InvalidMinerPublicKey)?;
+            let block_hash = state
+                .mine_block(
+                    request.reward,
+                    &miner,
+                    request.uniqueness,
+                    request.bits,
+                    request.max_transactions,
+                )
+                .map_err(PeerError::MiningRejected)?;
+            Ok(vec![WireMessage::MinedBlock(MinedBlock { block_hash })])
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -104,7 +121,9 @@ mod tests {
         node_state::NodeState,
         peer::{PeerConfig, PeerError, handle_message, local_hello},
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
-        wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
+        wire::{
+            HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage,
+        },
     };
 
     fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
@@ -337,5 +356,58 @@ mod tests {
 
         assert!(replies.is_empty());
         assert_eq!(state.chain().best_tip(), Some(child_hash));
+    }
+
+    #[test]
+    fn mine_pending_mines_announced_transaction_into_block() {
+        let sender = crate::crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crate::crypto::signing_key_from_bytes([2; 32]);
+        let miner = crate::crypto::signing_key_from_bytes([3; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let tx = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let txid = tx.txid();
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let config = PeerConfig::new("wobble-local", None);
+
+        handle_message(
+            &config,
+            &mut state,
+            WireMessage::AnnounceTx { transaction: tx },
+        )
+        .unwrap();
+
+        let replies = handle_message(
+            &config,
+            &mut state,
+            WireMessage::MinePending(MinePendingRequest {
+                reward: crate::consensus::BLOCK_SUBSIDY,
+                miner_public_key: crate::crypto::verifying_key_bytes(&miner.verifying_key())
+                    .to_vec(),
+                uniqueness: 2,
+                bits: 0x207f_ffff,
+                max_transactions: 10,
+            }),
+        )
+        .unwrap();
+
+        let [WireMessage::MinedBlock(MinedBlock { block_hash })] = replies.as_slice() else {
+            panic!("expected a single mined block response");
+        };
+        let mined = state.get_block(block_hash).expect("mined block indexed");
+
+        assert_eq!(state.chain().best_tip(), Some(*block_hash));
+        assert!(state.mempool().get(&txid).is_none());
+        assert_eq!(mined.transactions.len(), 2);
+        assert_eq!(mined.transactions[1].txid(), txid);
     }
 }

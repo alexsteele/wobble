@@ -28,6 +28,22 @@ pub struct HelloMessage {
     pub height: Option<u64>,
 }
 
+/// Local-testnet request to mine a block from the server's current mempool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinePendingRequest {
+    pub reward: u64,
+    pub miner_public_key: Vec<u8>,
+    pub uniqueness: u32,
+    pub bits: u32,
+    pub max_transactions: usize,
+}
+
+/// Result of a `mine_pending` request against a live server node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinedBlock {
+    pub block_hash: BlockHash,
+}
+
 /// A single newline-delimited JSON message on the peer wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -39,6 +55,8 @@ pub enum WireMessage {
     AnnounceBlock { block: Block },
     GetBlock { block_hash: BlockHash },
     Block { block: Option<Block> },
+    MinePending(MinePendingRequest),
+    MinedBlock(MinedBlock),
 }
 
 impl WireMessage {
@@ -59,7 +77,7 @@ impl WireMessage {
 mod tests {
     use crate::types::{Block, BlockHash, BlockHeader, Transaction};
 
-    use super::{HelloMessage, TipSummary, WireMessage};
+    use super::{HelloMessage, MinePendingRequest, MinedBlock, TipSummary, WireMessage};
 
     fn sample_transaction() -> Transaction {
         Transaction {
@@ -139,6 +157,34 @@ mod tests {
         let message = WireMessage::AnnounceTx {
             transaction: sample_transaction(),
         };
+
+        let line = message.to_json_line().unwrap();
+        let decoded = WireMessage::from_json_line(&line).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_mine_pending_request() {
+        let message = WireMessage::MinePending(MinePendingRequest {
+            reward: 50,
+            miner_public_key: vec![0x11; 32],
+            uniqueness: 7,
+            bits: 0x207f_ffff,
+            max_transactions: 10,
+        });
+
+        let line = message.to_json_line().unwrap();
+        let decoded = WireMessage::from_json_line(&line).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_mined_block_response() {
+        let message = WireMessage::MinedBlock(MinedBlock {
+            block_hash: BlockHash::new([0x55; 32]),
+        });
 
         let line = message.to_json_line().unwrap();
         let decoded = WireMessage::from_json_line(&line).unwrap();

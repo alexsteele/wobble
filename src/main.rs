@@ -9,7 +9,7 @@ use wobble::{
     store,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
-    wire::{HelloMessage, PROTOCOL_VERSION, WireMessage},
+    wire::{HelloMessage, MinePendingRequest, PROTOCOL_VERSION, WireMessage},
 };
 
 fn main() {
@@ -331,6 +331,63 @@ fn run() -> Result<(), String> {
             println!("submitted payment {} to {}", txid, peer_addr);
             Ok(())
         }
+        "mine-pending-remote" => {
+            if args.len() != 8 && args.len() != 9 {
+                return Err(usage());
+            }
+
+            let reward = parse_u64(&args[2], "reward")?;
+            let miner_wallet_path = Path::new(&args[3]);
+            let uniqueness = parse_u32(&args[4], "uniqueness")?;
+            let max_transactions = args[5]
+                .parse::<usize>()
+                .map_err(|_| format!("invalid max_transactions: {}", args[5]))?;
+            let peer_addr = &args[6];
+            let network = args[7].clone();
+            let node_name = args.get(8).cloned();
+            let miner_wallet = wallet::load_wallet(miner_wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
+            let mut stream =
+                net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
+
+            let hello = WireMessage::Hello(HelloMessage {
+                network,
+                version: PROTOCOL_VERSION,
+                node_name,
+                tip: None,
+                height: None,
+            });
+            net::send_message(&mut stream, &hello)
+                .map_err(|err| format!("send hello failed: {err}"))?;
+            let remote_hello = net::receive_message(&mut stream)
+                .map_err(|err| format!("receive hello failed: {err}"))?;
+            if !matches!(remote_hello, WireMessage::Hello(_)) {
+                return Err(format!("unexpected handshake response: {remote_hello:?}"));
+            }
+
+            net::send_message(
+                &mut stream,
+                &WireMessage::MinePending(MinePendingRequest {
+                    reward,
+                    miner_public_key: crypto::verifying_key_bytes(&miner_wallet.verifying_key())
+                        .to_vec(),
+                    uniqueness,
+                    bits: 0x207f_ffff,
+                    max_transactions,
+                }),
+            )
+            .map_err(|err| format!("send mine_pending failed: {err}"))?;
+
+            let response = net::receive_message(&mut stream)
+                .map_err(|err| format!("receive mined block failed: {err}"))?;
+            match response {
+                WireMessage::MinedBlock(result) => {
+                    println!("mined block {}", result.block_hash);
+                    Ok(())
+                }
+                other => Err(format!("unexpected mine response: {other:?}")),
+            }
+        }
         "submit-transfer" => {
             if args.len() != 8 {
                 return Err(usage());
@@ -495,6 +552,7 @@ fn usage() -> String {
         "  wobble serve <snapshot> <listen_addr> <network> [node_name]",
         "  wobble get-tip <peer_addr> <network> [node_name]",
         "  wobble submit-payment-remote <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
+        "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]",
         "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
