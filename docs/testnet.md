@@ -27,6 +27,8 @@ Already implemented:
 - outbound client handshake helper used by remote CLI flows
 - feature-gated integration test target at `tests/testnet_e2e.rs`
 - end-to-end proposer -> miner -> proposer flow over real TCP
+- restart/persistence proposer -> miner -> proposer flow over real TCP
+- multi-hop proposer -> relay -> miner -> relay -> proposer flow over real TCP
 
 What the current E2E test proves:
 - a proposer-facing node accepts a payment transaction
@@ -34,12 +36,14 @@ What the current E2E test proves:
 - the miner mines the transaction into a block
 - the proposer node learns the mined block through relay
 - both nodes converge on the same tip and balances
+- a restarted proposer reloads persisted mempool/chain state from SQLite and still converges after mining
+- a relay node can forward a payment onward to a miner and forward the mined block back to the proposer
 
 Current limitation:
 - relay is still short-lived request/response TCP rather than persistent peer sessions
 - origin suppression now prefers the advertised listener address from `hello`
   and falls back to `node_name` only when that address is unavailable
-- the scripted E2E coverage is still only the direct two-node proposer/miner path
+- missed-block catch-up is not yet covered by the scripted E2E flow
 
 ## Implementation Plan
 
@@ -89,6 +93,10 @@ Flow:
 4. verify the mined block returns through node B to node A
 5. assert all three nodes converge on the same tip
 
+Completed:
+- proposer restart and SQLite-backed recovery are covered in `tests/testnet_e2e.rs`
+- multi-hop relay through an intermediate node is covered in `tests/testnet_e2e.rs`
+
 ### 4. Catch-Up After Missed Blocks
 
 Prove that a node that misses a block can reconnect and catch up with the
@@ -121,6 +129,4 @@ We consider the current slice complete when:
 
 We consider the next testnet slice complete when:
 - the README shows a real manual two-node flow
-- restart/persistence is covered by an end-to-end test
-- a multi-hop relay scenario is covered by an end-to-end test
 - reconnect and catch-up after missed blocks is covered by an end-to-end test

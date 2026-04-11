@@ -448,3 +448,155 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
     fs::remove_file(&proposer_sqlite).unwrap();
     fs::remove_file(&miner_sqlite).unwrap();
 }
+
+#[test]
+fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
+    let sender = crypto::signing_key_from_bytes([21; 32]);
+    let recipient = crypto::signing_key_from_bytes([22; 32]);
+    let miner = crypto::signing_key_from_bytes([23; 32]);
+    let genesis = mine_block(
+        BlockHash::default(),
+        0x207f_ffff,
+        &sender.verifying_key(),
+        0,
+    );
+    let spendable = OutPoint {
+        txid: genesis.transactions[0].txid(),
+        vout: 0,
+    };
+    let payment = spend_with_change(spendable, &sender, &recipient.verifying_key(), 30, 20, 1);
+    let payment_txid = payment.txid();
+
+    let mut proposer_state = NodeState::new();
+    proposer_state.accept_block(genesis.clone()).unwrap();
+    let mut relay_state = NodeState::new();
+    relay_state.accept_block(genesis.clone()).unwrap();
+    let mut miner_state = NodeState::new();
+    miner_state.accept_block(genesis).unwrap();
+
+    let proposer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proposer_addr = proposer_listener.local_addr().unwrap().to_string();
+    let relay_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap().to_string();
+    let miner_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let miner_addr = miner_listener.local_addr().unwrap().to_string();
+
+    let proposer = Server::new(
+        PeerConfig::new("wobble-local", Some("proposer".to_string()))
+            .with_advertised_addr(proposer_addr.clone()),
+        proposer_state,
+    )
+    .with_peers(vec![PeerEndpoint::new(
+        relay_addr.clone(),
+        Some("relay".to_string()),
+    )]);
+    let relay_server = Server::new(
+        PeerConfig::new("wobble-local", Some("relay".to_string()))
+            .with_advertised_addr(relay_addr.clone()),
+        relay_state,
+    )
+    .with_peers(vec![
+        PeerEndpoint::new(proposer_addr.clone(), Some("proposer".to_string())),
+        PeerEndpoint::new(miner_addr.clone(), Some("miner".to_string())),
+    ]);
+    let miner_server = Server::new(
+        PeerConfig::new("wobble-local", Some("miner".to_string()))
+            .with_advertised_addr(miner_addr.clone()),
+        miner_state,
+    )
+    .with_peers(vec![PeerEndpoint::new(
+        relay_addr.clone(),
+        Some("relay".to_string()),
+    )]);
+
+    // proposer inbound: submitter client + relayed mined block
+    // relay inbound: relayed payment from proposer + relayed block from miner
+    // miner inbound: relayed payment from relay + mining request client
+    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 2));
+    let relay_worker = thread::spawn(move || serve_n(relay_server, relay_listener, 2));
+    let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 2));
+
+    let mut proposer_client = connect_and_handshake(&proposer_addr, "submitter");
+    net::send_message(
+        &mut proposer_client,
+        &WireMessage::AnnounceTx {
+            transaction: payment.clone(),
+        },
+    )
+    .unwrap();
+    drop(proposer_client);
+
+    thread::sleep(Duration::from_millis(100));
+
+    let mut miner_client = connect_and_handshake(&miner_addr, "miner-client");
+    net::send_message(
+        &mut miner_client,
+        &WireMessage::MinePending(MinePendingRequest {
+            reward: 50,
+            miner_public_key: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
+            uniqueness: 2,
+            bits: 0x207f_ffff,
+            max_transactions: 10,
+        }),
+    )
+    .unwrap();
+    let mined = net::receive_message(&mut miner_client).unwrap();
+    let WireMessage::MinedBlock(MinedBlock { block_hash }) = mined else {
+        panic!("expected mined_block reply");
+    };
+    drop(miner_client);
+
+    thread::sleep(Duration::from_millis(100));
+
+    let proposer = proposer_worker.join().unwrap();
+    let relay_server = relay_worker.join().unwrap();
+    let miner_server = miner_worker.join().unwrap();
+
+    assert_eq!(
+        proposer.state().chain().best_tip(),
+        relay_server.state().chain().best_tip()
+    );
+    assert_eq!(
+        relay_server.state().chain().best_tip(),
+        miner_server.state().chain().best_tip()
+    );
+    assert_eq!(proposer.state().chain().best_tip(), Some(block_hash));
+
+    assert!(proposer.state().mempool().is_empty());
+    assert!(relay_server.state().mempool().is_empty());
+    assert!(miner_server.state().mempool().is_empty());
+
+    let proposer_tip = proposer.state().get_block(&block_hash).unwrap();
+    let relay_tip = relay_server.state().get_block(&block_hash).unwrap();
+    let miner_tip = miner_server.state().get_block(&block_hash).unwrap();
+    assert_eq!(proposer_tip, relay_tip);
+    assert_eq!(relay_tip, miner_tip);
+    assert_eq!(proposer_tip.transactions.len(), 2);
+    assert_eq!(proposer_tip.transactions[1].txid(), payment_txid);
+
+    assert_eq!(
+        proposer.state().balance_for_key(&recipient.verifying_key()),
+        30
+    );
+    assert_eq!(
+        relay_server
+            .state()
+            .balance_for_key(&recipient.verifying_key()),
+        30
+    );
+    assert_eq!(
+        miner_server
+            .state()
+            .balance_for_key(&recipient.verifying_key()),
+        30
+    );
+    assert_eq!(proposer.state().balance_for_key(&miner.verifying_key()), 50);
+    assert_eq!(
+        relay_server.state().balance_for_key(&miner.verifying_key()),
+        50
+    );
+    assert_eq!(
+        miner_server.state().balance_for_key(&miner.verifying_key()),
+        50
+    );
+}
