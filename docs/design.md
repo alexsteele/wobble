@@ -79,6 +79,7 @@ Consensus is Nakamoto-style:
 - a `TxIn` consumes a prior `TxOut` by referencing `(prev_txid, prev_vout)` and providing matching `unlocking_data`
 - inputs destroy old UTXOs; outputs create new UTXOs
 - partial spends are modeled by creating a change output, not by splitting an input in place
+- a coinbase transaction is the special first transaction in a block that creates new coins and collects block fees
 
 ## Validation Rules
 
