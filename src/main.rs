@@ -278,6 +278,59 @@ fn run() -> Result<(), String> {
 
             Ok(())
         }
+        "submit-payment-remote" => {
+            if args.len() != 9 && args.len() != 10 {
+                return Err(usage());
+            }
+
+            let snapshot_path = Path::new(&args[2]);
+            let sender_wallet_path = Path::new(&args[3]);
+            let recipient_verifying_key = parse_public_key_or_alias(&args[4])?;
+            let amount = parse_u64(&args[5], "amount")?;
+            let uniqueness = parse_u32(&args[6], "uniqueness")?;
+            let peer_addr = &args[7];
+            let network = args[8].clone();
+            let node_name = args.get(9).cloned();
+            let sender_wallet = wallet::load_wallet(sender_wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
+            let mut local_state = store::load_node_state(snapshot_path)
+                .map_err(|err| format!("load failed: {err:?}"))?;
+
+            let txid = local_state
+                .submit_payment(
+                    sender_wallet.signing_key(),
+                    &recipient_verifying_key,
+                    amount,
+                    uniqueness,
+                )
+                .map_err(|err| format!("build failed: {err:?}"))?;
+            let transaction =
+                local_state.mempool().get(&txid).cloned().ok_or_else(|| {
+                    format!("built transaction {txid} missing from local mempool")
+                })?;
+
+            let mut stream =
+                net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
+            let hello = WireMessage::Hello(HelloMessage {
+                network,
+                version: PROTOCOL_VERSION,
+                node_name,
+                tip: None,
+                height: None,
+            });
+            net::send_message(&mut stream, &hello)
+                .map_err(|err| format!("send hello failed: {err}"))?;
+            let remote_hello = net::receive_message(&mut stream)
+                .map_err(|err| format!("receive hello failed: {err}"))?;
+            if !matches!(remote_hello, WireMessage::Hello(_)) {
+                return Err(format!("unexpected handshake response: {remote_hello:?}"));
+            }
+            net::send_message(&mut stream, &WireMessage::AnnounceTx { transaction })
+                .map_err(|err| format!("send transaction failed: {err}"))?;
+
+            println!("submitted payment {} to {}", txid, peer_addr);
+            Ok(())
+        }
         "submit-transfer" => {
             if args.len() != 8 {
                 return Err(usage());
@@ -441,6 +494,7 @@ fn usage() -> String {
         "  wobble alias-list <alias_book>",
         "  wobble serve <snapshot> <listen_addr> <network> [node_name]",
         "  wobble get-tip <peer_addr> <network> [node_name]",
+        "  wobble submit-payment-remote <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
         "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
