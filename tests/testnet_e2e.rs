@@ -7,6 +7,7 @@
 #![cfg(feature = "e2e")]
 
 use std::{
+    collections::HashMap,
     fs,
     net::TcpListener,
     path::PathBuf,
@@ -137,23 +138,157 @@ fn connect_and_handshake(addr: &str, node_name: &str) -> std::net::TcpStream {
     stream
 }
 
-fn sqlite_backed_server(
-    sqlite_path: &std::path::Path,
-    listen_addr: &str,
-    node_name: &str,
-    peers: Vec<PeerEndpoint>,
-) -> Server {
-    let state = SqliteStore::open(sqlite_path)
-        .unwrap()
-        .load_node_state()
+/// Small real-TCP harness for multi-node end-to-end scenarios.
+///
+/// This keeps address allocation, peer wiring, listener ownership, and
+/// SQLite-backed restarts out of the individual test flows.
+struct TestNet {
+    nodes: HashMap<String, TestNode>,
+}
+
+struct TestNode {
+    name: String,
+    addr: String,
+    peer_names: Vec<String>,
+    sqlite_path: Option<PathBuf>,
+    listener: Option<TcpListener>,
+}
+
+enum NodeBootstrap {
+    State(NodeState),
+    Persisted,
+}
+
+struct RunningNode {
+    worker: thread::JoinHandle<Server>,
+}
+
+impl TestNet {
+    fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+        }
+    }
+
+    fn add_node(&mut self, name: &str, peer_names: &[&str]) {
+        self.add_node_with_sqlite(name, peer_names, None);
+    }
+
+    fn add_node_with_sqlite(
+        &mut self,
+        name: &str,
+        peer_names: &[&str],
+        sqlite_path: Option<PathBuf>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        self.nodes.insert(
+            name.to_string(),
+            TestNode {
+                name: name.to_string(),
+                addr,
+                peer_names: peer_names.iter().map(|name| name.to_string()).collect(),
+                sqlite_path,
+                listener: Some(listener),
+            },
+        );
+    }
+
+    fn addr(&self, name: &str) -> &str {
+        &self.nodes.get(name).unwrap().addr
+    }
+
+    fn peer_endpoints(&self, name: &str) -> Vec<PeerEndpoint> {
+        let node = self.nodes.get(name).unwrap();
+        node.peer_names
+            .iter()
+            .map(|peer_name| {
+                let peer = self.nodes.get(peer_name).unwrap();
+                PeerEndpoint::new(peer.addr.clone(), Some(peer.name.clone()))
+            })
+            .collect()
+    }
+
+    fn start(&mut self, name: &str, bootstrap: NodeBootstrap, count: usize) -> RunningNode {
+        let addr = self.addr(name).to_string();
+        let peer_endpoints = self.peer_endpoints(name);
+        let node = self.nodes.get_mut(name).unwrap();
+        let listener = node.listener.take().unwrap();
+        let (state, sqlite_path) = match bootstrap {
+            NodeBootstrap::State(state) => (state, None),
+            NodeBootstrap::Persisted => {
+                let sqlite_path = node
+                    .sqlite_path
+                    .clone()
+                    .expect("persisted test node requires sqlite path");
+                let state = SqliteStore::open(&sqlite_path)
+                    .unwrap()
+                    .load_node_state()
+                    .unwrap();
+                (state, Some(sqlite_path))
+            }
+        };
+        let mut server = Server::new(
+            PeerConfig::new("wobble-local", Some(node.name.clone())).with_advertised_addr(addr),
+            state,
+        )
+        .with_peers(peer_endpoints);
+        if let Some(sqlite_path) = sqlite_path.as_deref() {
+            server = server.with_sqlite_path(sqlite_path);
+        }
+
+        RunningNode {
+            worker: thread::spawn(move || serve_n(server, listener, count)),
+        }
+    }
+
+    fn restart(&mut self, name: &str, count: usize) -> RunningNode {
+        let addr = self.addr(name).to_string();
+        assert!(
+            self.nodes.get(name).unwrap().sqlite_path.is_some(),
+            "restart requires persisted node backing"
+        );
+        let listener = TcpListener::bind(&addr).unwrap();
+        self.nodes.get_mut(name).unwrap().listener = Some(listener);
+        self.start(name, NodeBootstrap::Persisted, count)
+    }
+
+    fn submit_payment(&self, node_name: &str, transaction: Transaction) {
+        let mut client = connect_and_handshake(self.addr(node_name), "submitter");
+        net::send_message(&mut client, &WireMessage::AnnounceTx { transaction }).unwrap();
+        drop(client);
+    }
+
+    fn mine_pending(&self, node_name: &str, miner: &ed25519_dalek::SigningKey) -> BlockHash {
+        let mut client = connect_and_handshake(self.addr(node_name), "miner-client");
+        net::send_message(
+            &mut client,
+            &WireMessage::MinePending(MinePendingRequest {
+                reward: 50,
+                miner_public_key: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
+                uniqueness: 2,
+                bits: 0x207f_ffff,
+                max_transactions: 10,
+            }),
+        )
         .unwrap();
-    Server::new(
-        PeerConfig::new("wobble-local", Some(node_name.to_string()))
-            .with_advertised_addr(listen_addr.to_string()),
-        state,
-    )
-    .with_peers(peers)
-    .with_sqlite_path(sqlite_path)
+        let mined = net::receive_message(&mut client).unwrap();
+        let WireMessage::MinedBlock(MinedBlock { block_hash }) = mined else {
+            panic!("expected mined_block reply");
+        };
+        drop(client);
+        block_hash
+    }
+
+    fn sync_delay(&self) {
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+impl RunningNode {
+    fn join(self) -> Server {
+        self.worker.join().unwrap()
+    }
 }
 
 #[test]
@@ -179,74 +314,20 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     let mut miner_state = NodeState::new();
     miner_state.accept_block(genesis).unwrap();
 
-    let proposer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let proposer_addr = proposer_listener.local_addr().unwrap().to_string();
-    let miner_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let miner_addr = miner_listener.local_addr().unwrap().to_string();
+    let mut testnet = TestNet::new();
+    testnet.add_node("proposer", &["miner"]);
+    testnet.add_node("miner", &["proposer"]);
 
-    let proposer = Server::new(
-        PeerConfig::new("wobble-local", Some("proposer".to_string()))
-            .with_advertised_addr(proposer_addr.clone()),
-        proposer_state,
-    )
-    .with_peers(vec![PeerEndpoint::new(
-        miner_addr.clone(),
-        Some("miner".to_string()),
-    )]);
-    let miner_server = Server::new(
-        PeerConfig::new("wobble-local", Some("miner".to_string()))
-            .with_advertised_addr(miner_addr.clone()),
-        miner_state,
-    )
-    .with_peers(vec![PeerEndpoint::new(
-        proposer_addr.clone(),
-        Some("proposer".to_string()),
-    )]);
+    let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 2);
 
-    // Origin suppression avoids relaying accepted objects back to the named
-    // peer that just sent them, so this path needs only one tx relay and one
-    // block relay in addition to the direct client connections.
-    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 2));
-    let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 2));
+    testnet.submit_payment("proposer", payment.clone());
+    testnet.sync_delay();
+    let block_hash = testnet.mine_pending("miner", &miner);
+    testnet.sync_delay();
 
-    let mut proposer_client = connect_and_handshake(&proposer_addr, "submitter");
-    net::send_message(
-        &mut proposer_client,
-        &WireMessage::AnnounceTx {
-            transaction: payment.clone(),
-        },
-    )
-    .unwrap();
-    drop(proposer_client);
-
-    // Relay is best-effort and synchronous, but this small wait keeps the test
-    // deterministic across slower local scheduling.
-    thread::sleep(Duration::from_millis(100));
-
-    let mut miner_client = connect_and_handshake(&miner_addr, "miner-client");
-    net::send_message(
-        &mut miner_client,
-        &WireMessage::MinePending(MinePendingRequest {
-            reward: 50,
-            miner_public_key: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
-            uniqueness: 2,
-            bits: 0x207f_ffff,
-            max_transactions: 10,
-        }),
-    )
-    .unwrap();
-    let mined = net::receive_message(&mut miner_client).unwrap();
-    let WireMessage::MinedBlock(MinedBlock { block_hash }) = mined else {
-        panic!("expected mined_block reply");
-    };
-    drop(miner_client);
-
-    // Give the mined-block relay a brief window to complete before asserting
-    // final convergence across both live servers.
-    thread::sleep(Duration::from_millis(100));
-
-    let proposer = proposer_worker.join().unwrap();
-    let miner_server = miner_worker.join().unwrap();
+    let proposer = proposer.join();
+    let miner_server = miner_server.join();
 
     assert_eq!(
         proposer.state().chain().best_tip(),
@@ -323,46 +404,16 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
         .save_node_state(&miner_state)
         .unwrap();
 
-    let proposer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let proposer_addr = proposer_listener.local_addr().unwrap().to_string();
-    let miner_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let miner_addr = miner_listener.local_addr().unwrap().to_string();
+    let mut testnet = TestNet::new();
+    testnet.add_node_with_sqlite("proposer", &["miner"], Some(proposer_sqlite.clone()));
+    testnet.add_node_with_sqlite("miner", &["proposer"], Some(miner_sqlite.clone()));
 
-    let proposer = sqlite_backed_server(
-        &proposer_sqlite,
-        &proposer_addr,
-        "proposer",
-        vec![PeerEndpoint::new(
-            miner_addr.clone(),
-            Some("miner".to_string()),
-        )],
-    );
-    let miner_server = sqlite_backed_server(
-        &miner_sqlite,
-        &miner_addr,
-        "miner",
-        vec![PeerEndpoint::new(
-            proposer_addr.clone(),
-            Some("proposer".to_string()),
-        )],
-    );
+    let proposer = testnet.start("proposer", NodeBootstrap::Persisted, 1);
+    let miner_server = testnet.start("miner", NodeBootstrap::Persisted, 2);
 
-    // First proposer process handles only the inbound payment submission and
-    // persists the accepted mempool state before we restart it from SQLite.
-    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 1));
-    let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 2));
+    testnet.submit_payment("proposer", payment.clone());
 
-    let mut proposer_client = connect_and_handshake(&proposer_addr, "submitter");
-    net::send_message(
-        &mut proposer_client,
-        &WireMessage::AnnounceTx {
-            transaction: payment.clone(),
-        },
-    )
-    .unwrap();
-    drop(proposer_client);
-
-    let first_proposer = proposer_worker.join().unwrap();
+    let first_proposer = proposer.join();
     assert!(
         first_proposer
             .state()
@@ -377,45 +428,14 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
         .unwrap();
     assert!(reloaded.mempool().get(&payment_txid).is_some());
 
-    let restarted_listener = TcpListener::bind(&proposer_addr).unwrap();
-    let restarted_proposer = sqlite_backed_server(
-        &proposer_sqlite,
-        &proposer_addr,
-        "proposer",
-        vec![PeerEndpoint::new(
-            miner_addr.clone(),
-            Some("miner".to_string()),
-        )],
-    );
-    let restarted_worker =
-        thread::spawn(move || serve_n(restarted_proposer, restarted_listener, 1));
+    let restarted_proposer = testnet.restart("proposer", 1);
 
-    // Give the miner time to accept and persist the relayed mempool state
-    // before triggering mining on the live server.
-    thread::sleep(Duration::from_millis(100));
+    testnet.sync_delay();
+    let block_hash = testnet.mine_pending("miner", &miner);
+    testnet.sync_delay();
 
-    let mut miner_client = connect_and_handshake(&miner_addr, "miner-client");
-    net::send_message(
-        &mut miner_client,
-        &WireMessage::MinePending(MinePendingRequest {
-            reward: 50,
-            miner_public_key: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
-            uniqueness: 2,
-            bits: 0x207f_ffff,
-            max_transactions: 10,
-        }),
-    )
-    .unwrap();
-    let mined = net::receive_message(&mut miner_client).unwrap();
-    let WireMessage::MinedBlock(MinedBlock { block_hash }) = mined else {
-        panic!("expected mined_block reply");
-    };
-    drop(miner_client);
-
-    thread::sleep(Duration::from_millis(100));
-
-    let restarted_proposer = restarted_worker.join().unwrap();
-    let miner_server = miner_worker.join().unwrap();
+    let restarted_proposer = restarted_proposer.join();
+    let miner_server = miner_server.join();
 
     assert_eq!(
         restarted_proposer.state().chain().best_tip(),
@@ -474,83 +494,23 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
     let mut miner_state = NodeState::new();
     miner_state.accept_block(genesis).unwrap();
 
-    let proposer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let proposer_addr = proposer_listener.local_addr().unwrap().to_string();
-    let relay_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let relay_addr = relay_listener.local_addr().unwrap().to_string();
-    let miner_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let miner_addr = miner_listener.local_addr().unwrap().to_string();
+    let mut testnet = TestNet::new();
+    testnet.add_node("proposer", &["relay"]);
+    testnet.add_node("relay", &["proposer", "miner"]);
+    testnet.add_node("miner", &["relay"]);
 
-    let proposer = Server::new(
-        PeerConfig::new("wobble-local", Some("proposer".to_string()))
-            .with_advertised_addr(proposer_addr.clone()),
-        proposer_state,
-    )
-    .with_peers(vec![PeerEndpoint::new(
-        relay_addr.clone(),
-        Some("relay".to_string()),
-    )]);
-    let relay_server = Server::new(
-        PeerConfig::new("wobble-local", Some("relay".to_string()))
-            .with_advertised_addr(relay_addr.clone()),
-        relay_state,
-    )
-    .with_peers(vec![
-        PeerEndpoint::new(proposer_addr.clone(), Some("proposer".to_string())),
-        PeerEndpoint::new(miner_addr.clone(), Some("miner".to_string())),
-    ]);
-    let miner_server = Server::new(
-        PeerConfig::new("wobble-local", Some("miner".to_string()))
-            .with_advertised_addr(miner_addr.clone()),
-        miner_state,
-    )
-    .with_peers(vec![PeerEndpoint::new(
-        relay_addr.clone(),
-        Some("relay".to_string()),
-    )]);
+    let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
+    let relay_server = testnet.start("relay", NodeBootstrap::State(relay_state), 2);
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 2);
 
-    // proposer inbound: submitter client + relayed mined block
-    // relay inbound: relayed payment from proposer + relayed block from miner
-    // miner inbound: relayed payment from relay + mining request client
-    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 2));
-    let relay_worker = thread::spawn(move || serve_n(relay_server, relay_listener, 2));
-    let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 2));
+    testnet.submit_payment("proposer", payment.clone());
+    testnet.sync_delay();
+    let block_hash = testnet.mine_pending("miner", &miner);
+    testnet.sync_delay();
 
-    let mut proposer_client = connect_and_handshake(&proposer_addr, "submitter");
-    net::send_message(
-        &mut proposer_client,
-        &WireMessage::AnnounceTx {
-            transaction: payment.clone(),
-        },
-    )
-    .unwrap();
-    drop(proposer_client);
-
-    thread::sleep(Duration::from_millis(100));
-
-    let mut miner_client = connect_and_handshake(&miner_addr, "miner-client");
-    net::send_message(
-        &mut miner_client,
-        &WireMessage::MinePending(MinePendingRequest {
-            reward: 50,
-            miner_public_key: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
-            uniqueness: 2,
-            bits: 0x207f_ffff,
-            max_transactions: 10,
-        }),
-    )
-    .unwrap();
-    let mined = net::receive_message(&mut miner_client).unwrap();
-    let WireMessage::MinedBlock(MinedBlock { block_hash }) = mined else {
-        panic!("expected mined_block reply");
-    };
-    drop(miner_client);
-
-    thread::sleep(Duration::from_millis(100));
-
-    let proposer = proposer_worker.join().unwrap();
-    let relay_server = relay_worker.join().unwrap();
-    let miner_server = miner_worker.join().unwrap();
+    let proposer = proposer.join();
+    let relay_server = relay_server.join();
+    let miner_server = miner_server.join();
 
     assert_eq!(
         proposer.state().chain().best_tip(),
