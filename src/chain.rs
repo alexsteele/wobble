@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    consensus::{self, ConsensusError},
+    consensus::{self, ConsensusError, PowTarget},
     types::{Block, BlockHash, ChainIndexEntry},
 };
 
@@ -117,24 +117,9 @@ impl ChainIndex {
 /// Work is derived from the expanded proof-of-work target and summed across a
 /// branch to determine the best tip.
 pub fn block_work(block: &Block) -> Result<u128, ChainError> {
-    let target = consensus::expand_compact_target_for_chain(block.header.bits)
+    let target = PowTarget::from_compact(block.header.bits)
         .ok_or(ChainError::InvalidBlock(ConsensusError::InvalidPowTarget))?;
-
-    let leading = u128::from_be_bytes(target[..16].try_into().expect("slice length is fixed"));
-    let trailing = u128::from_be_bytes(target[16..].try_into().expect("slice length is fixed"));
-
-    let denominator = if leading == 0 {
-        1
-    } else {
-        leading.saturating_add(1)
-    };
-    let base_work = u128::MAX / denominator;
-
-    if leading == 0 && trailing != u128::MAX {
-        return Ok(base_work.saturating_sub(trailing / 2));
-    }
-
-    Ok(base_work)
+    Ok(target.work())
 }
 
 #[cfg(test)]

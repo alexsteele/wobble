@@ -9,14 +9,86 @@
 
 use crate::{
     state::{UtxoSet, ValidationError},
-    types::{Block, BlockHeight},
+    types::{Block, BlockHash, BlockHeight},
 };
 
 /// Expanded 256-bit proof-of-work threshold represented as a big-endian integer.
 ///
 /// A block header is valid only if its hash, interpreted the same way, is less
 /// than or equal to this target.
-type PowTarget = [u8; 32];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PowTarget([u8; 32]);
+
+impl PowTarget {
+    /// Parses Bitcoin-style compact difficulty encoding into a full target.
+    ///
+    /// The high byte is an exponent and the low three bytes are a mantissa. This is
+    /// effectively a base-256 scientific-notation form for the target:
+    /// `target = mantissa * 256^(exponent - 3)`.
+    ///
+    /// Example: `0x1d00ffff` means exponent `0x1d` and mantissa `0x00ffff`, which
+    /// expands into Bitcoin's historical maximum target.
+    pub(crate) fn from_compact(bits: u32) -> Option<Self> {
+        let exponent = (bits >> 24) as usize;
+        let mantissa = bits & 0x007f_ffff;
+        let is_negative = (bits & 0x0080_0000) != 0;
+
+        if is_negative || mantissa == 0 {
+            return None;
+        }
+
+        let mantissa_bytes = [
+            ((mantissa >> 16) & 0xff) as u8,
+            ((mantissa >> 8) & 0xff) as u8,
+            (mantissa & 0xff) as u8,
+        ];
+
+        let mut target = [0_u8; 32];
+        if exponent <= 3 {
+            let value = mantissa >> (8 * (3 - exponent));
+            let bytes = value.to_be_bytes();
+            target[28..].copy_from_slice(&bytes);
+            return Some(Self(target));
+        }
+
+        let offset = 32usize.checked_sub(exponent)?;
+        if offset + 3 > 32 {
+            return None;
+        }
+
+        target[offset..offset + 3].copy_from_slice(&mantissa_bytes);
+        Some(Self(target))
+    }
+
+    /// Returns true if `hash` satisfies this proof-of-work threshold.
+    pub(crate) fn is_met_by(&self, hash: &BlockHash) -> bool {
+        hash.as_bytes() <= &self.0
+    }
+
+    /// Returns the amount of chain-selection work represented by this target.
+    pub(crate) fn work(&self) -> u128 {
+        let leading = u128::from_be_bytes(self.0[..16].try_into().expect("slice length is fixed"));
+        let trailing = u128::from_be_bytes(self.0[16..].try_into().expect("slice length is fixed"));
+
+        let denominator = if leading == 0 {
+            1
+        } else {
+            leading.saturating_add(1)
+        };
+        let base_work = u128::MAX / denominator;
+
+        if leading == 0 && trailing != u128::MAX {
+            return base_work.saturating_sub(trailing / 2);
+        }
+
+        base_work
+    }
+
+    #[cfg(test)]
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
@@ -85,55 +157,15 @@ pub fn validate_block(block: &Block) -> Result<(), ConsensusError> {
 /// less than or equal to that target. Smaller targets are harder to satisfy
 /// and therefore represent higher difficulty.
 fn validate_header_pow(block: &Block) -> Result<(), ConsensusError> {
-    let target = expand_compact_target_for_chain(block.header.bits)
-        .ok_or(ConsensusError::InvalidPowTarget)?;
+    let target =
+        PowTarget::from_compact(block.header.bits).ok_or(ConsensusError::InvalidPowTarget)?;
     let hash = block.header.block_hash();
 
-    if hash.as_bytes() > &target {
+    if !target.is_met_by(&hash) {
         return Err(ConsensusError::InsufficientProofOfWork);
     }
 
     Ok(())
-}
-
-/// Converts Bitcoin-style compact difficulty encoding into a full 256-bit target.
-///
-/// The high byte is an exponent and the low three bytes are a mantissa. This is
-/// effectively a base-256 scientific-notation form for the target:
-/// `target = mantissa * 256^(exponent - 3)`.
-///
-/// Example: `0x1d00ffff` means exponent `0x1d` and mantissa `0x00ffff`, which
-/// expands into Bitcoin's historical maximum target.
-pub(crate) fn expand_compact_target_for_chain(bits: u32) -> Option<PowTarget> {
-    let exponent = (bits >> 24) as usize;
-    let mantissa = bits & 0x007f_ffff;
-    let is_negative = (bits & 0x0080_0000) != 0;
-
-    if is_negative || mantissa == 0 {
-        return None;
-    }
-
-    let mantissa_bytes = [
-        ((mantissa >> 16) & 0xff) as u8,
-        ((mantissa >> 8) & 0xff) as u8,
-        (mantissa & 0xff) as u8,
-    ];
-
-    let mut target: PowTarget = [0_u8; 32];
-    if exponent <= 3 {
-        let value = mantissa >> (8 * (3 - exponent));
-        let bytes = value.to_be_bytes();
-        target[28..].copy_from_slice(&bytes);
-        return Some(target);
-    }
-
-    let offset = 32usize.checked_sub(exponent)?;
-    if offset + 3 > 32 {
-        return None;
-    }
-
-    target[offset..offset + 3].copy_from_slice(&mantissa_bytes);
-    Some(target)
 }
 
 #[cfg(test)]
@@ -143,7 +175,7 @@ mod tests {
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut, Txid},
     };
 
-    use super::{ConsensusError, apply_block, expand_compact_target_for_chain, validate_block};
+    use super::{ConsensusError, PowTarget, apply_block, validate_block};
 
     // `uniqueness` perturbs the coinbase so separate test blocks do not reuse
     // the same transaction id for otherwise identical rewards.
@@ -340,28 +372,28 @@ mod tests {
 
     #[test]
     fn expands_compact_target_with_large_exponent() {
-        let target = expand_compact_target_for_chain(0x1d00ffff).unwrap();
+        let target = PowTarget::from_compact(0x1d00ffff).unwrap();
 
-        assert_eq!(target[3], 0x00);
-        assert_eq!(target[4], 0xff);
-        assert_eq!(target[5], 0xff);
-        assert!(target[..3].iter().all(|byte| *byte == 0));
-        assert!(target[6..].iter().all(|byte| *byte == 0));
+        assert_eq!(target.as_bytes()[3], 0x00);
+        assert_eq!(target.as_bytes()[4], 0xff);
+        assert_eq!(target.as_bytes()[5], 0xff);
+        assert!(target.as_bytes()[..3].iter().all(|byte| *byte == 0));
+        assert!(target.as_bytes()[6..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
     fn expands_compact_target_with_small_exponent() {
-        let target = expand_compact_target_for_chain(0x0300ff00).unwrap();
+        let target = PowTarget::from_compact(0x0300ff00).unwrap();
 
-        assert_eq!(target[30], 0xff);
-        assert_eq!(target[31], 0x00);
-        assert!(target[..30].iter().all(|byte| *byte == 0));
+        assert_eq!(target.as_bytes()[30], 0xff);
+        assert_eq!(target.as_bytes()[31], 0x00);
+        assert!(target.as_bytes()[..30].iter().all(|byte| *byte == 0));
     }
 
     #[test]
     fn rejects_invalid_compact_targets() {
-        assert_eq!(expand_compact_target_for_chain(0), None);
-        assert_eq!(expand_compact_target_for_chain(0x1d800001), None);
-        assert_eq!(expand_compact_target_for_chain(0x21010000), None);
+        assert_eq!(PowTarget::from_compact(0), None);
+        assert_eq!(PowTarget::from_compact(0x1d800001), None);
+        assert_eq!(PowTarget::from_compact(0x21010000), None);
     }
 }
