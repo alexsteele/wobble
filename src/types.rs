@@ -12,6 +12,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::crypto;
 
 pub type Amount = u64;
@@ -20,7 +22,7 @@ pub type BlockHeight = u64;
 pub type UnixTimestamp = u64;
 
 /// Transaction identifier bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Txid([u8; 32]);
 
 impl Txid {
@@ -54,7 +56,7 @@ impl fmt::Display for Txid {
 }
 
 /// Block header hash bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct BlockHash([u8; 32]);
 
 impl BlockHash {
@@ -88,28 +90,28 @@ impl fmt::Display for BlockHash {
 }
 
 /// Identifies a specific output of a prior transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OutPoint {
     pub txid: Txid,
     pub vout: u32,
 }
 
 /// Consumes a prior output by providing spend authorization data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxIn {
     pub previous_output: OutPoint,
     pub unlocking_data: Vec<u8>,
 }
 
 /// Creates spendable value together with its future spend condition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxOut {
     pub value: Amount,
     pub locking_data: Vec<u8>,
 }
 
 /// A UTXO-model transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub version: u32,
     pub inputs: Vec<TxIn>,
@@ -119,7 +121,7 @@ pub struct Transaction {
 }
 
 /// Fields committed by proof-of-work and chain linking.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub version: u32,
     pub prev_blockhash: BlockHash,
@@ -130,14 +132,14 @@ pub struct BlockHeader {
 }
 
 /// A block body paired with its mined header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
 }
 
 /// Metadata used to compare competing chain tips.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainIndexEntry {
     pub block_hash: BlockHash,
     pub height: BlockHeight,
@@ -146,7 +148,7 @@ pub struct ChainIndexEntry {
 }
 
 /// Materialized unspent output tracked in chain state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Utxo {
     pub outpoint: OutPoint,
     pub output: TxOut,

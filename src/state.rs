@@ -7,6 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::{Amount, BlockHeight, OutPoint, Transaction, TxOut, Utxo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +25,7 @@ pub enum ValidationError {
 }
 
 /// In-memory view of the current unspent transaction outputs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UtxoSet {
     entries: HashMap<OutPoint, Utxo>,
 }

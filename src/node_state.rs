@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     chain::{ChainError, ChainIndex},
     consensus::{self, ConsensusError},
@@ -22,7 +24,7 @@ pub enum NodeStateError {
 }
 
 /// Tracks indexed blocks together with the active-chain UTXO view.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeState {
     chain: ChainIndex,
     active_utxos: UtxoSet,

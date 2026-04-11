@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     consensus::{self, ConsensusError, PowTarget},
     types::{Block, BlockHash, ChainIndexEntry},
@@ -19,7 +21,7 @@ pub enum ChainError {
 }
 
 /// Index of known blocks keyed by hash, with best-tip tracking by cumulative work.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChainIndex {
     entries: HashMap<BlockHash, ChainIndexEntry>,
     best_tip: Option<BlockHash>,
