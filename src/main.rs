@@ -48,6 +48,18 @@ fn run() -> Result<(), String> {
             println!("mempool txs: {}", state.mempool().len());
             Ok(())
         }
+        "balance" => {
+            if args.len() != 4 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            let owner = parse_public_key(&args[3])?;
+            let state =
+                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            println!("{}", state.balance_for_key(&owner));
+            Ok(())
+        }
         "utxos" => {
             if args.len() != 3 {
                 return Err(usage());
@@ -111,6 +123,20 @@ fn run() -> Result<(), String> {
                 "{}",
                 encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
             );
+            Ok(())
+        }
+        "wallet-balance" => {
+            if args.len() != 4 {
+                return Err(usage());
+            }
+
+            let snapshot_path = Path::new(&args[2]);
+            let wallet_path = Path::new(&args[3]);
+            let wallet = wallet::load_wallet(wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
+            let state = store::load_node_state(snapshot_path)
+                .map_err(|err| format!("load failed: {err:?}"))?;
+            println!("{}", state.balance_for_key(&wallet.verifying_key()));
             Ok(())
         }
         "submit-transfer" => {
@@ -265,10 +291,12 @@ fn usage() -> String {
         "usage:",
         "  wobble init <snapshot>",
         "  wobble info <snapshot>",
+        "  wobble balance <snapshot> <public_key>",
         "  wobble utxos <snapshot>",
         "  wobble generate-key",
         "  wobble create-wallet <wallet_path>",
         "  wobble wallet-address <wallet_path>",
+        "  wobble wallet-balance <snapshot> <wallet_path>",
         "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",

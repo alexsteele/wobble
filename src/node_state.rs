@@ -75,6 +75,16 @@ impl NodeState {
         outpoints
     }
 
+    /// Returns the total active-chain balance locked to `owner`.
+    pub fn balance_for_key(&self, owner: &VerifyingKey) -> Amount {
+        let owner_bytes = crypto::verifying_key_bytes(owner);
+        self.active_utxos
+            .iter()
+            .filter(|(_, utxo)| utxo.output.locking_data == owner_bytes)
+            .map(|(_, utxo)| utxo.output.value)
+            .sum()
+    }
+
     /// Validates and queues a pending transaction against the active chain state.
     pub fn submit_transaction(&mut self, tx: Transaction) -> Result<Txid, NodeStateError> {
         self.mempool
@@ -576,5 +586,29 @@ mod tests {
                 available: 0,
             })
         );
+    }
+
+    #[test]
+    fn reports_balance_for_public_key() {
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let miner = signing_key(3);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &sender.verifying_key(), 0)],
+        );
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        state
+            .submit_payment(&sender, &recipient.verifying_key(), 30, 1)
+            .unwrap();
+        state
+            .mine_block(50, &miner.verifying_key(), 2, 0x207f_ffff, 100)
+            .unwrap();
+
+        assert_eq!(state.balance_for_key(&sender.verifying_key()), 20);
+        assert_eq!(state.balance_for_key(&recipient.verifying_key()), 30);
+        assert_eq!(state.balance_for_key(&miner.verifying_key()), 50);
     }
 }

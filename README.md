@@ -45,10 +45,12 @@ The current CLI is intentionally small:
 ```text
 wobble init <snapshot>
 wobble info <snapshot>
+wobble balance <snapshot> <public_key>
 wobble utxos <snapshot>
 wobble generate-key
 wobble create-wallet <wallet_path>
 wobble wallet-address <wallet_path>
+wobble wallet-balance <snapshot> <wallet_path>
 wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key> <amount> <uniqueness>
 wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>
 wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]
@@ -63,8 +65,11 @@ wobble create-wallet /tmp/miner.wallet
 wobble create-wallet /tmp/recipient.wallet
 wobble wallet-address /tmp/recipient.wallet
 wobble mine-coinbase /tmp/wobble.bin 50 /tmp/miner.wallet 0
+wobble wallet-balance /tmp/wobble.bin /tmp/miner.wallet
 wobble utxos /tmp/wobble.bin
 wobble submit-payment /tmp/wobble.bin /tmp/miner.wallet <recipient_public_key> 30 1
 wobble mine-pending /tmp/wobble.bin 50 /tmp/miner.wallet 2 100
+wobble wallet-balance /tmp/wobble.bin /tmp/miner.wallet
+wobble wallet-balance /tmp/wobble.bin /tmp/recipient.wallet
 wobble info /tmp/wobble.bin
 ```
