@@ -46,8 +46,8 @@ The current CLI is intentionally small:
 High-level workflow:
 wobble init [--home <dir>]
 wobble serve <listen_addr> <network> [--home <dir>] [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]
-wobble submit-payment <recipient_public_key|@alias_book:name> <amount> <uniqueness> [--home <dir>]
-wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]
+wobble submit-payment <recipient_public_key|@alias_book:name> <amount> [uniqueness] [--home <dir>]
+wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> [uniqueness] <peer_addr> <network> [--node_name <name>]
 wobble wallet-address [--home <dir>]
 wobble wallet-balance [--home <dir>]
 
@@ -63,7 +63,7 @@ wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]
 wobble mine-pending <reward> <uniqueness> <max_transactions> [bits] [--home <dir>]
 wobble mine-pending <sqlite_path> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]
 wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]
-wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>
+wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> [uniqueness]
 wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>
 
 Setup and helpers:
@@ -88,7 +88,7 @@ wobble alias-add /tmp/recipients.json recipient <recipient_public_key>
 wobble mine-coinbase 50
 wobble wallet-balance
 wobble utxos ~/.wobble/node.sqlite
-wobble submit-payment @/tmp/recipients.json:recipient 30 1
+wobble submit-payment @/tmp/recipients.json:recipient 30
 wobble mine-pending 50 2 100
 wobble wallet-balance
 wobble wallet-balance ~/.wobble/node.sqlite /tmp/recipient.wallet

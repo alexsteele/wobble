@@ -347,7 +347,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "submit-payment-remote" => {
-            if args.len() != 9 && args.len() != 11 {
+            if args.len() != 8 && args.len() != 9 && args.len() != 10 && args.len() != 11 {
                 return Err(usage());
             }
 
@@ -355,10 +355,13 @@ fn run() -> Result<(), String> {
             let sender_wallet_path = Path::new(&args[3]);
             let recipient_verifying_key = parse_public_key_or_alias(&args[4])?;
             let amount = parse_u64(&args[5], "amount")?;
-            let uniqueness = parse_u32(&args[6], "uniqueness")?;
-            let peer_addr = &args[7];
-            let network = args[8].clone();
-            let node_name = parse_optional_node_name_flag(&args[9..])?;
+            let (uniqueness, peer_addr, network, node_name_args) =
+                if let Ok(value) = parse_u32(&args[6], "uniqueness") {
+                    (value, &args[7], args[8].clone(), &args[9..])
+                } else {
+                    (default_uniqueness(), &args[6], args[7].clone(), &args[8..])
+                };
+            let node_name = parse_optional_node_name_flag(node_name_args)?;
             let config = PeerConfig::new(network, node_name);
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
@@ -546,8 +549,8 @@ fn usage() -> String {
         "  High-level workflow:",
         "    wobble init [--home <dir>]",
         "    wobble serve <listen_addr> <network> [--home <dir>] [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]",
-        "    wobble submit-payment <recipient_public_key|@alias_book:name> <amount> <uniqueness> [--home <dir>]",
-        "    wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]",
+        "    wobble submit-payment <recipient_public_key|@alias_book:name> <amount> [uniqueness] [--home <dir>]",
+        "    wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> [uniqueness] <peer_addr> <network> [--node_name <name>]",
         "    wobble wallet-address [--home <dir>]",
         "    wobble wallet-balance [--home <dir>]",
         "",
@@ -563,7 +566,7 @@ fn usage() -> String {
         "    wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]",
         "    wobble mine-coinbase <reward> [uniqueness] [bits] [--home <dir>]",
         "    wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]",
-        "    wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
+        "    wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> [uniqueness]",
         "    wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "",
         "  Setup and helpers:",
@@ -835,12 +838,19 @@ fn parse_submit_payment_paths(args: &[String]) -> Result<(LocalNodePaths, &[Stri
 
 fn parse_local_submit_payment_args(args: &[String]) -> Result<LocalSubmitPaymentArgs, String> {
     let (local, command_args) = parse_submit_payment_paths(args)?;
+    if command_args.len() < 2 || command_args.len() > 3 {
+        return Err(usage());
+    }
     Ok(LocalSubmitPaymentArgs {
         state_path: local.state_path,
         wallet_path: local.wallet_path,
         recipient: command_args[0].clone(),
         amount: parse_u64(&command_args[1], "amount")?,
-        uniqueness: parse_u32(&command_args[2], "uniqueness")?,
+        uniqueness: command_args
+            .get(2)
+            .map(|value| parse_u32(value, "uniqueness"))
+            .transpose()?
+            .unwrap_or_else(default_uniqueness),
     })
 }
 
@@ -964,6 +974,19 @@ fn parse_bits(value: &str) -> Result<u32, String> {
     } else {
         parse_u32(value, "bits")
     }
+}
+
+/// Returns a default transaction uniqueness value for user-facing CLI commands.
+///
+/// This keeps the common payment flow free from manual nonce-like inputs while
+/// still producing distinct transactions when users omit an explicit override.
+fn default_uniqueness() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is after unix epoch")
+        .subsec_nanos()
 }
 
 fn parse_txid(value: &str) -> Result<Txid, String> {
