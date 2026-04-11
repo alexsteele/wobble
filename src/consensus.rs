@@ -85,8 +85,8 @@ pub fn validate_block(block: &Block) -> Result<(), ConsensusError> {
 /// less than or equal to that target. Smaller targets are harder to satisfy
 /// and therefore represent higher difficulty.
 fn validate_header_pow(block: &Block) -> Result<(), ConsensusError> {
-    let target =
-        expand_compact_target(block.header.bits).ok_or(ConsensusError::InvalidPowTarget)?;
+    let target = expand_compact_target_for_chain(block.header.bits)
+        .ok_or(ConsensusError::InvalidPowTarget)?;
     let hash = block.header.block_hash();
 
     if hash.as_bytes() > &target {
@@ -104,7 +104,7 @@ fn validate_header_pow(block: &Block) -> Result<(), ConsensusError> {
 ///
 /// Example: `0x1d00ffff` means exponent `0x1d` and mantissa `0x00ffff`, which
 /// expands into Bitcoin's historical maximum target.
-fn expand_compact_target(bits: u32) -> Option<PowTarget> {
+pub(crate) fn expand_compact_target_for_chain(bits: u32) -> Option<PowTarget> {
     let exponent = (bits >> 24) as usize;
     let mantissa = bits & 0x007f_ffff;
     let is_negative = (bits & 0x0080_0000) != 0;
@@ -143,7 +143,7 @@ mod tests {
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut, Txid},
     };
 
-    use super::{ConsensusError, apply_block, expand_compact_target, validate_block};
+    use super::{ConsensusError, apply_block, expand_compact_target_for_chain, validate_block};
 
     // `uniqueness` perturbs the coinbase so separate test blocks do not reuse
     // the same transaction id for otherwise identical rewards.
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn expands_compact_target_with_large_exponent() {
-        let target = expand_compact_target(0x1d00ffff).unwrap();
+        let target = expand_compact_target_for_chain(0x1d00ffff).unwrap();
 
         assert_eq!(target[3], 0x00);
         assert_eq!(target[4], 0xff);
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn expands_compact_target_with_small_exponent() {
-        let target = expand_compact_target(0x0300ff00).unwrap();
+        let target = expand_compact_target_for_chain(0x0300ff00).unwrap();
 
         assert_eq!(target[30], 0xff);
         assert_eq!(target[31], 0x00);
@@ -360,8 +360,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_compact_targets() {
-        assert_eq!(expand_compact_target(0), None);
-        assert_eq!(expand_compact_target(0x1d800001), None);
-        assert_eq!(expand_compact_target(0x21010000), None);
+        assert_eq!(expand_compact_target_for_chain(0), None);
+        assert_eq!(expand_compact_target_for_chain(0x1d800001), None);
+        assert_eq!(expand_compact_target_for_chain(0x21010000), None);
     }
 }
