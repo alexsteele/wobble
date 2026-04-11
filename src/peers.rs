@@ -19,6 +19,12 @@ pub fn load_peer_endpoints(path: &Path) -> Result<Vec<PeerEndpoint>, PeerConfigE
     serde_json::from_str(&contents).map_err(PeerConfigError::Parse)
 }
 
+/// Saves a startup peer list to a JSON file on disk.
+pub fn save_peer_endpoints(path: &Path, peers: &[PeerEndpoint]) -> Result<(), PeerConfigError> {
+    let contents = serde_json::to_string_pretty(peers).map_err(PeerConfigError::Parse)?;
+    fs::write(path, contents).map_err(PeerConfigError::Read)
+}
+
 #[derive(Debug)]
 pub enum PeerConfigError {
     Read(std::io::Error),
@@ -33,7 +39,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{peers::load_peer_endpoints, server::PeerEndpoint};
+    use crate::{
+        peers::{load_peer_endpoints, save_peer_endpoints},
+        server::PeerEndpoint,
+    };
 
     fn temp_peers_path() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -84,5 +93,20 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert!(matches!(err, crate::peers::PeerConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn saves_peer_endpoint_list_as_json() {
+        let path = temp_peers_path();
+        let peers = vec![PeerEndpoint::new(
+            "127.0.0.1:9001",
+            Some("miner".to_string()),
+        )];
+
+        save_peer_endpoints(&path, &peers).unwrap();
+        let loaded = load_peer_endpoints(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded, peers);
     }
 }

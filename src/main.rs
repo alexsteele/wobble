@@ -9,7 +9,9 @@ use wobble::{
     aliases::{self, AliasBook},
     client,
     consensus::BLOCK_SUBSIDY,
-    crypto, logging, net,
+    crypto,
+    home::NodeHome,
+    logging, net,
     node_state::NodeState,
     peer::PeerConfig,
     peers,
@@ -36,18 +38,25 @@ fn run() -> Result<(), String> {
 
     match command {
         "init" => {
-            if args.len() != 3 {
+            if args.len() != 2 && args.len() != 4 {
                 return Err(usage());
             }
 
-            let path = Path::new(&args[2]);
-            let state = NodeState::new();
-            let store =
-                SqliteStore::open(path).map_err(|err| format!("sqlite open failed: {err:?}"))?;
-            store
-                .save_node_state(&state)
-                .map_err(|err| format!("sqlite save failed: {err:?}"))?;
-            println!("initialized sqlite node state at {}", path.display());
+            let home_override = parse_optional_home_flag(&args[2..])?;
+            let home = resolve_node_home(home_override.as_deref())?;
+            home.initialize()
+                .map_err(|err| format!("home init failed: {err:?}"))?;
+            let wallet = wallet::load_wallet(&home.wallet_path())
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
+            println!("initialized node home at {}", home.root().display());
+            println!("state: {}", home.state_path().display());
+            println!("wallet: {}", home.wallet_path().display());
+            println!("aliases: {}", home.aliases_path().display());
+            println!("peers: {}", home.peers_path().display());
+            println!(
+                "public: {}",
+                encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
+            );
             Ok(())
         }
         "info" => {
@@ -201,15 +210,16 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "serve" => {
-            if args.len() < 5 {
+            if args.len() < 4 {
                 return Err(usage());
             }
 
-            let sqlite_path = Path::new(&args[2]);
-            let listen_addr = &args[3];
-            let network = args[4].clone();
-            let serve_options = parse_serve_args(&args[5..])?;
-            let state = SqliteStore::open(sqlite_path)
+            let listen_addr = &args[2];
+            let network = args[3].clone();
+            let serve_options = parse_serve_args(&args[4..])?;
+            let home = resolve_node_home(serve_options.home_path.as_deref())?;
+            let sqlite_path = home.state_path();
+            let state = SqliteStore::open(&sqlite_path)
                 .and_then(|store| store.load_node_state())
                 .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
             let config = PeerConfig::new(network.clone(), serve_options.node_name.clone())
@@ -217,7 +227,8 @@ fn run() -> Result<(), String> {
             let peer_endpoints = match serve_options.peers_path.as_ref() {
                 Some(path) => peers::load_peer_endpoints(path)
                     .map_err(|err| format!("peer config load failed: {err:?}"))?,
-                None => Vec::new(),
+                None => peers::load_peer_endpoints(&home.peers_path())
+                    .map_err(|err| format!("peer config load failed: {err:?}"))?,
             };
             let mining = match serve_options.miner_wallet_path.as_ref() {
                 Some(path) => {
@@ -240,7 +251,7 @@ fn run() -> Result<(), String> {
             };
             let mut server = Server::new(config, state)
                 .with_peers(peer_endpoints.clone())
-                .with_sqlite_path(sqlite_path)
+                .with_sqlite_path(&sqlite_path)
                 .with_bootstrap_sync(true);
             if let Some(mining) = mining.clone() {
                 server = server.with_mining(mining);
@@ -248,6 +259,7 @@ fn run() -> Result<(), String> {
 
             info!(
                 command = "serve",
+                home = %home.root().display(),
                 sqlite_path = %sqlite_path.display(),
                 listen_addr,
                 network,
@@ -257,6 +269,7 @@ fn run() -> Result<(), String> {
                 "starting server"
             );
             println!("serving sqlite {}", sqlite_path.display());
+            println!("node home: {}", home.root().display());
             println!("bootstrap source: sqlite");
             println!("listen addr: {listen_addr}");
             println!("network: {network}");
@@ -269,6 +282,8 @@ fn run() -> Result<(), String> {
             );
             if let Some(path) = serve_options.peers_path {
                 println!("peers file: {}", path.display());
+            } else {
+                println!("peers file: {}", home.peers_path().display());
             }
             if let Some(path) = serve_options.miner_wallet_path {
                 println!("integrated mining: enabled");
@@ -568,7 +583,7 @@ fn run() -> Result<(), String> {
 fn usage() -> String {
     [
         "usage:",
-        "  wobble init <sqlite_path>",
+        "  wobble init [--home <dir>]",
         "  wobble info <sqlite_path>",
         "  wobble balance <sqlite_path> <public_key>",
         "  wobble utxos <sqlite_path>",
@@ -579,7 +594,7 @@ fn usage() -> String {
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
-        "  wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]",
+        "  wobble serve <listen_addr> <network> [--home <dir>] [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]",
         "  wobble get-tip <peer_addr> <network> [--node_name <name>]",
         "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]",
         "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]",
@@ -600,6 +615,7 @@ fn load_sqlite_state(path: &Path) -> Result<NodeState, String> {
 /// Parses optional `serve` arguments without changing the existing required prefix.
 ///
 /// Supported forms:
+/// - `--home <dir>`
 /// - `--node_name <name>`
 /// - `--peers_path <path>`
 /// - `--miner_wallet <path>`
@@ -608,6 +624,7 @@ fn load_sqlite_state(path: &Path) -> Result<NodeState, String> {
 /// - `--mining_bits <bits>`
 #[derive(Debug, PartialEq, Eq)]
 struct ServeOptions {
+    home_path: Option<PathBuf>,
     node_name: Option<String>,
     peers_path: Option<PathBuf>,
     miner_wallet_path: Option<PathBuf>,
@@ -617,6 +634,7 @@ struct ServeOptions {
 }
 
 fn parse_serve_args(args: &[String]) -> Result<ServeOptions, String> {
+    let mut home_path = None;
     let mut node_name = None;
     let mut peers_path = None;
     let mut miner_wallet_path = None;
@@ -627,6 +645,16 @@ fn parse_serve_args(args: &[String]) -> Result<ServeOptions, String> {
 
     while index < args.len() {
         match args[index].as_str() {
+            "--home" => {
+                if home_path.is_some() {
+                    return Err("duplicate --home".to_string());
+                }
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --home".to_string());
+                };
+                home_path = Some(PathBuf::from(path));
+                index += 2;
+            }
             "--node_name" => {
                 if node_name.is_some() {
                     return Err("duplicate --node_name".to_string());
@@ -706,6 +734,7 @@ fn parse_serve_args(args: &[String]) -> Result<ServeOptions, String> {
     }
 
     Ok(ServeOptions {
+        home_path,
         node_name,
         peers_path,
         miner_wallet_path,
@@ -713,6 +742,23 @@ fn parse_serve_args(args: &[String]) -> Result<ServeOptions, String> {
         mining_max_transactions,
         mining_bits,
     })
+}
+
+fn parse_optional_home_flag(args: &[String]) -> Result<Option<PathBuf>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--home" => Ok(Some(PathBuf::from(value))),
+        [flag] if flag == "--home" => Err("missing value for --home".to_string()),
+        [value] => Err(format!("unexpected argument: {value}")),
+        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+    }
+}
+
+fn resolve_node_home(path: Option<&Path>) -> Result<NodeHome, String> {
+    match path {
+        Some(path) => Ok(NodeHome::new(path)),
+        None => NodeHome::from_default_dir().map_err(|err| format!("home resolve failed: {err:?}")),
+    }
 }
 
 /// Parses an optional `--node_name <name>` flag used by remote CLI commands.
@@ -788,7 +834,9 @@ fn parse_public_key_or_alias(value: &str) -> Result<ed25519_dalek::VerifyingKey,
 mod tests {
     use std::path::PathBuf;
 
-    use super::{ServeOptions, parse_optional_node_name_flag, parse_serve_args};
+    use super::{
+        ServeOptions, parse_optional_home_flag, parse_optional_node_name_flag, parse_serve_args,
+    };
 
     #[test]
     fn parse_serve_args_accepts_node_name_and_peer_file() {
@@ -804,6 +852,7 @@ mod tests {
         assert_eq!(
             options,
             ServeOptions {
+                home_path: None,
                 node_name: Some("alpha".to_string()),
                 peers_path: Some(PathBuf::from("/tmp/peers.json")),
                 miner_wallet_path: None,
@@ -823,6 +872,7 @@ mod tests {
         assert_eq!(
             options,
             ServeOptions {
+                home_path: None,
                 node_name: None,
                 peers_path: Some(PathBuf::from("/tmp/peers.json")),
                 miner_wallet_path: None,
@@ -838,6 +888,8 @@ mod tests {
         let args = vec![
             "--node_name".to_string(),
             "alpha".to_string(),
+            "--home".to_string(),
+            "/tmp/proposer".to_string(),
             "--miner_wallet".to_string(),
             "/tmp/miner.wallet".to_string(),
             "--mining_interval_ms".to_string(),
@@ -853,6 +905,7 @@ mod tests {
         assert_eq!(
             options,
             ServeOptions {
+                home_path: Some(PathBuf::from("/tmp/proposer")),
                 node_name: Some("alpha".to_string()),
                 peers_path: None,
                 miner_wallet_path: Some(PathBuf::from("/tmp/miner.wallet")),
@@ -900,6 +953,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_args_rejects_duplicate_home_flag() {
+        let args = vec![
+            "--home".to_string(),
+            "/tmp/a".to_string(),
+            "--home".to_string(),
+            "/tmp/b".to_string(),
+        ];
+
+        let err = parse_serve_args(&args).unwrap_err();
+
+        assert_eq!(err, "duplicate --home");
+    }
+
+    #[test]
     fn parse_serve_args_rejects_mining_overrides_without_wallet() {
         let args = vec!["--mining_interval_ms".to_string(), "250".to_string()];
 
@@ -924,6 +991,15 @@ mod tests {
         let err = parse_optional_node_name_flag(&args).unwrap_err();
 
         assert_eq!(err, "unexpected argument: alpha");
+    }
+
+    #[test]
+    fn parse_optional_home_flag_accepts_named_form() {
+        let args = vec!["--home".to_string(), "/tmp/proposer".to_string()];
+
+        let home = parse_optional_home_flag(&args).unwrap();
+
+        assert_eq!(home, Some(PathBuf::from("/tmp/proposer")));
     }
 }
 

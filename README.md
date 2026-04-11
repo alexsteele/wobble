@@ -43,7 +43,7 @@ See [design](docs/design.md).
 The current CLI is intentionally small:
 
 ```shell
-wobble init <sqlite_path>
+wobble init [--home <dir>]
 wobble info <sqlite_path>
 wobble balance <sqlite_path> <public_key>
 wobble utxos <sqlite_path>
@@ -54,7 +54,7 @@ wobble wallet-balance <sqlite_path> <wallet_path>
 wobble create-alias-book <alias_book>
 wobble alias-add <alias_book> <name> <public_key>
 wobble alias-list <alias_book>
-wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]
+wobble serve <listen_addr> <network> [--home <dir>] [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]
 wobble get-tip <peer_addr> <network> [--node_name <name>]
 wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]
 wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]
@@ -67,21 +67,26 @@ wobble mine-pending <sqlite_path> <reward> <miner_wallet> <uniqueness> <max_tran
 Example:
 
 ```shell
-wobble init /tmp/wobble.sqlite
-wobble create-wallet /tmp/miner.wallet
+wobble init
 wobble create-wallet /tmp/recipient.wallet
 wobble create-alias-book /tmp/recipients.aliases
 wobble wallet-address /tmp/recipient.wallet
 wobble alias-add /tmp/recipients.aliases recipient <recipient_public_key>
-wobble mine-coinbase /tmp/wobble.sqlite 50 /tmp/miner.wallet 0
-wobble wallet-balance /tmp/wobble.sqlite /tmp/miner.wallet
-wobble utxos /tmp/wobble.sqlite
-wobble submit-payment /tmp/wobble.sqlite /tmp/miner.wallet @/tmp/recipients.aliases:recipient 30 1
-wobble mine-pending /tmp/wobble.sqlite 50 /tmp/miner.wallet 2 100
-wobble wallet-balance /tmp/wobble.sqlite /tmp/miner.wallet
-wobble wallet-balance /tmp/wobble.sqlite /tmp/recipient.wallet
-wobble info /tmp/wobble.sqlite
+wobble mine-coinbase ~/.wobble/node.sqlite 50 ~/.wobble/wallet.bin 0
+wobble wallet-balance ~/.wobble/node.sqlite ~/.wobble/wallet.bin
+wobble utxos ~/.wobble/node.sqlite
+wobble submit-payment ~/.wobble/node.sqlite ~/.wobble/wallet.bin @/tmp/recipients.aliases:recipient 30 1
+wobble mine-pending ~/.wobble/node.sqlite 50 ~/.wobble/wallet.bin 2 100
+wobble wallet-balance ~/.wobble/node.sqlite ~/.wobble/wallet.bin
+wobble wallet-balance ~/.wobble/node.sqlite /tmp/recipient.wallet
+wobble info ~/.wobble/node.sqlite
 ```
+
+`wobble init` creates a default node home at `~/.wobble` with:
+- `node.sqlite`
+- `wallet.bin`
+- `aliases.bin`
+- `peers.json`
 
 Peer bootstrap file example:
 
@@ -96,23 +101,21 @@ Example server startup with peers:
 
 ```shell
 wobble serve \
-  /tmp/wobble.sqlite \
   127.0.0.1:9001 \
   wobble-local \
   --node_name proposer \
-  --peers_path /tmp/peers.json
+  --home /tmp/proposer
 ```
 
 Example server startup with integrated mining:
 
 ```shell
 wobble serve \
-  /tmp/miner.sqlite \
   127.0.0.1:9002 \
   wobble-local \
+  --home /tmp/miner \
   --node_name miner \
-  --peers_path /tmp/miner-peers.json \
-  --miner_wallet /tmp/miner.wallet \
+  --miner_wallet /tmp/miner/wallet.bin \
   --mining_interval_ms 250
 ```
 
@@ -124,17 +127,14 @@ Examples:
 
 ```shell
 cargo run -- serve \
-  /tmp/wobble.sqlite \
   127.0.0.1:9001 \
   wobble-local \
   --node_name proposer
 RUST_LOG=wobble=debug cargo run -- serve \
-  /tmp/wobble.sqlite \
   127.0.0.1:9001 \
   wobble-local \
   --node_name proposer
 RUST_LOG=info cargo run -- serve \
-  /tmp/wobble.sqlite \
   127.0.0.1:9001 \
   wobble-local \
   --node_name proposer
