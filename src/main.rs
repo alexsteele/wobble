@@ -202,7 +202,8 @@ fn run() -> Result<(), String> {
             let node_name = args.get(5).cloned();
             let state = store::load_node_state(snapshot_path)
                 .map_err(|err| format!("load failed: {err:?}"))?;
-            let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state);
+            let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
+                .with_snapshot_path(snapshot_path);
 
             println!("serving snapshot {}", snapshot_path.display());
             println!("listen addr: {listen_addr}");

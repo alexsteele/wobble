@@ -125,6 +125,7 @@ Fields:
 Receiver behavior:
 - validate the transaction against the active chain and mempool policy
 - if accepted, store it in the mempool
+- if the serving node is snapshot-backed, persist the updated snapshot
 - if newly accepted, relay it to other peers
 
 Known limitation:
@@ -141,6 +142,7 @@ Fields:
 Receiver behavior:
 - validate and index the block
 - if it becomes the best tip, update active state
+- if the serving node is snapshot-backed, persist the updated snapshot
 - if newly accepted, relay it to other peers
 
 Known limitation:
@@ -163,6 +165,27 @@ Fields:
 - `block: Option<Block>`
 
 If the block is unknown, return `null` in the `block` field.
+
+### `mine_pending`
+
+Purpose:
+- local testnet control message to mine a block from the server's current mempool
+
+Fields:
+- `reward: u64`
+- `miner_public_key: Vec<u8>`
+- `uniqueness: u32`
+- `bits: u32`
+- `max_transactions: usize`
+
+Receiver behavior:
+- build and mine a block from the current best tip and pending mempool contents
+- accept the mined block into local chain state
+- if the serving node is snapshot-backed, persist the updated snapshot
+- return the mined block hash
+
+Known limitation:
+- this is a local control surface for testing, not a realistic public P2P message
 
 ## Initial Sync Behavior
 

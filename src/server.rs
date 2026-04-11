@@ -9,12 +9,14 @@
 use std::{
     io,
     net::{TcpListener, TcpStream, ToSocketAddrs},
+    path::{Path, PathBuf},
 };
 
 use crate::{
     net,
     node_state::NodeState,
     peer::{self, PeerConfig, PeerError},
+    store::{self, StoreError},
     wire::WireMessage,
 };
 
@@ -23,11 +25,34 @@ use crate::{
 pub struct Server {
     config: PeerConfig,
     state: NodeState,
+    snapshot_path: Option<PathBuf>,
+}
+
+/// Errors produced by the live server while handling protocol messages.
+#[derive(Debug)]
+pub enum ServerError {
+    Peer(PeerError),
+    Persist(StoreError),
 }
 
 impl Server {
     pub fn new(config: PeerConfig, state: NodeState) -> Self {
-        Self { config, state }
+        Self {
+            config,
+            state,
+            snapshot_path: None,
+        }
+    }
+
+    /// Configures the server to persist the full node snapshot after each
+    /// successful state-changing message.
+    ///
+    /// This keeps the first live server implementation simple by reusing the
+    /// existing whole-snapshot store. Gap: this rewrites the full snapshot on
+    /// each mutation rather than using incremental storage.
+    pub fn with_snapshot_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.snapshot_path = Some(path.into());
+        self
     }
 
     pub fn config(&self) -> &PeerConfig {
@@ -42,9 +67,26 @@ impl Server {
         &mut self.state
     }
 
+    pub fn snapshot_path(&self) -> Option<&Path> {
+        self.snapshot_path.as_deref()
+    }
+
     /// Handles one decoded wire message against the server's current node state.
-    pub fn handle_message(&mut self, message: WireMessage) -> Result<Vec<WireMessage>, PeerError> {
-        peer::handle_message(&self.config, &mut self.state, message)
+    ///
+    /// If the message mutates the live chain or mempool and snapshot
+    /// persistence is enabled, the updated `NodeState` is saved after the
+    /// protocol action succeeds.
+    pub fn handle_message(
+        &mut self,
+        message: WireMessage,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        let should_persist = message_mutates_state(&message);
+        let replies = peer::handle_message(&self.config, &mut self.state, message)
+            .map_err(ServerError::Peer)?;
+        if should_persist {
+            self.persist_snapshot().map_err(ServerError::Persist)?;
+        }
+        Ok(replies)
     }
 
     /// Serves a single connected stream until the peer closes the connection or
@@ -89,15 +131,33 @@ impl Server {
         }
         Ok(())
     }
+
+    fn persist_snapshot(&self) -> Result<(), StoreError> {
+        let Some(path) = self.snapshot_path.as_deref() else {
+            return Ok(());
+        };
+        store::save_node_state(path, &self.state)
+    }
+}
+
+fn message_mutates_state(message: &WireMessage) -> bool {
+    matches!(
+        message,
+        WireMessage::AnnounceTx { .. }
+            | WireMessage::AnnounceBlock { .. }
+            | WireMessage::MinePending(..)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        io,
+        fs, io,
         io::{BufRead, BufReader, Write},
         net::{TcpListener, TcpStream},
+        path::PathBuf,
         thread,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::{
@@ -121,6 +181,20 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         line
+    }
+
+    fn temp_snapshot_path() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        path.push(format!(
+            "wobble-server-test-{}-{}.bin",
+            std::process::id(),
+            nanos
+        ));
+        path
     }
 
     fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
@@ -296,5 +370,37 @@ mod tests {
         let server = worker.join().unwrap();
 
         assert!(server.state().mempool().get(&txid).is_some());
+    }
+
+    #[test]
+    fn persists_snapshot_after_state_changing_message() {
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let txid = transaction.txid();
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let path = temp_snapshot_path();
+        let mut server =
+            Server::new(PeerConfig::new("wobble-local", None), state).with_snapshot_path(&path);
+
+        server
+            .handle_message(WireMessage::AnnounceTx { transaction })
+            .unwrap();
+
+        let loaded = crate::store::load_node_state(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert!(loaded.mempool().get(&txid).is_some());
     }
 }
