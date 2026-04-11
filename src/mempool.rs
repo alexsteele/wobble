@@ -6,6 +6,10 @@
 //! set and pays a strictly higher fee. It does not yet support package
 //! acceptance or parent-child dependency chains, so every admitted transaction
 //! must stand on its own against the active chain state.
+//!
+//! The pool also enforces a fixed transaction-count limit. When full, it keeps
+//! the higher-fee transactions and evicts the current lowest-fee entry only if
+//! the incoming transaction pays strictly more.
 
 use std::collections::HashMap;
 
@@ -13,14 +17,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     state::{UtxoSet, ValidationError},
-    types::{OutPoint, Transaction, Txid},
+    types::{Amount, OutPoint, Transaction, Txid},
 };
+
+/// Maximum number of transactions retained in the mempool at once.
+pub const MAX_MEMPOOL_TRANSACTIONS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MempoolError {
     DuplicateTransaction(Txid),
     ConflictingInput(OutPoint),
     ReplacementFeeTooLow { existing: u64, replacement: u64 },
+    CapacityFeeTooLow { lowest: u64, candidate: u64 },
     InvalidTransaction(ValidationError),
 }
 
@@ -58,8 +66,13 @@ impl Mempool {
     /// lower-fee one. Partial-overlap conflicts are still rejected because the
     /// mempool does not track dependency packages or more advanced policy.
     ///
+    /// When the mempool is already at capacity, the incoming transaction must
+    /// also pay a strictly higher fee than the current lowest-fee retained
+    /// transaction; otherwise it is rejected.
+    ///
     /// Gap: this does not yet admit dependent transactions whose parents live
-    /// only in the mempool.
+    /// only in the mempool, and eviction is based only on direct transaction
+    /// fees rather than package-aware policy.
     pub fn submit(&mut self, utxos: &UtxoSet, tx: Transaction) -> Result<Txid, MempoolError> {
         let txid = tx.txid();
         if self.transactions.contains_key(&txid) {
@@ -96,8 +109,20 @@ impl Mempool {
                     replacement: replacement_fee,
                 });
             }
-            self.remove_many(&conflicting_ids);
         }
+
+        let displaced = self.capacity_eviction_candidate(utxos, &conflicting_ids);
+        if let Some((evicted_txid, evicted_fee)) = displaced {
+            if replacement_fee <= evicted_fee {
+                return Err(MempoolError::CapacityFeeTooLow {
+                    lowest: evicted_fee,
+                    candidate: replacement_fee,
+                });
+            }
+            self.transactions.remove(&evicted_txid);
+        }
+
+        self.remove_many(&conflicting_ids);
 
         self.transactions.insert(txid, tx);
         Ok(txid)
@@ -169,6 +194,31 @@ impl Mempool {
         })
     }
 
+    fn capacity_eviction_candidate(
+        &self,
+        utxos: &UtxoSet,
+        conflicting_ids: &[Txid],
+    ) -> Option<(Txid, Amount)> {
+        let survivor_count = self
+            .transactions
+            .len()
+            .saturating_sub(conflicting_ids.len());
+        if survivor_count < MAX_MEMPOOL_TRANSACTIONS {
+            return None;
+        }
+
+        self.transactions
+            .iter()
+            .filter(|(txid, _)| !conflicting_ids.contains(txid))
+            .map(|(txid, tx)| {
+                let fee = utxos
+                    .transaction_fee(tx)
+                    .expect("pending transactions should remain valid against active UTXOs");
+                (*txid, fee)
+            })
+            .min_by_key(|(txid, fee)| (*fee, txid.to_string()))
+    }
+
     pub fn remove_many(&mut self, txids: &[Txid]) {
         for txid in txids {
             self.transactions.remove(txid);
@@ -181,7 +231,7 @@ mod tests {
     use crate::crypto;
     use crate::types::{OutPoint, Transaction, TxIn, TxOut, Txid, Utxo};
 
-    use super::{Mempool, MempoolError};
+    use super::{MAX_MEMPOOL_TRANSACTIONS, Mempool, MempoolError};
 
     fn spendable_utxo(value: u64) -> Utxo {
         let signing_key = crypto::signing_key_from_bytes([7; 32]);
@@ -246,6 +296,13 @@ mod tests {
             input.unlocking_data = signature.clone();
         }
         tx
+    }
+
+    fn indexed_txid(index: usize) -> Txid {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = (index & 0xff) as u8;
+        bytes[1] = ((index >> 8) & 0xff) as u8;
+        Txid::new(bytes)
     }
 
     #[test]
@@ -361,6 +418,145 @@ mod tests {
         mempool.prune_invalid(&after);
 
         assert!(mempool.is_empty());
+    }
+
+    #[test]
+    fn evicts_lowest_fee_transaction_when_full_and_candidate_pays_more() {
+        let owner = crypto::signing_key_from_bytes([7; 32]);
+        let recipient = crypto::signing_key_from_bytes([9; 32]);
+        let mut utxos = crate::state::UtxoSet::new();
+        let mut mempool = Mempool::new();
+        let mut lowest_fee_txid = None;
+
+        for index in 0..MAX_MEMPOOL_TRANSACTIONS {
+            let outpoint = OutPoint {
+                txid: indexed_txid(index),
+                vout: 0,
+            };
+            let utxo = Utxo {
+                outpoint,
+                output: TxOut {
+                    value: 100,
+                    locking_data: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+                },
+                created_at_height: 1,
+                is_coinbase: false,
+            };
+            utxos.insert(utxo);
+
+            // Fees range from 1 up to MAX_MEMPOOL_TRANSACTIONS.
+            let mut tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: outpoint,
+                    unlocking_data: Vec::new(),
+                }],
+                outputs: vec![TxOut {
+                    value: 99_u64.saturating_sub(index as u64),
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                }],
+                lock_time: index as u32,
+            };
+            tx.inputs[0].unlocking_data =
+                crypto::sign_message(&owner, &tx.signing_digest()).to_vec();
+            let txid = tx.txid();
+            mempool.submit(&utxos, tx).unwrap();
+
+            if index == 0 {
+                lowest_fee_txid = Some(txid);
+            }
+        }
+
+        let candidate_outpoint = OutPoint {
+            txid: Txid::new([0xfe; 32]),
+            vout: 0,
+        };
+        utxos.insert(Utxo {
+            outpoint: candidate_outpoint,
+            output: TxOut {
+                value: 100,
+                locking_data: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            },
+            created_at_height: 1,
+            is_coinbase: false,
+        });
+        let mut candidate = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: candidate_outpoint,
+                unlocking_data: Vec::new(),
+            }],
+            // Candidate fee is 50, which should displace the current floor fee of 1.
+            outputs: vec![TxOut {
+                value: 50,
+                locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+            }],
+            lock_time: u32::MAX,
+        };
+        candidate.inputs[0].unlocking_data =
+            crypto::sign_message(&owner, &candidate.signing_digest()).to_vec();
+        let candidate_id = candidate.txid();
+
+        mempool.submit(&utxos, candidate).unwrap();
+
+        assert_eq!(mempool.len(), MAX_MEMPOOL_TRANSACTIONS);
+        assert!(
+            mempool
+                .get(&lowest_fee_txid.expect("lowest fee txid recorded"))
+                .is_none()
+        );
+        assert!(mempool.get(&candidate_id).is_some());
+    }
+
+    #[test]
+    fn rejects_candidate_when_full_and_fee_is_not_above_floor() {
+        let owner = crypto::signing_key_from_bytes([7; 32]);
+        let mut utxos = crate::state::UtxoSet::new();
+        let mut mempool = Mempool::new();
+
+        for index in 0..MAX_MEMPOOL_TRANSACTIONS {
+            let outpoint = OutPoint {
+                txid: indexed_txid(index),
+                vout: 0,
+            };
+            utxos.insert(Utxo {
+                outpoint,
+                output: TxOut {
+                    value: 10,
+                    locking_data: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+                },
+                created_at_height: 1,
+                is_coinbase: false,
+            });
+
+            // Every retained transaction pays fee 1.
+            let tx = tx(outpoint, 9, index as u32);
+            mempool.submit(&utxos, tx).unwrap();
+        }
+
+        let candidate_outpoint = OutPoint {
+            txid: Txid::new([0xfd; 32]),
+            vout: 0,
+        };
+        utxos.insert(Utxo {
+            outpoint: candidate_outpoint,
+            output: TxOut {
+                value: 10,
+                locking_data: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            },
+            created_at_height: 1,
+            is_coinbase: false,
+        });
+        let candidate = tx(candidate_outpoint, 9, u32::MAX);
+
+        assert_eq!(
+            mempool.submit(&utxos, candidate),
+            Err(MempoolError::CapacityFeeTooLow {
+                lowest: 1,
+                candidate: 1,
+            })
+        );
+        assert_eq!(mempool.len(), MAX_MEMPOOL_TRANSACTIONS);
     }
 
     #[test]
