@@ -187,16 +187,23 @@ impl Server {
                 Err(err) => return Err(err),
             };
 
-            if let WireMessage::Hello(HelloMessage {
-                node_name,
-                advertised_addr,
-                ..
-            }) = &message
-            {
+            if let WireMessage::Hello(remote_hello) = &message {
                 origin = RelayOrigin {
-                    advertised_addr: advertised_addr.clone(),
-                    node_name: node_name.clone(),
+                    advertised_addr: remote_hello.advertised_addr.clone(),
+                    node_name: remote_hello.node_name.clone(),
                 };
+                let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
+                    .map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                    })?;
+                for reply in replies {
+                    net::send_message(&mut stream, &reply)?;
+                }
+                let synced_blocks = self.sync_from_hello_best_effort(remote_hello);
+                for block in synced_blocks {
+                    self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
+                }
+                continue;
             }
             let replies = self
                 .handle_message_from_peer(message, Some(&origin))
@@ -245,14 +252,14 @@ impl Server {
     /// If the remote tip is already indexed locally, this is a no-op. Current
     /// behavior reconnects per block request for simplicity; later versions can
     /// keep one stream open while downloading a range.
-    fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
+    fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
         let (_, remote_hello) = client::connect_and_handshake(&peer.addr, &self.config)
             .map_err(SyncError::Handshake)?;
         let Some(remote_tip) = remote_hello.tip else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if self.state.get_block(&remote_tip).is_some() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let mut missing_blocks = Vec::new();
@@ -274,31 +281,51 @@ impl Server {
             next_hash = parent_hash;
         }
 
-        let mut accepted_any = false;
+        let mut accepted_blocks = Vec::new();
         for block in missing_blocks.into_iter().rev() {
-            if self.accept_synced_block(block)? {
-                accepted_any = true;
+            if let Some(block) = self.accept_synced_block(block)? {
+                accepted_blocks.push(block);
             }
         }
 
-        if accepted_any {
+        if !accepted_blocks.is_empty() {
             self.persist_full_state()
                 .map_err(SyncError::SqlitePersist)?;
         }
 
-        Ok(())
+        Ok(accepted_blocks)
+    }
+
+    /// Triggers a one-shot catch-up attempt when an inbound peer advertises a
+    /// tip this node does not yet know and includes a listener address we can
+    /// dial back for block fetches.
+    ///
+    /// This is best effort by design. A failed catch-up should not reject the
+    /// handshake or stop normal message handling on the current stream.
+    fn sync_from_hello_best_effort(&mut self, remote_hello: &HelloMessage) -> Vec<Block> {
+        let Some(remote_tip) = remote_hello.tip else {
+            return Vec::new();
+        };
+        if self.state.get_block(&remote_tip).is_some() {
+            return Vec::new();
+        }
+        let Some(peer_addr) = remote_hello.advertised_addr.as_deref() else {
+            return Vec::new();
+        };
+        let peer = PeerEndpoint::new(peer_addr.to_string(), remote_hello.node_name.clone());
+        self.sync_from_peer(&peer).unwrap_or_default()
     }
 
     /// Applies one fetched block if it is not already indexed locally.
-    fn accept_synced_block(&mut self, block: Block) -> Result<bool, SyncError> {
+    fn accept_synced_block(&mut self, block: Block) -> Result<Option<Block>, SyncError> {
         let block_hash = block.header.block_hash();
         if self.state.get_block(&block_hash).is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         self.state
-            .accept_block(block)
+            .accept_block(block.clone())
             .map_err(SyncError::AcceptBlock)?;
-        Ok(true)
+        Ok(Some(block))
     }
 
     fn persist_sqlite(
@@ -343,7 +370,7 @@ impl Server {
             if peer_matches_origin(peer, origin) {
                 continue;
             }
-            let _ = relay_to_peer(&peer.addr, &self.config, message);
+            let _ = relay_to_peer(&peer.addr, &self.config, &self.state, message);
         }
     }
 
@@ -428,10 +455,15 @@ fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
 /// Relay is intentionally best effort. A small bounded retry helps with local
 /// testnet timing where the destination listener may still be unwinding a
 /// previous connection before it accepts the next one.
-fn relay_to_peer(peer_addr: &str, config: &PeerConfig, message: &WireMessage) -> io::Result<()> {
+fn relay_to_peer(
+    peer_addr: &str,
+    config: &PeerConfig,
+    state: &NodeState,
+    message: &WireMessage,
+) -> io::Result<()> {
     let mut last_error = None;
     for attempt in 0..RELAY_CONNECT_ATTEMPTS {
-        match relay_to_peer_once(peer_addr, config, message) {
+        match relay_to_peer_once(peer_addr, config, state, message) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_error = Some(err);
@@ -448,19 +480,13 @@ fn relay_to_peer(peer_addr: &str, config: &PeerConfig, message: &WireMessage) ->
 fn relay_to_peer_once(
     peer_addr: &str,
     config: &PeerConfig,
+    state: &NodeState,
     message: &WireMessage,
 ) -> io::Result<()> {
     let mut stream = net::connect(peer_addr)?;
     net::send_message(
         &mut stream,
-        &WireMessage::Hello(crate::wire::HelloMessage {
-            network: config.network.clone(),
-            version: crate::wire::PROTOCOL_VERSION,
-            node_name: config.node_name.clone(),
-            advertised_addr: config.advertised_addr.clone(),
-            tip: None,
-            height: None,
-        }),
+        &WireMessage::Hello(peer::local_hello(config, state)),
     )?;
     let _ = net::receive_message(&mut stream)?;
     net::send_message(&mut stream, message)?;
@@ -488,7 +514,7 @@ mod tests {
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
-    use super::{RelayOrigin, peer_matches_origin};
+    use super::{RelayOrigin, peer_matches_origin, relay_to_peer};
 
     fn connected_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1008,5 +1034,50 @@ mod tests {
         worker.join().unwrap();
 
         assert!(matches!(err, super::SyncError::MissingRemoteBlock(hash) if hash == missing_hash));
+    }
+
+    #[test]
+    fn relay_handshake_advertises_current_tip() {
+        let owner = crypto::signing_key_from_bytes([12; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let genesis_hash = genesis.header.block_hash();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut stream).unwrap();
+            let WireMessage::Hello(hello) = hello else {
+                panic!("expected hello");
+            };
+            assert_eq!(hello.tip, Some(genesis_hash));
+            assert_eq!(hello.height, Some(0));
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: None,
+                    tip: None,
+                    height: None,
+                }),
+            )
+            .unwrap();
+            let message = net::receive_message(&mut stream).unwrap();
+            assert_eq!(message, WireMessage::GetTip);
+        });
+
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+
+        relay_to_peer(
+            &addr,
+            &PeerConfig::new("wobble-local", Some("local".to_string())),
+            &state,
+            &WireMessage::GetTip,
+        )
+        .unwrap();
+        worker.join().unwrap();
     }
 }

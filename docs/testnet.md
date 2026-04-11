@@ -26,11 +26,13 @@ Already implemented:
 - best-effort relay hooks for newly accepted and newly mined blocks
 - outbound client handshake helper used by remote CLI flows
 - optional bootstrap sync from configured peers at server startup
+- live hello-triggered sync when a peer advertises a tip this node does not know
 - feature-gated integration test target at `tests/testnet_e2e.rs`
 - end-to-end proposer -> miner -> proposer flow over real TCP
 - restart/persistence proposer -> miner -> proposer flow over real TCP
 - multi-hop proposer -> relay -> miner -> relay -> proposer flow over real TCP
 - lagging-node catch-up from a live peer during bootstrap sync
+- live lagging-node catch-up after a later peer hello advertisement
 
 What the current E2E test proves:
 - a proposer-facing node accepts a payment transaction
@@ -41,12 +43,13 @@ What the current E2E test proves:
 - a restarted proposer reloads persisted mempool/chain state from SQLite and still converges after mining
 - a relay node can forward a payment onward to a miner and forward the mined block back to the proposer
 - a lagging node can start later, fetch a missed block from a configured peer, and converge before serving
+- a running lagging node can learn about a newer tip from a later peer hello, sync it, and converge
 
 Current limitation:
 - relay is still short-lived request/response TCP rather than persistent peer sessions
 - origin suppression now prefers the advertised listener address from `hello`
   and falls back to `node_name` only when that address is unavailable
-- catch-up currently runs only once during bootstrap rather than as a background sync loop
+- catch-up runs at bootstrap and on later peer hello, but not yet as a background sync loop
 
 ## Implementation Plan
 
@@ -115,6 +118,8 @@ Flow:
 Completed:
 - a lagging node can bootstrap from a configured peer, pull a missed tip block,
   and converge in `tests/testnet_e2e.rs`
+- a running lagging node can catch up later when a peer hello advertises a
+  newer tip in `tests/testnet_e2e.rs`
 
 ## Non-Goals For This Slice
 
