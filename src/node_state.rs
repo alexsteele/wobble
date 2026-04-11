@@ -18,6 +18,7 @@ use crate::{
         Amount, Block, BlockHash, BlockHeader, BlockHeight, OutPoint, Transaction, TxIn, TxOut,
         Txid,
     },
+    wire::TipSummary,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
@@ -64,6 +65,21 @@ impl NodeState {
 
     pub fn get_block(&self, hash: &BlockHash) -> Option<&Block> {
         self.blocks.get(hash)
+    }
+
+    /// Returns the current best tip hash and height for peer handshake and sync.
+    pub fn tip_summary(&self) -> TipSummary {
+        let Some(best_tip) = self.chain.best_tip() else {
+            return TipSummary {
+                tip: None,
+                height: None,
+            };
+        };
+        let height = self.chain.get(&best_tip).map(|entry| entry.height);
+        TipSummary {
+            tip: Some(best_tip),
+            height,
+        }
     }
 
     pub fn active_outpoints(&self) -> Vec<OutPoint> {
