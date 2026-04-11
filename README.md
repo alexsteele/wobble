@@ -31,3 +31,21 @@ A UTXO is an unspent coint. The current set of UTXOs form the chain state.
 https://bitcoin.org/bitcoin.pdf
 
 See [design](docs/design.md).
+
+## CLI
+
+The current CLI is intentionally small:
+
+```text
+wobble init <snapshot>
+wobble info <snapshot>
+wobble mine-coinbase <snapshot> <reward> <uniqueness> [bits]
+```
+
+Example:
+
+```text
+wobble init /tmp/wobble.bin
+wobble mine-coinbase /tmp/wobble.bin 50 0
+wobble info /tmp/wobble.bin
+```
