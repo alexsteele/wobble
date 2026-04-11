@@ -2,9 +2,9 @@
 //!
 //! This feature-gated integration test keeps the slower proposer-to-miner flow
 //! out of the default unit-test path while still exercising the live network
-//! stack. Current sync coverage is still explicit and pull-based: a lagging
-//! node asks a live peer for tip and missing blocks rather than relying on an
-//! automatic background catch-up loop.
+//! stack. Catch-up coverage now includes an automatic bootstrap sync pass where
+//! a restarted or lagging node pulls missing blocks from its configured peers
+//! before entering the normal accept loop.
 
 #![cfg(feature = "e2e")]
 
@@ -18,15 +18,13 @@ use std::{
 };
 
 use wobble::{
-    client, crypto, net,
+    crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
     server::{PeerEndpoint, Server},
     sqlite_store::SqliteStore,
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
-    wire::{
-        HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage,
-    },
+    wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
 };
 
 fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
@@ -114,7 +112,15 @@ fn temp_sqlite_path(label: &str) -> PathBuf {
 }
 
 /// Runs a server against a fixed number of inbound connections for deterministic tests.
-fn serve_n(mut server: Server, listener: TcpListener, count: usize) -> Server {
+fn serve_n(
+    mut server: Server,
+    listener: TcpListener,
+    count: usize,
+    bootstrap_sync: bool,
+) -> Server {
+    if bootstrap_sync {
+        server.sync_configured_peers_best_effort();
+    }
     for _ in 0..count {
         let (stream, _) = listener.accept().unwrap();
         server.handle_stream(stream).unwrap();
@@ -214,6 +220,16 @@ impl TestNet {
     }
 
     fn start(&mut self, name: &str, bootstrap: NodeBootstrap, count: usize) -> RunningNode {
+        self.start_with_sync(name, bootstrap, count, false)
+    }
+
+    fn start_with_sync(
+        &mut self,
+        name: &str,
+        bootstrap: NodeBootstrap,
+        count: usize,
+        bootstrap_sync: bool,
+    ) -> RunningNode {
         let addr = self.addr(name).to_string();
         let peer_endpoints = self.peer_endpoints(name);
         let node = self.nodes.get_mut(name).unwrap();
@@ -236,13 +252,14 @@ impl TestNet {
             PeerConfig::new("wobble-local", Some(node.name.clone())).with_advertised_addr(addr),
             state,
         )
-        .with_peers(peer_endpoints);
+        .with_peers(peer_endpoints)
+        .with_bootstrap_sync(bootstrap_sync);
         if let Some(sqlite_path) = sqlite_path.as_deref() {
             server = server.with_sqlite_path(sqlite_path);
         }
 
         RunningNode {
-            worker: thread::spawn(move || serve_n(server, listener, count)),
+            worker: thread::spawn(move || serve_n(server, listener, count, bootstrap_sync)),
         }
     }
 
@@ -282,33 +299,6 @@ impl TestNet {
         };
         drop(client);
         block_hash
-    }
-
-    /// Polls a live peer for its currently advertised best tip summary.
-    fn request_tip(&self, node_name: &str) -> TipSummary {
-        client::request_tip(
-            self.addr(node_name),
-            &PeerConfig::new("wobble-local", Some("sync-client".to_string())),
-        )
-        .unwrap()
-    }
-
-    /// Fetches one concrete block from a live peer by hash during explicit sync.
-    fn request_block(&self, node_name: &str, block_hash: BlockHash) -> Option<Block> {
-        client::request_block(
-            self.addr(node_name),
-            &PeerConfig::new("wobble-local", Some("sync-client".to_string())),
-            block_hash,
-        )
-        .unwrap()
-    }
-
-    /// Pushes a fetched block into another node the same way a relayed block
-    /// announcement would arrive over the normal network path.
-    fn announce_block(&self, node_name: &str, block: Block) {
-        let mut client = connect_and_handshake(self.addr(node_name), "sync-client");
-        net::send_message(&mut client, &WireMessage::AnnounceBlock { block }).unwrap();
-        drop(client);
     }
 
     fn sync_delay(&self) {
@@ -620,13 +610,14 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
     let mut testnet = TestNet::new();
     testnet.add_node("proposer", &["miner"]);
     testnet.add_node("miner", &["proposer"]);
-    testnet.add_node("observer", &[]);
+    testnet.add_node("observer", &["miner"]);
 
     // The observer stays offline while the payment is proposed and mined, so it
-    // must later discover the new tip and pull the missing block explicitly.
+    // must catch up from its configured peer during bootstrap before it begins
+    // serving new inbound connections.
     let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
-    // The miner must stay online for the later explicit `get_tip` and
-    // `get_block` catch-up requests from the observer.
+    // The miner must stay online for the observer bootstrap handshake plus the
+    // one-shot tip block fetch that follows.
     let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 4);
 
     testnet.submit_payment("proposer", payment.clone());
@@ -634,19 +625,8 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
     let block_hash = testnet.mine_pending("miner", &miner);
     testnet.sync_delay();
 
-    let observer = testnet.start("observer", NodeBootstrap::State(observer_state), 1);
-
-    let remote_tip = testnet.request_tip("miner");
-    assert_eq!(remote_tip.tip, Some(block_hash));
-    assert_eq!(remote_tip.height, Some(1));
-
-    let missing_block = testnet
-        .request_block("miner", block_hash)
-        .expect("miner should serve the new tip block");
-    assert_eq!(missing_block.transactions.len(), 2);
-    assert_eq!(missing_block.transactions[1].txid(), payment_txid);
-
-    testnet.announce_block("observer", missing_block);
+    let observer =
+        testnet.start_with_sync("observer", NodeBootstrap::State(observer_state), 0, true);
 
     let proposer = proposer.join();
     let miner_server = miner_server.join();
@@ -662,6 +642,9 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
         miner_server.state().chain().best_tip()
     );
     assert!(observer.state().mempool().is_empty());
+    let observer_tip = observer.state().get_block(&block_hash).unwrap();
+    assert_eq!(observer_tip.transactions.len(), 2);
+    assert_eq!(observer_tip.transactions[1].txid(), payment_txid);
     assert_eq!(
         observer.state().balance_for_key(&recipient.verifying_key()),
         30

@@ -4,7 +4,8 @@
 //! semantics in `peer`, and the mutable blockchain state in `NodeState`.
 //! The first version is intentionally single-threaded and handles one stream at
 //! a time so the protocol loop stays easy to reason about during early
-//! networking work.
+//! networking work. It now also supports an optional bootstrap sync pass that
+//! can pull missing blocks from configured peers before the main accept loop.
 
 use std::{
     io,
@@ -17,11 +18,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    client::{self, ClientError, RequestError},
     net,
-    node_state::NodeState,
+    node_state::{NodeState, NodeStateError},
     peer::{self, PeerConfig, PeerError},
     sqlite_store::{self, SqliteStoreError},
-    types::BlockHash,
+    types::{Block, BlockHash},
     wire::{HelloMessage, WireMessage},
 };
 
@@ -59,12 +61,24 @@ pub struct Server {
     state: NodeState,
     peers: Vec<PeerEndpoint>,
     sqlite_path: Option<PathBuf>,
+    bootstrap_sync: bool,
 }
 
 /// Errors produced by the live server while handling protocol messages.
 #[derive(Debug)]
 pub enum ServerError {
     Peer(PeerError),
+    SqlitePersist(SqliteStoreError),
+    Sync(SyncError),
+}
+
+/// Errors produced while fetching and applying missing blocks from a peer.
+#[derive(Debug)]
+pub enum SyncError {
+    Handshake(ClientError),
+    Request(RequestError),
+    MissingRemoteBlock(BlockHash),
+    AcceptBlock(NodeStateError),
     SqlitePersist(SqliteStoreError),
 }
 
@@ -81,6 +95,7 @@ impl Server {
             state,
             peers: Vec::new(),
             sqlite_path: None,
+            bootstrap_sync: false,
         }
     }
 
@@ -95,6 +110,16 @@ impl Server {
     /// This stores the live server state in SQLite for restart and sync.
     pub fn with_sqlite_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.sqlite_path = Some(path.into());
+        self
+    }
+
+    /// Enables a one-time sync attempt from configured peers before serving.
+    ///
+    /// This is intended for cold start or restart of a node that may have
+    /// missed blocks while offline. Sync is still best effort and currently
+    /// runs only once at startup rather than as a background loop.
+    pub fn with_bootstrap_sync(mut self, enabled: bool) -> Self {
+        self.bootstrap_sync = enabled;
         self
     }
 
@@ -193,10 +218,87 @@ impl Server {
 
     /// Accepts inbound peer connections from an existing listener.
     pub fn serve_listener(&mut self, listener: TcpListener) -> io::Result<()> {
+        if self.bootstrap_sync {
+            self.sync_configured_peers_best_effort();
+        }
         for stream in listener.incoming() {
             self.handle_stream(stream?)?;
         }
         Ok(())
+    }
+
+    /// Attempts a one-time startup sync from each configured peer.
+    ///
+    /// Failures are intentionally swallowed so a node can still come up and
+    /// serve local traffic even if some peers are offline or return incomplete
+    /// history.
+    pub fn sync_configured_peers_best_effort(&mut self) {
+        let peers = self.peers.clone();
+        for peer in &peers {
+            let _ = self.sync_from_peer(peer);
+        }
+    }
+
+    /// Fetches a missing remote tip segment from `peer` and applies it
+    /// parent-first until this node reaches a known ancestor.
+    ///
+    /// If the remote tip is already indexed locally, this is a no-op. Current
+    /// behavior reconnects per block request for simplicity; later versions can
+    /// keep one stream open while downloading a range.
+    fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
+        let (_, remote_hello) = client::connect_and_handshake(&peer.addr, &self.config)
+            .map_err(SyncError::Handshake)?;
+        let Some(remote_tip) = remote_hello.tip else {
+            return Ok(());
+        };
+        if self.state.get_block(&remote_tip).is_some() {
+            return Ok(());
+        }
+
+        let mut missing_blocks = Vec::new();
+        let mut next_hash = remote_tip;
+        loop {
+            if self.state.get_block(&next_hash).is_some() {
+                break;
+            }
+
+            let block = client::request_block(&peer.addr, &self.config, next_hash)
+                .map_err(SyncError::Request)?
+                .ok_or(SyncError::MissingRemoteBlock(next_hash))?;
+            let parent_hash = block.header.prev_blockhash;
+            missing_blocks.push(block);
+
+            if parent_hash == BlockHash::default() {
+                break;
+            }
+            next_hash = parent_hash;
+        }
+
+        let mut accepted_any = false;
+        for block in missing_blocks.into_iter().rev() {
+            if self.accept_synced_block(block)? {
+                accepted_any = true;
+            }
+        }
+
+        if accepted_any {
+            self.persist_full_state()
+                .map_err(SyncError::SqlitePersist)?;
+        }
+
+        Ok(())
+    }
+
+    /// Applies one fetched block if it is not already indexed locally.
+    fn accept_synced_block(&mut self, block: Block) -> Result<bool, SyncError> {
+        let block_hash = block.header.block_hash();
+        if self.state.get_block(&block_hash).is_some() {
+            return Ok(false);
+        }
+        self.state
+            .accept_block(block)
+            .map_err(SyncError::AcceptBlock)?;
+        Ok(true)
     }
 
     fn persist_sqlite(
@@ -223,6 +325,15 @@ impl Server {
             return Ok(());
         };
         store.save_block_record(block, entry, self.state.chain().best_tip())
+    }
+
+    /// Persists the full current node state when a bulk sync changed local history.
+    fn persist_full_state(&self) -> Result<(), SqliteStoreError> {
+        let Some(path) = self.sqlite_path.as_deref() else {
+            return Ok(());
+        };
+        let store = sqlite_store::SqliteStore::open(path)?;
+        store.save_node_state(&self.state)
     }
 
     /// Announces an accepted object to configured peers except the one that
@@ -752,5 +863,150 @@ mod tests {
         assert_eq!(block.header.block_hash(), *block_hash);
         assert_eq!(block.transactions.len(), 2);
         assert_eq!(block.transactions[1], transaction);
+    }
+
+    #[test]
+    fn sync_from_peer_fetches_and_accepts_missing_tip_block() {
+        let owner = crypto::signing_key_from_bytes([9; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let child = mine_block(
+            genesis.header.block_hash(),
+            0x207f_ffff,
+            &owner.verifying_key(),
+            1,
+        );
+        let child_hash = child.header.block_hash();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer_addr = addr.clone();
+        let served_child = child.clone();
+        let worker = thread::spawn(move || {
+            let (mut hello_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut hello_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut hello_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr.clone()),
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            drop(hello_stream);
+
+            let (mut block_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut block_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut block_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr),
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut block_stream).unwrap();
+            let WireMessage::GetBlock { block_hash } = request else {
+                panic!("expected get_block request");
+            };
+            assert_eq!(block_hash, child_hash);
+            net::send_message(
+                &mut block_stream,
+                &WireMessage::Block {
+                    block: Some(served_child),
+                },
+            )
+            .unwrap();
+        });
+
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let mut server = Server::new(
+            PeerConfig::new("wobble-local", Some("local".to_string())),
+            state,
+        );
+
+        server
+            .sync_from_peer(&PeerEndpoint::new(peer_addr, Some("remote".to_string())))
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(server.state().chain().best_tip(), Some(child_hash));
+        assert!(server.state().get_block(&child_hash).is_some());
+    }
+
+    #[test]
+    fn sync_from_peer_errors_when_remote_tip_block_is_missing() {
+        let owner = crypto::signing_key_from_bytes([10; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let missing_hash = BlockHash::new([0x44; 32]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer_addr = addr.clone();
+        let missing_hash_for_thread = missing_hash;
+        let worker = thread::spawn(move || {
+            let (mut hello_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut hello_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut hello_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr.clone()),
+                    tip: Some(missing_hash_for_thread),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            drop(hello_stream);
+
+            let (mut block_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut block_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut block_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr),
+                    tip: Some(missing_hash_for_thread),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut block_stream).unwrap();
+            let WireMessage::GetBlock { block_hash } = request else {
+                panic!("expected get_block request");
+            };
+            assert_eq!(block_hash, missing_hash_for_thread);
+            net::send_message(&mut block_stream, &WireMessage::Block { block: None }).unwrap();
+        });
+
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let mut server = Server::new(
+            PeerConfig::new("wobble-local", Some("local".to_string())),
+            state,
+        );
+
+        let err = server
+            .sync_from_peer(&PeerEndpoint::new(peer_addr, Some("remote".to_string())))
+            .unwrap_err();
+        worker.join().unwrap();
+
+        assert!(matches!(err, super::SyncError::MissingRemoteBlock(hash) if hash == missing_hash));
     }
 }

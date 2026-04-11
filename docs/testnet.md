@@ -25,10 +25,12 @@ Already implemented:
 - best-effort transaction relay for newly accepted transactions
 - best-effort relay hooks for newly accepted and newly mined blocks
 - outbound client handshake helper used by remote CLI flows
+- optional bootstrap sync from configured peers at server startup
 - feature-gated integration test target at `tests/testnet_e2e.rs`
 - end-to-end proposer -> miner -> proposer flow over real TCP
 - restart/persistence proposer -> miner -> proposer flow over real TCP
 - multi-hop proposer -> relay -> miner -> relay -> proposer flow over real TCP
+- lagging-node catch-up from a live peer during bootstrap sync
 
 What the current E2E test proves:
 - a proposer-facing node accepts a payment transaction
@@ -38,12 +40,13 @@ What the current E2E test proves:
 - both nodes converge on the same tip and balances
 - a restarted proposer reloads persisted mempool/chain state from SQLite and still converges after mining
 - a relay node can forward a payment onward to a miner and forward the mined block back to the proposer
+- a lagging node can start later, fetch a missed block from a configured peer, and converge before serving
 
 Current limitation:
 - relay is still short-lived request/response TCP rather than persistent peer sessions
 - origin suppression now prefers the advertised listener address from `hello`
   and falls back to `node_name` only when that address is unavailable
-- missed-block catch-up is not yet covered by the scripted E2E flow
+- catch-up currently runs only once during bootstrap rather than as a background sync loop
 
 ## Implementation Plan
 
@@ -108,6 +111,10 @@ Flow:
 3. reconnect it
 4. fetch the missing block segment
 5. assert it reaches the same best tip as the live nodes
+
+Completed:
+- a lagging node can bootstrap from a configured peer, pull a missed tip block,
+  and converge in `tests/testnet_e2e.rs`
 
 ## Non-Goals For This Slice
 

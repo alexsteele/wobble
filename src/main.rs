@@ -213,7 +213,8 @@ fn run() -> Result<(), String> {
             };
             let mut server = Server::new(config, state)
                 .with_peers(peer_endpoints.clone())
-                .with_sqlite_path(sqlite_path);
+                .with_sqlite_path(sqlite_path)
+                .with_bootstrap_sync(true);
 
             println!("serving sqlite {}", sqlite_path.display());
             println!("bootstrap source: sqlite");
