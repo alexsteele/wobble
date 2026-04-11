@@ -9,13 +9,17 @@
 //! - `blocks` stores the raw serialized block payload by block hash
 //! - `chain_entries` stores per-block indexing facts used for fork choice, such
 //!   as height, cumulative work, and parent linkage
+//! - `active_utxos` stores the current active-chain unspent outputs
 //! - `metadata` stores singleton node-level values such as the current best tip
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::types::{Block, BlockHash, ChainIndexEntry};
+use crate::{
+    state::UtxoSet,
+    types::{Block, BlockHash, ChainIndexEntry, OutPoint, TxOut, Txid, Utxo},
+};
 
 #[derive(Debug)]
 pub enum SqliteStoreError {
@@ -156,6 +160,70 @@ impl SqliteStore {
         best_tip.map(|value| parse_block_hash(&value)).transpose()
     }
 
+    /// Replaces the persisted active-chain UTXO view with `utxos`.
+    ///
+    /// This is still a whole-view rewrite rather than incremental spend/create
+    /// journaling. That keeps the first SQLite-backed UTXO step simple while we
+    /// decide the longer-term schema.
+    pub fn save_active_utxos(&self, utxos: &UtxoSet) -> Result<(), SqliteStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM active_utxos", [])?;
+        for (outpoint, utxo) in utxos.iter() {
+            tx.execute(
+                "INSERT INTO active_utxos (
+                     txid, vout, value, locking_data, created_at_height, is_coinbase
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    outpoint.txid.to_string(),
+                    outpoint.vout as i64,
+                    utxo.output.value as i64,
+                    utxo.output.locking_data,
+                    utxo.created_at_height as i64,
+                    if utxo.is_coinbase { 1_i64 } else { 0_i64 },
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted active-chain UTXO view.
+    pub fn load_active_utxos(&self) -> Result<UtxoSet, SqliteStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT txid, vout, value, locking_data, created_at_height, is_coinbase
+             FROM active_utxos",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut utxos = UtxoSet::new();
+        for row in rows {
+            let (txid, vout, value, locking_data, created_at_height, is_coinbase) = row?;
+            let outpoint = OutPoint {
+                txid: parse_txid(&txid)?,
+                vout: vout as u32,
+            };
+            utxos.insert(Utxo {
+                outpoint,
+                output: TxOut {
+                    value: value as u64,
+                    locking_data,
+                },
+                created_at_height: created_at_height as u64,
+                is_coinbase: is_coinbase != 0,
+            });
+        }
+        Ok(utxos)
+    }
+
     fn initialize_schema(&self) -> Result<(), SqliteStoreError> {
         self.connection.execute_batch(
             "BEGIN;
@@ -168,6 +236,15 @@ impl SqliteStore {
                  height INTEGER NOT NULL,
                  cumulative_work BLOB NOT NULL,
                  parent_hash TEXT NULL
+             );
+             CREATE TABLE IF NOT EXISTS active_utxos (
+                 txid TEXT NOT NULL,
+                 vout INTEGER NOT NULL,
+                 value INTEGER NOT NULL,
+                 locking_data BLOB NOT NULL,
+                 created_at_height INTEGER NOT NULL,
+                 is_coinbase INTEGER NOT NULL,
+                 PRIMARY KEY (txid, vout)
              );
              CREATE TABLE IF NOT EXISTS metadata (
                  key TEXT PRIMARY KEY,
@@ -196,6 +273,16 @@ fn parse_block_hash(value: &str) -> Result<BlockHash, SqliteStoreError> {
     Ok(BlockHash::new(array))
 }
 
+fn parse_txid(value: &str) -> Result<Txid, SqliteStoreError> {
+    let bytes =
+        hex::decode(value).map_err(|_| SqliteStoreError::InvalidHashHex(value.to_string()))?;
+    let len = bytes.len();
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SqliteStoreError::InvalidHashLength(len))?;
+    Ok(Txid::new(array))
+}
+
 mod hex {
     pub fn decode(value: &str) -> Result<Vec<u8>, ()> {
         if value.len() % 2 != 0 {
@@ -220,7 +307,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::types::{Block, BlockHash, BlockHeader, ChainIndexEntry, Transaction, TxOut};
+    use crate::{
+        state::UtxoSet,
+        types::{
+            Block, BlockHash, BlockHeader, ChainIndexEntry, OutPoint, Transaction, TxOut, Txid,
+            Utxo,
+        },
+    };
 
     use super::SqliteStore;
 
@@ -298,5 +391,42 @@ mod tests {
         assert_eq!(loaded_block, block);
         assert_eq!(loaded_entry, entry);
         assert_eq!(best_tip, Some(block_hash));
+    }
+
+    #[test]
+    fn round_trips_active_utxos() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let mut utxos = UtxoSet::new();
+        utxos.insert(Utxo {
+            outpoint: OutPoint {
+                txid: Txid::new([0x10; 32]),
+                vout: 1,
+            },
+            output: TxOut {
+                value: 42,
+                locking_data: vec![0xaa, 0xbb],
+            },
+            created_at_height: 7,
+            is_coinbase: true,
+        });
+
+        store.save_active_utxos(&utxos).unwrap();
+
+        let loaded = store.load_active_utxos().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded.get(&OutPoint {
+                txid: Txid::new([0x10; 32]),
+                vout: 1,
+            }),
+            utxos.get(&OutPoint {
+                txid: Txid::new([0x10; 32]),
+                vout: 1,
+            })
+        );
     }
 }

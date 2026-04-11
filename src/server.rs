@@ -166,14 +166,14 @@ impl Server {
         let Some(block_hash) = request_block_hash.or_else(|| mined_block_hash(replies)) else {
             return Ok(());
         };
+        let store = sqlite_store::SqliteStore::open(path)?;
+        store.save_active_utxos(self.state.active_utxos())?;
         let Some(block) = self.state.get_block(&block_hash) else {
             return Ok(());
         };
         let Some(entry) = self.state.chain().get(&block_hash) else {
             return Ok(());
         };
-
-        let store = sqlite_store::SqliteStore::open(path)?;
         store.save_block_record(block, entry, self.state.chain().best_tip())
     }
 }
@@ -217,6 +217,7 @@ mod tests {
         node_state::NodeState,
         peer::PeerConfig,
         server::Server,
+        sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
@@ -243,6 +244,20 @@ mod tests {
             .as_nanos();
         path.push(format!(
             "wobble-server-test-{}-{}.bin",
+            std::process::id(),
+            nanos
+        ));
+        path
+    }
+
+    fn temp_sqlite_path() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        path.push(format!(
+            "wobble-server-test-{}-{}.sqlite",
             std::process::id(),
             nanos
         ));
@@ -454,5 +469,37 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert!(loaded.mempool().get(&txid).is_some());
+    }
+
+    #[test]
+    fn persists_block_metadata_and_active_utxos_to_sqlite() {
+        let owner = crypto::signing_key_from_bytes([1; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let genesis_hash = genesis.header.block_hash();
+        let sqlite_path = temp_sqlite_path();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+            .with_sqlite_path(&sqlite_path);
+
+        server
+            .handle_message(WireMessage::AnnounceBlock {
+                block: genesis.clone(),
+            })
+            .unwrap();
+
+        let store = SqliteStore::open(&sqlite_path).unwrap();
+        let loaded_block = store.load_block(genesis_hash).unwrap();
+        let loaded_entry = store.load_chain_entry(genesis_hash).unwrap();
+        let loaded_best_tip = store.load_best_tip().unwrap();
+        let loaded_utxos = store.load_active_utxos().unwrap();
+        drop(store);
+        fs::remove_file(&sqlite_path).unwrap();
+
+        assert_eq!(loaded_block, Some(genesis));
+        assert_eq!(
+            loaded_entry,
+            server.state().chain().get(&genesis_hash).cloned()
+        );
+        assert_eq!(loaded_best_tip, server.state().chain().best_tip());
+        assert_eq!(loaded_utxos.len(), server.state().active_utxos().len());
     }
 }

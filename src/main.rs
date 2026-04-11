@@ -204,7 +204,7 @@ fn run() -> Result<(), String> {
             let sqlite_path = snapshot_path.with_extension("sqlite");
             let state = store::load_node_state(snapshot_path)
                 .map_err(|err| format!("load failed: {err:?}"))?;
-            validate_sqlite_bootstrap(&sqlite_path, state.chain().best_tip())?;
+            validate_sqlite_bootstrap(&sqlite_path, &state)?;
             let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
                 .with_snapshot_path(snapshot_path)
                 .with_sqlite_path(&sqlite_path);
@@ -570,10 +570,7 @@ fn usage() -> String {
     .join("\n")
 }
 
-fn validate_sqlite_bootstrap(
-    sqlite_path: &Path,
-    snapshot_best_tip: Option<BlockHash>,
-) -> Result<(), String> {
+fn validate_sqlite_bootstrap(sqlite_path: &Path, snapshot_state: &NodeState) -> Result<(), String> {
     if !sqlite_path.exists() {
         return Ok(());
     }
@@ -583,6 +580,7 @@ fn validate_sqlite_bootstrap(
     let sqlite_best_tip = store
         .load_best_tip()
         .map_err(|err| format!("sqlite best tip load failed: {err:?}"))?;
+    let snapshot_best_tip = snapshot_state.chain().best_tip();
     if sqlite_best_tip != snapshot_best_tip {
         return Err(format!(
             "sqlite best tip mismatch: snapshot={} sqlite={}",
@@ -591,7 +589,27 @@ fn validate_sqlite_bootstrap(
         ));
     }
 
+    let sqlite_utxos = store
+        .load_active_utxos()
+        .map_err(|err| format!("sqlite active UTXO load failed: {err:?}"))?;
+    if !utxo_sets_match(snapshot_state.active_utxos(), &sqlite_utxos) {
+        return Err(format!(
+            "sqlite active UTXO mismatch: snapshot={} sqlite={}",
+            snapshot_state.active_utxos().len(),
+            sqlite_utxos.len()
+        ));
+    }
+
     Ok(())
+}
+
+fn utxo_sets_match(left: &wobble::state::UtxoSet, right: &wobble::state::UtxoSet) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter()
+        .all(|(outpoint, utxo)| right.get(outpoint) == Some(utxo))
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64, String> {
