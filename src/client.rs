@@ -7,7 +7,7 @@
 //! for explicit tip, block, and transaction announcement flows during sync
 //! tests and CLI operations.
 
-use std::{io, net::TcpStream};
+use std::{io, net::TcpStream, time::Duration};
 
 use crate::{
     net,
@@ -15,6 +15,13 @@ use crate::{
     types::Transaction,
     wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
+
+/// Short timeout for one-shot outbound peer requests.
+///
+/// Bootstrap sync and relay-style requests are best effort, so they should
+/// fail quickly when a peer is not yet accepting or replying rather than
+/// stalling server startup indefinitely.
+const OUTBOUND_PEER_IO_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Errors returned while opening and handshaking an outbound peer connection.
 #[derive(Debug)]
@@ -45,6 +52,7 @@ pub fn connect_and_handshake(
     config: &PeerConfig,
 ) -> Result<(TcpStream, HelloMessage), ClientError> {
     let mut stream = net::connect(peer_addr).map_err(ClientError::Connect)?;
+    configure_outbound_stream(&stream).map_err(ClientError::Connect)?;
     let hello = WireMessage::Hello(HelloMessage {
         network: config.network.clone(),
         version: PROTOCOL_VERSION,
@@ -61,6 +69,13 @@ pub fn connect_and_handshake(
     };
 
     Ok((stream, message))
+}
+
+/// Applies a short read/write timeout to one-shot outbound peer streams.
+fn configure_outbound_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
+    Ok(())
 }
 
 /// Opens a one-shot connection, asks the peer for its current best tip, and
@@ -113,12 +128,12 @@ pub fn announce_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, thread};
+    use std::{io, net::TcpListener, thread, time::Duration};
 
     use crate::{
         client::{
-            ClientError, RequestError, announce_transaction, connect_and_handshake, request_block,
-            request_tip,
+            ClientError, OUTBOUND_PEER_IO_TIMEOUT, RequestError, announce_transaction,
+            connect_and_handshake, request_block, request_tip,
         },
         net,
         peer::PeerConfig,
@@ -201,6 +216,28 @@ mod tests {
         assert!(matches!(
             err,
             ClientError::UnexpectedHandshake(WireMessage::GetTip)
+        ));
+    }
+
+    #[test]
+    fn connect_and_handshake_times_out_when_peer_never_replies() {
+        let (listener, addr) = connected_listener();
+
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = net::receive_message(&mut stream).unwrap();
+            thread::sleep(Duration::from_millis(
+                OUTBOUND_PEER_IO_TIMEOUT.as_millis() as u64 + 100,
+            ));
+        });
+
+        let err = connect_and_handshake(&addr, &PeerConfig::new("wobble-local", None)).unwrap_err();
+        worker.join().unwrap();
+
+        assert!(matches!(
+            err,
+            ClientError::ReceiveHello(source)
+                if matches!(source.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
         ));
     }
 
