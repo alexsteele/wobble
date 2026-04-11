@@ -271,6 +271,10 @@ impl Server {
             let message = match net::receive_message_from_reader(&mut reader) {
                 Ok(message) => message,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 Err(err) => return Err(err),
             };
 
@@ -325,6 +329,10 @@ impl Server {
             let request = match receive_admin_request_from_reader(&mut reader) {
                 Ok(request) => request,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 Err(err) => return Err(err),
             };
             let response = self.handle_admin_request(request);
@@ -378,13 +386,19 @@ impl Server {
         }
         loop {
             match listener.accept() {
-                Ok((stream, _)) => self.handle_stream(stream)?,
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    self.handle_stream(stream)?
+                }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(err) => return Err(err),
             }
             if let Some(admin_listener) = admin_listener.as_ref() {
                 match admin_listener.accept() {
-                    Ok((stream, _)) => self.handle_admin_stream(stream)?,
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        self.handle_admin_stream(stream)?
+                    }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     Err(err) => return Err(err),
                 }
@@ -1058,6 +1072,7 @@ mod tests {
         let owner = crypto::signing_key_from_bytes([7; 32]);
         let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
         let (mut client, server_stream) = connected_pair();
+        server_stream.set_nonblocking(true).unwrap();
 
         let worker =
             thread::spawn(move || server.handle_admin_stream(server_stream).map(|_| server));
