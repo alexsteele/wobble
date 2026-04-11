@@ -54,7 +54,7 @@ wobble wallet-balance <sqlite_path> <wallet_path>
 wobble create-alias-book <alias_book>
 wobble alias-add <alias_book> <name> <public_key>
 wobble alias-list <alias_book>
-wobble serve <sqlite_path> <listen_addr> <network> [node_name]
+wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>]
 wobble get-tip <peer_addr> <network> [node_name]
 wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]
 wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]
@@ -81,6 +81,21 @@ wobble mine-pending /tmp/wobble.sqlite 50 /tmp/miner.wallet 2 100
 wobble wallet-balance /tmp/wobble.sqlite /tmp/miner.wallet
 wobble wallet-balance /tmp/wobble.sqlite /tmp/recipient.wallet
 wobble info /tmp/wobble.sqlite
+```
+
+Peer bootstrap file example:
+
+```json
+[
+  { "addr": "127.0.0.1:9002", "node_name": "miner" },
+  { "addr": "127.0.0.1:9003", "node_name": "observer" }
+]
+```
+
+Example server startup with peers:
+
+```text
+wobble serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer --peers_path /tmp/peers.json
 ```
 
 ## Build And Test

@@ -29,6 +29,7 @@ Still missing for a convincing multi-node testnet:
 
 Implemented in the first slice:
 - configured peer set on `Server`
+- optional peer bootstrap file for `wobble serve --peers_path <path>`
 - best-effort transaction relay for newly accepted transactions
 - best-effort relay hooks for newly accepted and newly mined blocks
 - feature-gated integration test target at `tests/testnet_e2e.rs`

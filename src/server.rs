@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     net,
     node_state::NodeState,
@@ -28,7 +30,7 @@ use crate::{
 /// `node_name` is optional because some callers may know only the socket
 /// address. When present, it lets the server avoid relaying an accepted object
 /// straight back to the peer that just announced it on the current stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerEndpoint {
     pub addr: String,
     pub node_name: Option<String>,

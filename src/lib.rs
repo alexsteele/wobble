@@ -6,6 +6,7 @@ pub mod mempool;
 pub mod net;
 pub mod node_state;
 pub mod peer;
+pub mod peers;
 pub mod server;
 pub mod sqlite_store;
 pub mod state;

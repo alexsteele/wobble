@@ -5,6 +5,7 @@ use wobble::{
     crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
+    peers,
     server::Server,
     sqlite_store::SqliteStore,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
@@ -192,20 +193,27 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "serve" => {
-            if args.len() != 5 && args.len() != 6 {
+            if args.len() < 5 {
                 return Err(usage());
             }
 
             let sqlite_path = Path::new(&args[2]);
             let listen_addr = &args[3];
             let network = args[4].clone();
-            let node_name = args.get(5).cloned();
+            let (node_name, peers_path) = parse_serve_args(&args[5..])?;
             let state = SqliteStore::open(sqlite_path)
                 .and_then(|store| store.load_node_state())
                 .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
             let config =
                 PeerConfig::new(network.clone(), node_name).with_advertised_addr(listen_addr);
-            let mut server = Server::new(config, state).with_sqlite_path(sqlite_path);
+            let peer_endpoints = match peers_path {
+                Some(path) => peers::load_peer_endpoints(path)
+                    .map_err(|err| format!("peer config load failed: {err:?}"))?,
+                None => Vec::new(),
+            };
+            let mut server = Server::new(config, state)
+                .with_peers(peer_endpoints.clone())
+                .with_sqlite_path(sqlite_path);
 
             println!("serving sqlite {}", sqlite_path.display());
             println!("bootstrap source: sqlite");
@@ -218,6 +226,16 @@ fn run() -> Result<(), String> {
                 "best tip: {}",
                 format_hash(server.state().chain().best_tip())
             );
+            if let Some(path) = peers_path {
+                println!("peers file: {}", path.display());
+            }
+            println!("configured peers: {}", peer_endpoints.len());
+            for peer in &peer_endpoints {
+                match peer.node_name.as_deref() {
+                    Some(name) => println!("peer: {} ({name})", peer.addr),
+                    None => println!("peer: {}", peer.addr),
+                }
+            }
 
             server
                 .serve(listen_addr)
@@ -551,7 +569,7 @@ fn usage() -> String {
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
-        "  wobble serve <sqlite_path> <listen_addr> <network> [node_name]",
+        "  wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>]",
         "  wobble get-tip <peer_addr> <network> [node_name]",
         "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
         "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]",
@@ -567,6 +585,48 @@ fn load_sqlite_state(path: &Path) -> Result<NodeState, String> {
     SqliteStore::open(path)
         .and_then(|store| store.load_node_state())
         .map_err(|err| format!("sqlite load failed: {err:?}"))
+}
+
+/// Parses optional `serve` arguments without changing the existing required prefix.
+///
+/// Supported forms:
+/// - `--node_name <name>`
+/// - `--peers_path <path>`
+/// - both flags in either order
+fn parse_serve_args(args: &[String]) -> Result<(Option<String>, Option<&Path>), String> {
+    let mut node_name = None;
+    let mut peers_path = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--node_name" => {
+                if node_name.is_some() {
+                    return Err("duplicate --node_name".to_string());
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --node_name".to_string());
+                };
+                node_name = Some(value.to_string());
+                index += 2;
+            }
+            "--peers_path" => {
+                if peers_path.is_some() {
+                    return Err("duplicate --peers_path".to_string());
+                }
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --peers_path".to_string());
+                };
+                peers_path = Some(Path::new(path));
+                index += 2;
+            }
+            value => {
+                return Err(format!("unexpected serve argument: {value}"));
+            }
+        }
+    }
+
+    Ok((node_name, peers_path))
 }
 
 fn save_sqlite_state(path: &Path, state: &NodeState) -> Result<(), String> {
@@ -624,6 +684,74 @@ fn parse_public_key_or_alias(value: &str) -> Result<ed25519_dalek::VerifyingKey,
             .map_err(|err| format!("alias resolve failed: {err:?}"))
     } else {
         parse_public_key(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::parse_serve_args;
+
+    #[test]
+    fn parse_serve_args_accepts_node_name_and_peer_file() {
+        let args = vec![
+            "--node_name".to_string(),
+            "alpha".to_string(),
+            "--peers_path".to_string(),
+            "/tmp/peers.json".to_string(),
+        ];
+
+        let (node_name, peers_path) = parse_serve_args(&args).unwrap();
+
+        assert_eq!(node_name, Some("alpha".to_string()));
+        assert_eq!(peers_path, Some(Path::new("/tmp/peers.json")));
+    }
+
+    #[test]
+    fn parse_serve_args_accepts_peer_file_without_node_name() {
+        let args = vec!["--peers_path".to_string(), "/tmp/peers.json".to_string()];
+
+        let (node_name, peers_path) = parse_serve_args(&args).unwrap();
+
+        assert_eq!(node_name, None);
+        assert_eq!(peers_path, Some(Path::new("/tmp/peers.json")));
+    }
+
+    #[test]
+    fn parse_serve_args_rejects_missing_peer_file_value() {
+        let args = vec![
+            "--node_name".to_string(),
+            "alpha".to_string(),
+            "--peers_path".to_string(),
+        ];
+
+        let err = parse_serve_args(&args).unwrap_err();
+
+        assert_eq!(err, "missing value for --peers_path");
+    }
+
+    #[test]
+    fn parse_serve_args_rejects_positional_node_name() {
+        let args = vec!["alpha".to_string()];
+
+        let err = parse_serve_args(&args).unwrap_err();
+
+        assert_eq!(err, "unexpected serve argument: alpha");
+    }
+
+    #[test]
+    fn parse_serve_args_rejects_duplicate_node_name_flag() {
+        let args = vec![
+            "--node_name".to_string(),
+            "alpha".to_string(),
+            "--node_name".to_string(),
+            "beta".to_string(),
+        ];
+
+        let err = parse_serve_args(&args).unwrap_err();
+
+        assert_eq!(err, "duplicate --node_name");
     }
 }
 
