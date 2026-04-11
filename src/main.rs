@@ -242,13 +242,13 @@ fn run() -> Result<(), String> {
                 .map_err(|err| format!("server failed: {err}"))
         }
         "get-tip" => {
-            if args.len() != 4 && args.len() != 5 {
+            if args.len() != 4 && args.len() != 6 {
                 return Err(usage());
             }
 
             let peer_addr = &args[2];
             let network = args[3].clone();
-            let node_name = args.get(4).cloned();
+            let node_name = parse_optional_node_name_flag(&args[4..])?;
             let mut stream =
                 net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
 
@@ -302,7 +302,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "submit-payment-remote" => {
-            if args.len() != 9 && args.len() != 10 {
+            if args.len() != 9 && args.len() != 11 {
                 return Err(usage());
             }
 
@@ -313,7 +313,7 @@ fn run() -> Result<(), String> {
             let uniqueness = parse_u32(&args[6], "uniqueness")?;
             let peer_addr = &args[7];
             let network = args[8].clone();
-            let node_name = args.get(9).cloned();
+            let node_name = parse_optional_node_name_flag(&args[9..])?;
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let mut local_state = load_sqlite_state(sqlite_path)?;
@@ -355,7 +355,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "mine-pending-remote" => {
-            if args.len() != 8 && args.len() != 9 {
+            if args.len() != 8 && args.len() != 10 {
                 return Err(usage());
             }
 
@@ -367,7 +367,7 @@ fn run() -> Result<(), String> {
                 .map_err(|_| format!("invalid max_transactions: {}", args[5]))?;
             let peer_addr = &args[6];
             let network = args[7].clone();
-            let node_name = args.get(8).cloned();
+            let node_name = parse_optional_node_name_flag(&args[8..])?;
             let miner_wallet = wallet::load_wallet(miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let mut stream =
@@ -570,9 +570,9 @@ fn usage() -> String {
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
         "  wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>]",
-        "  wobble get-tip <peer_addr> <network> [node_name]",
-        "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
-        "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]",
+        "  wobble get-tip <peer_addr> <network> [--node_name <name>]",
+        "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]",
+        "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]",
         "  wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]",
@@ -627,6 +627,17 @@ fn parse_serve_args(args: &[String]) -> Result<(Option<String>, Option<&Path>), 
     }
 
     Ok((node_name, peers_path))
+}
+
+/// Parses an optional `--node_name <name>` flag used by remote CLI commands.
+fn parse_optional_node_name_flag(args: &[String]) -> Result<Option<String>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--node_name" => Ok(Some(value.clone())),
+        [flag] if flag == "--node_name" => Err("missing value for --node_name".to_string()),
+        [value] => Err(format!("unexpected argument: {value}")),
+        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+    }
 }
 
 fn save_sqlite_state(path: &Path, state: &NodeState) -> Result<(), String> {
@@ -691,7 +702,7 @@ fn parse_public_key_or_alias(value: &str) -> Result<ed25519_dalek::VerifyingKey,
 mod tests {
     use std::path::Path;
 
-    use super::parse_serve_args;
+    use super::{parse_optional_node_name_flag, parse_serve_args};
 
     #[test]
     fn parse_serve_args_accepts_node_name_and_peer_file() {
@@ -752,6 +763,24 @@ mod tests {
         let err = parse_serve_args(&args).unwrap_err();
 
         assert_eq!(err, "duplicate --node_name");
+    }
+
+    #[test]
+    fn parse_optional_node_name_flag_accepts_named_form() {
+        let args = vec!["--node_name".to_string(), "alpha".to_string()];
+
+        let node_name = parse_optional_node_name_flag(&args).unwrap();
+
+        assert_eq!(node_name, Some("alpha".to_string()));
+    }
+
+    #[test]
+    fn parse_optional_node_name_flag_rejects_old_positional_form() {
+        let args = vec!["alpha".to_string()];
+
+        let err = parse_optional_node_name_flag(&args).unwrap_err();
+
+        assert_eq!(err, "unexpected argument: alpha");
     }
 }
 

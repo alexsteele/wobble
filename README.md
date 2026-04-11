@@ -55,9 +55,9 @@ wobble create-alias-book <alias_book>
 wobble alias-add <alias_book> <name> <public_key>
 wobble alias-list <alias_book>
 wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>]
-wobble get-tip <peer_addr> <network> [node_name]
-wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]
-wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]
+wobble get-tip <peer_addr> <network> [--node_name <name>]
+wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]
+wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]
 wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>
 wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>
 wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]
