@@ -1,11 +1,11 @@
 use std::{env, path::Path};
 
-use ed25519_dalek::SigningKey;
 use wobble::{
     crypto,
     node_state::NodeState,
     store,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
+    wallet::{self, Wallet},
 };
 
 fn main() {
@@ -83,6 +83,36 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        "create-wallet" => {
+            if args.len() != 3 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            let wallet = Wallet::generate();
+            wallet::save_wallet(path, &wallet)
+                .map_err(|err| format!("wallet save failed: {err:?}"))?;
+            println!("created wallet at {}", path.display());
+            println!(
+                "public: {}",
+                encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
+            );
+            Ok(())
+        }
+        "wallet-address" => {
+            if args.len() != 3 {
+                return Err(usage());
+            }
+
+            let path = Path::new(&args[2]);
+            let wallet =
+                wallet::load_wallet(path).map_err(|err| format!("wallet load failed: {err:?}"))?;
+            println!(
+                "{}",
+                encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
+            );
+            Ok(())
+        }
         "submit-transfer" => {
             if args.len() != 8 {
                 return Err(usage());
@@ -92,8 +122,10 @@ fn run() -> Result<(), String> {
             let txid = parse_txid(&args[3])?;
             let vout = parse_u32(&args[4], "vout")?;
             let amount = parse_u64(&args[5], "amount")?;
-            let secret_key = parse_signing_key(&args[6])?;
+            let sender_wallet_path = Path::new(&args[6]);
             let recipient_public_key = parse_public_key(&args[7])?;
+            let sender_wallet = wallet::load_wallet(sender_wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
             let mut state =
                 store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
@@ -110,7 +142,7 @@ fn run() -> Result<(), String> {
                 lock_time: 0,
             };
             tx.inputs[0].unlocking_data =
-                crypto::sign_message(&secret_key, &tx.signing_digest()).to_vec();
+                crypto::sign_message(sender_wallet.signing_key(), &tx.signing_digest()).to_vec();
             let submitted = state
                 .submit_transaction(tx)
                 .map_err(|err| format!("submit failed: {err:?}"))?;
@@ -126,16 +158,18 @@ fn run() -> Result<(), String> {
             }
 
             let path = Path::new(&args[2]);
-            let sender_signing_key = parse_signing_key(&args[3])?;
+            let sender_wallet_path = Path::new(&args[3]);
             let recipient_verifying_key = parse_public_key(&args[4])?;
             let amount = parse_u64(&args[5], "amount")?;
             let uniqueness = parse_u32(&args[6], "uniqueness")?;
+            let sender_wallet = wallet::load_wallet(sender_wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
             let mut state =
                 store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
             let submitted = state
                 .submit_payment(
-                    &sender_signing_key,
+                    sender_wallet.signing_key(),
                     &recipient_verifying_key,
                     amount,
                     uniqueness,
@@ -154,7 +188,7 @@ fn run() -> Result<(), String> {
 
             let path = Path::new(&args[2]);
             let reward = parse_u64(&args[3], "reward")?;
-            let miner_verifying_key = parse_public_key(&args[4])?;
+            let miner_wallet_path = Path::new(&args[4]);
             let uniqueness = if args.len() == 6 {
                 parse_u32(&args[5], "uniqueness")?
             } else {
@@ -165,11 +199,13 @@ fn run() -> Result<(), String> {
             } else {
                 0x207f_ffff
             };
+            let miner_wallet = wallet::load_wallet(miner_wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
             let mut state =
                 store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
             let block_hash = state
-                .mine_block(reward, &miner_verifying_key, uniqueness, bits, 0)
+                .mine_block(reward, &miner_wallet.verifying_key(), uniqueness, bits, 0)
                 .map_err(|err| format!("block rejected: {err:?}"))?;
             store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
 
@@ -188,7 +224,7 @@ fn run() -> Result<(), String> {
 
             let path = Path::new(&args[2]);
             let reward = parse_u64(&args[3], "reward")?;
-            let miner_verifying_key = parse_public_key(&args[4])?;
+            let miner_wallet_path = Path::new(&args[4]);
             let uniqueness = parse_u32(&args[5], "uniqueness")?;
             let max_transactions = args[6]
                 .parse::<usize>()
@@ -198,13 +234,15 @@ fn run() -> Result<(), String> {
             } else {
                 0x207f_ffff
             };
+            let miner_wallet = wallet::load_wallet(miner_wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
             let mut state =
                 store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
             let block_hash = state
                 .mine_block(
                     reward,
-                    &miner_verifying_key,
+                    &miner_wallet.verifying_key(),
                     uniqueness,
                     bits,
                     max_transactions,
@@ -229,10 +267,12 @@ fn usage() -> String {
         "  wobble info <snapshot>",
         "  wobble utxos <snapshot>",
         "  wobble generate-key",
-        "  wobble submit-payment <snapshot> <sender_secret_key> <recipient_public_key> <amount> <uniqueness>",
-        "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_secret_key> <recipient_public_key>",
-        "  wobble mine-coinbase <snapshot> <reward> <miner_public_key> [uniqueness] [bits]",
-        "  wobble mine-pending <snapshot> <reward> <miner_public_key> <uniqueness> <max_transactions> [bits]",
+        "  wobble create-wallet <wallet_path>",
+        "  wobble wallet-address <wallet_path>",
+        "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key> <amount> <uniqueness>",
+        "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
+        "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
+        "  wobble mine-pending <snapshot> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
     ]
     .join("\n")
 }
@@ -267,13 +307,6 @@ fn parse_txid(value: &str) -> Result<Txid, String> {
 fn format_hash(hash: Option<BlockHash>) -> String {
     hash.map(|value| value.to_string())
         .unwrap_or_else(|| "<none>".to_string())
-}
-
-fn parse_signing_key(value: &str) -> Result<SigningKey, String> {
-    Ok(crypto::signing_key_from_bytes(parse_hex_array::<32>(
-        value,
-        "secret key",
-    )?))
 }
 
 fn parse_public_key(value: &str) -> Result<ed25519_dalek::VerifyingKey, String> {

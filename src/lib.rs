@@ -6,3 +6,4 @@ pub mod node_state;
 pub mod state;
 pub mod store;
 pub mod types;
+pub mod wallet;
