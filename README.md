@@ -98,6 +98,23 @@ Example server startup with peers:
 wobble serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer --peers_path /tmp/peers.json
 ```
 
+## Logging
+
+The server uses structured `tracing` logs on stderr.
+
+Examples:
+
+```text
+cargo run -- serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer
+RUST_LOG=wobble=debug cargo run -- serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer
+RUST_LOG=info cargo run -- serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer
+```
+
+Notes:
+- default logging falls back to `info` if `RUST_LOG` is not set
+- `RUST_LOG=wobble=debug` is useful when following handshakes, relay, and sync decisions
+- logs are emitted on stderr so normal CLI output stays readable on stdout
+
 ## Build And Test
 
 Common development commands:

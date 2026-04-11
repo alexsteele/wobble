@@ -1,8 +1,10 @@
 use std::{env, path::Path};
 
+use tracing::info;
+
 use wobble::{
     aliases::{self, AliasBook},
-    client, crypto, net,
+    client, crypto, logging, net,
     node_state::NodeState,
     peer::PeerConfig,
     peers,
@@ -14,6 +16,7 @@ use wobble::{
 };
 
 fn main() {
+    logging::init();
     if let Err(message) = run() {
         eprintln!("{message}");
         std::process::exit(1);
@@ -216,6 +219,15 @@ fn run() -> Result<(), String> {
                 .with_sqlite_path(sqlite_path)
                 .with_bootstrap_sync(true);
 
+            info!(
+                command = "serve",
+                sqlite_path = %sqlite_path.display(),
+                listen_addr,
+                network,
+                peer_count = peer_endpoints.len(),
+                best_tip = %format_hash(server.state().chain().best_tip()),
+                "starting server"
+            );
             println!("serving sqlite {}", sqlite_path.display());
             println!("bootstrap source: sqlite");
             println!("listen addr: {listen_addr}");

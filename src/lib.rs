@@ -3,6 +3,7 @@ pub mod chain;
 pub mod client;
 pub mod consensus;
 pub mod crypto;
+pub mod logging;
 pub mod mempool;
 pub mod net;
 pub mod node_state;

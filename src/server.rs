@@ -16,6 +16,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use crate::{
     client::{self, ClientError, RequestError},
@@ -154,11 +155,13 @@ impl Server {
         message: WireMessage,
         origin: Option<&RelayOrigin>,
     ) -> Result<Vec<WireMessage>, ServerError> {
+        log_inbound_message(&message, &self.state);
         let should_persist = message_mutates_state(&message);
         let relay = self.relay_message_before_handle(&message);
         let sqlite_block_hash = persisted_block_hash(&message);
         let replies = peer::handle_message(&self.config, &mut self.state, message)
             .map_err(ServerError::Peer)?;
+        log_post_handle_state(&replies, &self.state);
         if should_persist {
             self.persist_sqlite(sqlite_block_hash, &replies)
                 .map_err(ServerError::SqlitePersist)?;
@@ -179,6 +182,9 @@ impl Server {
         let reader_stream = stream.try_clone()?;
         let mut reader = io::BufReader::new(reader_stream);
         let mut origin = RelayOrigin::default();
+        let peer_addr = stream.peer_addr().ok();
+
+        info!(peer_addr = ?peer_addr, "accepted peer stream");
 
         loop {
             let message = match net::receive_message_from_reader(&mut reader) {
@@ -188,6 +194,14 @@ impl Server {
             };
 
             if let WireMessage::Hello(remote_hello) = &message {
+                info!(
+                    peer_addr = ?peer_addr,
+                    remote_node = remote_hello.node_name.as_deref().unwrap_or("unknown"),
+                    advertised_addr = remote_hello.advertised_addr.as_deref().unwrap_or("none"),
+                    remote_tip = %format_hash(remote_hello.tip),
+                    remote_height = ?remote_hello.height,
+                    "received peer hello"
+                );
                 origin = RelayOrigin {
                     advertised_addr: remote_hello.advertised_addr.clone(),
                     node_name: remote_hello.node_name.clone(),
@@ -201,6 +215,10 @@ impl Server {
                 }
                 let synced_blocks = self.sync_from_hello_best_effort(remote_hello);
                 for block in synced_blocks {
+                    info!(
+                        block_hash = %format_hash(Some(block.header.block_hash())),
+                        "relaying block learned during hello-triggered sync"
+                    );
                     self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
                 }
                 continue;
@@ -226,8 +244,10 @@ impl Server {
     /// Accepts inbound peer connections from an existing listener.
     pub fn serve_listener(&mut self, listener: TcpListener) -> io::Result<()> {
         if self.bootstrap_sync {
+            info!(peer_count = self.peers.len(), "starting bootstrap sync");
             self.sync_configured_peers_best_effort();
         }
+        info!(listen_addr = ?listener.local_addr().ok(), "server listening");
         for stream in listener.incoming() {
             self.handle_stream(stream?)?;
         }
@@ -242,7 +262,9 @@ impl Server {
     pub fn sync_configured_peers_best_effort(&mut self) {
         let peers = self.peers.clone();
         for peer in &peers {
-            let _ = self.sync_from_peer(peer);
+            if let Err(err) = self.sync_from_peer(peer) {
+                warn!(peer_addr = %peer.addr, error = ?err, "bootstrap sync from peer failed");
+            }
         }
     }
 
@@ -253,12 +275,19 @@ impl Server {
     /// behavior reconnects per block request for simplicity; later versions can
     /// keep one stream open while downloading a range.
     fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
+        info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
         let (_, remote_hello) = client::connect_and_handshake(&peer.addr, &self.config)
             .map_err(SyncError::Handshake)?;
         let Some(remote_tip) = remote_hello.tip else {
+            debug!(peer_addr = %peer.addr, "peer has no advertised tip");
             return Ok(Vec::new());
         };
         if self.state.get_block(&remote_tip).is_some() {
+            debug!(
+                peer_addr = %peer.addr,
+                remote_tip = %format_hash(Some(remote_tip)),
+                "remote tip already known"
+            );
             return Ok(Vec::new());
         }
 
@@ -273,6 +302,12 @@ impl Server {
                 .map_err(SyncError::Request)?
                 .ok_or(SyncError::MissingRemoteBlock(next_hash))?;
             let parent_hash = block.header.prev_blockhash;
+            debug!(
+                peer_addr = %peer.addr,
+                block_hash = %format_hash(Some(block.header.block_hash())),
+                parent_hash = %format_hash(Some(parent_hash)),
+                "fetched block during sync"
+            );
             missing_blocks.push(block);
 
             if parent_hash == BlockHash::default() {
@@ -293,6 +328,13 @@ impl Server {
                 .map_err(SyncError::SqlitePersist)?;
         }
 
+        info!(
+            peer_addr = %peer.addr,
+            accepted_blocks = accepted_blocks.len(),
+            new_best_tip = %format_hash(self.state.chain().best_tip()),
+            "completed sync from peer"
+        );
+
         Ok(accepted_blocks)
     }
 
@@ -310,8 +352,15 @@ impl Server {
             return Vec::new();
         }
         let Some(peer_addr) = remote_hello.advertised_addr.as_deref() else {
+            debug!("remote hello advertised unknown tip without listener address");
             return Vec::new();
         };
+        info!(
+            peer_addr,
+            remote_tip = %format_hash(Some(remote_tip)),
+            remote_height = ?remote_hello.height,
+            "starting hello-triggered sync"
+        );
         let peer = PeerEndpoint::new(peer_addr.to_string(), remote_hello.node_name.clone());
         self.sync_from_peer(&peer).unwrap_or_default()
     }
@@ -368,8 +417,14 @@ impl Server {
     fn relay_best_effort(&self, message: &WireMessage, origin: Option<&RelayOrigin>) {
         for peer in &self.peers {
             if peer_matches_origin(peer, origin) {
+                debug!(peer_addr = %peer.addr, "skipping relay to origin peer");
                 continue;
             }
+            debug!(
+                peer_addr = %peer.addr,
+                message = wire_message_name(message),
+                "relaying message to peer"
+            );
             let _ = relay_to_peer(&peer.addr, &self.config, &self.state, message);
         }
     }
@@ -447,6 +502,74 @@ fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
         WireMessage::MinedBlock(result) => Some(result.block_hash),
         _ => None,
     })
+}
+
+/// Emits a concise log event for one inbound message before it is handled.
+fn log_inbound_message(message: &WireMessage, state: &NodeState) {
+    match message {
+        WireMessage::GetTip => debug!(
+            best_tip = %format_hash(state.chain().best_tip()),
+            "handling get_tip"
+        ),
+        WireMessage::GetBlock { block_hash } => debug!(
+            block_hash = %format_hash(Some(*block_hash)),
+            "handling get_block"
+        ),
+        WireMessage::AnnounceTx { transaction } => info!(
+            txid = %transaction.txid(),
+            input_count = transaction.inputs.len(),
+            output_count = transaction.outputs.len(),
+            "handling announced transaction"
+        ),
+        WireMessage::AnnounceBlock { block } => info!(
+            block_hash = %format_hash(Some(block.header.block_hash())),
+            tx_count = block.transactions.len(),
+            "handling announced block"
+        ),
+        WireMessage::MinePending(request) => info!(
+            reward = request.reward,
+            max_transactions = request.max_transactions,
+            bits = format_args!("{:#010x}", request.bits),
+            "handling mine_pending request"
+        ),
+        WireMessage::Hello(_)
+        | WireMessage::Tip(_)
+        | WireMessage::Block { .. }
+        | WireMessage::MinedBlock(_) => {}
+    }
+}
+
+/// Emits a concise log event after a state transition succeeds.
+fn log_post_handle_state(replies: &[WireMessage], state: &NodeState) {
+    if let Some(WireMessage::MinedBlock(result)) = replies.first() {
+        info!(
+            block_hash = %format_hash(Some(result.block_hash)),
+            best_tip = %format_hash(state.chain().best_tip()),
+            mempool_size = state.mempool().len(),
+            "mined block"
+        );
+    }
+}
+
+/// Returns a short stable label for a wire message variant.
+fn wire_message_name(message: &WireMessage) -> &'static str {
+    match message {
+        WireMessage::Hello(_) => "hello",
+        WireMessage::GetTip => "get_tip",
+        WireMessage::Tip(_) => "tip",
+        WireMessage::AnnounceTx { .. } => "announce_tx",
+        WireMessage::AnnounceBlock { .. } => "announce_block",
+        WireMessage::GetBlock { .. } => "get_block",
+        WireMessage::Block { .. } => "block",
+        WireMessage::MinePending(_) => "mine_pending",
+        WireMessage::MinedBlock(_) => "mined_block",
+    }
+}
+
+/// Formats an optional block hash for structured logs.
+fn format_hash(hash: Option<BlockHash>) -> String {
+    hash.map(|hash| hash.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Opens a short-lived outbound relay connection, completes the handshake, and
