@@ -32,12 +32,20 @@ pub struct BalanceSummary {
     pub amount: u64,
 }
 
+/// Result of an admin bootstrap mining request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapSummary {
+    pub blocks_mined: u32,
+    pub last_block_hash: Option<BlockHash>,
+}
+
 /// Local admin requests accepted by the node's admin socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AdminRequest {
     GetStatus,
     GetBalance { public_key: Vec<u8> },
+    Bootstrap { public_key: Vec<u8>, blocks: u32 },
     SubmitTransaction { transaction: Transaction },
 }
 
@@ -47,6 +55,7 @@ pub enum AdminRequest {
 pub enum AdminResponse {
     Status(StatusSummary),
     Balance(BalanceSummary),
+    Bootstrapped(BootstrapSummary),
     Submitted { txid: Txid },
     Error { message: String },
 }
@@ -131,6 +140,22 @@ pub fn submit_transaction(admin_addr: &str, transaction: Transaction) -> Result<
     }
 }
 
+/// Opens a one-shot localhost admin connection and mines initial funding blocks.
+pub fn bootstrap_funds(
+    admin_addr: &str,
+    public_key: Vec<u8>,
+    blocks: u32,
+) -> Result<BootstrapSummary, AdminError> {
+    let mut stream = net::connect(admin_addr).map_err(AdminError::Connect)?;
+    send_request(&mut stream, &AdminRequest::Bootstrap { public_key, blocks })
+        .map_err(AdminError::Send)?;
+    match receive_response(&mut stream).map_err(AdminError::Receive)? {
+        AdminResponse::Bootstrapped(summary) => Ok(summary),
+        AdminResponse::Error { message } => Err(AdminError::Server(message)),
+        other => Err(AdminError::UnexpectedResponse(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -141,8 +166,8 @@ mod tests {
 
     use crate::{
         admin::{
-            AdminRequest, AdminResponse, BalanceSummary, StatusSummary, request_balance,
-            request_status, submit_transaction,
+            AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary,
+            bootstrap_funds, request_balance, request_status, submit_transaction,
         },
         types::{BlockHash, Transaction},
     };
@@ -253,5 +278,40 @@ mod tests {
         worker.join().unwrap();
 
         assert_eq!(submitted, txid);
+    }
+
+    #[test]
+    fn bootstrap_funds_returns_bootstrap_summary() {
+        let (listener, addr) = connected_listener();
+
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: AdminRequest = serde_json::from_str(line.trim_end_matches('\n')).unwrap();
+            assert_eq!(
+                request,
+                AdminRequest::Bootstrap {
+                    public_key: vec![0x11; 32],
+                    blocks: 3,
+                }
+            );
+
+            let mut line = serde_json::to_string(&AdminResponse::Bootstrapped(BootstrapSummary {
+                blocks_mined: 3,
+                last_block_hash: Some(BlockHash::new([0x22; 32])),
+            }))
+            .unwrap();
+            line.push('\n');
+            stream.write_all(line.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let summary = bootstrap_funds(&addr, vec![0x11; 32], 3).unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(summary.blocks_mined, 3);
+        assert_eq!(summary.last_block_hash, Some(BlockHash::new([0x22; 32])));
     }
 }

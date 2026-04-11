@@ -44,6 +44,8 @@ struct Cli {
 enum Command {
     /// Initializes a node home with default state, wallet, aliases, and peers.
     Init(HomeArg),
+    /// Mines initial coinbase-only funding blocks to the local node wallet.
+    Bootstrap(BootstrapCommand),
     /// Starts the local node server.
     Serve(ServeCommand),
     /// Prints the local node wallet public key.
@@ -74,6 +76,17 @@ enum Command {
 /// Shared option for commands that operate on the default node home layout.
 #[derive(Debug, Args, Clone)]
 struct HomeArg {
+    /// Overrides the default node home directory.
+    #[arg(long)]
+    home: Option<PathBuf>,
+}
+
+/// Mines initial funding blocks to the local node wallet through the admin socket.
+#[derive(Debug, Args)]
+struct BootstrapCommand {
+    /// Number of coinbase-only blocks to mine.
+    #[arg(long, default_value_t = 1)]
+    blocks: u32,
     /// Overrides the default node home directory.
     #[arg(long)]
     home: Option<PathBuf>,
@@ -354,6 +367,7 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(command) => run_init(command),
+        Command::Bootstrap(command) => run_bootstrap(command),
         Command::Serve(command) => run_serve(command),
         Command::WalletAddress(command) => run_wallet_address(command),
         Command::WalletBalance(command) => run_wallet_balance(command),
@@ -401,6 +415,27 @@ fn run_init(command: HomeArg) -> Result<(), String> {
         "public: {}",
         encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
     );
+    Ok(())
+}
+
+/// Mines initial coinbase-only blocks to fund the local node wallet.
+fn run_bootstrap(command: BootstrapCommand) -> Result<(), String> {
+    let home = resolve_node_home(command.home.as_deref())?;
+    let node_config = home
+        .load_config()
+        .map_err(|err| format!("config load failed: {err:?}"))?;
+    let wallet = wallet::load_wallet(&home.wallet_path())
+        .map_err(|err| format!("wallet load failed: {err:?}"))?;
+    let summary = admin::bootstrap_funds(
+        &node_config.admin_addr,
+        crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec(),
+        command.blocks,
+    )
+    .map_err(|err| format!("bootstrap failed: {err:?}"))?;
+
+    println!("blocks mined: {}", summary.blocks_mined);
+    println!("last block: {}", format_hash(summary.last_block_hash));
+    println!("local admin: {}", node_config.admin_addr);
     Ok(())
 }
 
@@ -1116,8 +1151,8 @@ mod tests {
     use wobble::home::{MiningSection, NodeConfig, NodeHome};
 
     use super::{
-        Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand, ServeCommand,
-        SubmitPaymentCommand, resolve_mining_runtime, resolve_serve_runtime,
+        BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
+        ServeCommand, SubmitPaymentCommand, resolve_mining_runtime, resolve_serve_runtime,
         resolve_state_and_wallet_paths, resolve_state_path, resolve_wallet_path,
     };
 
@@ -1157,6 +1192,27 @@ mod tests {
 
         match cli.command {
             Command::Status(HomeArg { home }) => {
+                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bootstrap_with_block_count() {
+        let cli = Cli::try_parse_from([
+            "wobble",
+            "bootstrap",
+            "--blocks",
+            "3",
+            "--home",
+            "/tmp/node",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Bootstrap(BootstrapCommand { blocks, home }) => {
+                assert_eq!(blocks, 3);
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
             }
             other => panic!("unexpected command: {other:?}"),

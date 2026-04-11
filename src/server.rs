@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::{
-    admin::{AdminRequest, AdminResponse, BalanceSummary, StatusSummary},
+    admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
     client::{self, ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
     net,
@@ -419,6 +419,41 @@ impl Server {
                 };
                 AdminResponse::Balance(BalanceSummary {
                     amount: self.state.balance_for_key(&owner),
+                })
+            }
+            AdminRequest::Bootstrap { public_key, blocks } => {
+                if crate::crypto::parse_verifying_key(&public_key).is_none() {
+                    return AdminResponse::Error {
+                        message: "invalid public key".to_string(),
+                    };
+                }
+                let mut last_block_hash = None;
+                for uniqueness in 0..blocks {
+                    match self.handle_message(WireMessage::MinePending(
+                        crate::wire::MinePendingRequest {
+                            reward: BLOCK_SUBSIDY,
+                            miner_public_key: public_key.clone(),
+                            uniqueness,
+                            bits: 0x207f_ffff,
+                            max_transactions: 0,
+                        },
+                    )) {
+                        Ok(replies) => {
+                            last_block_hash = replies.iter().find_map(|reply| match reply {
+                                WireMessage::MinedBlock(result) => Some(result.block_hash),
+                                _ => None,
+                            });
+                        }
+                        Err(err) => {
+                            return AdminResponse::Error {
+                                message: format!("{err:?}"),
+                            };
+                        }
+                    }
+                }
+                AdminResponse::Bootstrapped(BootstrapSummary {
+                    blocks_mined: blocks,
+                    last_block_hash,
                 })
             }
             AdminRequest::SubmitTransaction { transaction } => {
@@ -865,6 +900,7 @@ mod tests {
     };
 
     use crate::{
+        admin::{AdminRequest, AdminResponse},
         crypto, net,
         node_state::NodeState,
         peer::PeerConfig,
@@ -882,6 +918,12 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    fn read_admin_line(reader: &mut BufReader<TcpStream>) -> String {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        line
     }
 
     fn read_line(reader: &mut BufReader<TcpStream>) -> String {
@@ -1009,6 +1051,38 @@ mod tests {
 
         drop(reader);
         assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn bootstrap_admin_request_mines_coinbase_blocks() {
+        let owner = crypto::signing_key_from_bytes([7; 32]);
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let (mut client, server_stream) = connected_pair();
+
+        let worker =
+            thread::spawn(move || server.handle_admin_stream(server_stream).map(|_| server));
+
+        let mut request = serde_json::to_string(&AdminRequest::Bootstrap {
+            public_key: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            blocks: 2,
+        })
+        .unwrap();
+        request.push('\n');
+        client.write_all(request.as_bytes()).unwrap();
+        client.flush().unwrap();
+
+        let mut reader = BufReader::new(client);
+        let response: AdminResponse =
+            serde_json::from_str(read_admin_line(&mut reader).trim_end_matches('\n')).unwrap();
+        let AdminResponse::Bootstrapped(summary) = response else {
+            panic!("expected bootstrapped response");
+        };
+        assert_eq!(summary.blocks_mined, 2);
+        assert!(summary.last_block_hash.is_some());
+
+        drop(reader);
+        let server = worker.join().unwrap().unwrap();
+        assert_eq!(server.state().balance_for_key(&owner.verifying_key()), 100);
     }
 
     #[test]
