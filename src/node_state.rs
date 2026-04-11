@@ -206,6 +206,10 @@ impl NodeState {
 
     /// Indexes `block`, derives its UTXO state from its parent snapshot, and
     /// updates the active view if this block becomes the best tip.
+    ///
+    /// If the accepted block advances or replaces the active tip, the mempool
+    /// is pruned afterward so any transactions invalidated by the new active
+    /// chain are dropped.
     pub fn accept_block(&mut self, block: Block) -> Result<(), NodeStateError> {
         let entry = self
             .chain
@@ -221,6 +225,10 @@ impl NodeState {
                 .get(&block_hash)
                 .ok_or(NodeStateError::MissingParentState(block_hash))?
                 .clone();
+            // Revalidate pending transactions against the new active tip after
+            // the UTXO view changes. This keeps stale spends from surviving a
+            // newly accepted block or reorg.
+            self.mempool.prune_invalid(&self.active_utxos);
         }
 
         Ok(())
@@ -552,6 +560,99 @@ mod tests {
         assert_eq!(block.transactions[0].outputs[0].value, BLOCK_SUBSIDY + 20);
         assert!(state.active_utxos().get(&spendable).is_none());
         assert_eq!(state.mempool().len(), 0);
+    }
+
+    #[test]
+    fn prunes_pending_transaction_spent_by_new_best_block() {
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let rival = signing_key(3);
+        let miner = signing_key(4);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &sender.verifying_key(), 0)],
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let competing_block = mine_block(
+            genesis.header.block_hash(),
+            0x207f_ffff,
+            vec![
+                coinbase(50, &miner.verifying_key(), 1),
+                spend(spendable, &sender, &rival.verifying_key(), 45, 2),
+            ],
+        );
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+
+        state
+            .submit_transaction(spend(spendable, &sender, &recipient.verifying_key(), 30, 3))
+            .unwrap();
+        assert_eq!(state.mempool().len(), 1);
+
+        // Once the best chain consumes the same outpoint, the pending spend is
+        // no longer valid against the active UTXO set and should be pruned.
+        state.accept_block(competing_block).unwrap();
+
+        assert!(state.mempool().is_empty());
+    }
+
+    #[test]
+    fn prunes_pending_transaction_after_reorg_replaces_its_input() {
+        let owner = signing_key(1);
+        let pending_recipient = signing_key(2);
+        let active_branch_miner = signing_key(3);
+        let alt_branch_miner = signing_key(4);
+        let replacement_owner = signing_key(5);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &owner.verifying_key(), 0)],
+        );
+        let genesis_hash = genesis.header.block_hash();
+        let easy_child = mine_block(
+            genesis_hash,
+            0x207f_ffff,
+            vec![coinbase(50, &active_branch_miner.verifying_key(), 1)],
+        );
+        let harder_child = mine_block(
+            genesis_hash,
+            0x1f00ffff,
+            vec![coinbase(50, &replacement_owner.verifying_key(), 2)],
+        );
+        let follow_on = mine_block(
+            harder_child.header.block_hash(),
+            0x1f00ffff,
+            vec![coinbase(50, &alt_branch_miner.verifying_key(), 3)],
+        );
+        let easy_child_coinbase = OutPoint {
+            txid: easy_child.transactions[0].txid(),
+            vout: 0,
+        };
+        let mut state = NodeState::new();
+
+        state.accept_block(genesis).unwrap();
+        state.accept_block(easy_child).unwrap();
+        state
+            .submit_transaction(spend(
+                easy_child_coinbase,
+                &active_branch_miner,
+                &pending_recipient.verifying_key(),
+                40,
+                4,
+            ))
+            .unwrap();
+        assert_eq!(state.mempool().len(), 1);
+
+        // The harder branch becomes the best tip and removes the easy-child
+        // coinbase from the active chain, so the pending spend becomes stale.
+        state.accept_block(harder_child).unwrap();
+        state.accept_block(follow_on).unwrap();
+
+        assert!(state.mempool().is_empty());
     }
 
     #[test]
