@@ -6,6 +6,7 @@ use wobble::{
     node_state::NodeState,
     peer::PeerConfig,
     server::Server,
+    sqlite_store::SqliteStore,
     store,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
@@ -203,6 +204,7 @@ fn run() -> Result<(), String> {
             let sqlite_path = snapshot_path.with_extension("sqlite");
             let state = store::load_node_state(snapshot_path)
                 .map_err(|err| format!("load failed: {err:?}"))?;
+            validate_sqlite_bootstrap(&sqlite_path, state.chain().best_tip())?;
             let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
                 .with_snapshot_path(snapshot_path)
                 .with_sqlite_path(&sqlite_path);
@@ -218,6 +220,9 @@ fn run() -> Result<(), String> {
                 "best tip: {}",
                 format_hash(server.state().chain().best_tip())
             );
+            if sqlite_path.exists() {
+                println!("sqlite bootstrap: validated");
+            }
 
             server
                 .serve(listen_addr)
@@ -563,6 +568,30 @@ fn usage() -> String {
         "  wobble mine-pending <snapshot> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
     ]
     .join("\n")
+}
+
+fn validate_sqlite_bootstrap(
+    sqlite_path: &Path,
+    snapshot_best_tip: Option<BlockHash>,
+) -> Result<(), String> {
+    if !sqlite_path.exists() {
+        return Ok(());
+    }
+
+    let store =
+        SqliteStore::open(sqlite_path).map_err(|err| format!("sqlite load failed: {err:?}"))?;
+    let sqlite_best_tip = store
+        .load_best_tip()
+        .map_err(|err| format!("sqlite best tip load failed: {err:?}"))?;
+    if sqlite_best_tip != snapshot_best_tip {
+        return Err(format!(
+            "sqlite best tip mismatch: snapshot={} sqlite={}",
+            format_hash(snapshot_best_tip),
+            format_hash(sqlite_best_tip)
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64, String> {
