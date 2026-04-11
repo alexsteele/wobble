@@ -7,7 +7,10 @@
 //! command reads defaults from the node home's config file and treats CLI flags
 //! as temporary overrides.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
@@ -431,7 +434,7 @@ fn run_bootstrap(command: BootstrapCommand) -> Result<(), String> {
         crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec(),
         command.blocks,
     )
-    .map_err(|err| format!("bootstrap failed: {err:?}"))?;
+    .map_err(|err| format_admin_error("bootstrap", &node_config.admin_addr, err))?;
 
     println!("blocks mined: {}", summary.blocks_mined);
     println!("last block: {}", format_hash(summary.last_block_hash));
@@ -539,7 +542,7 @@ fn run_wallet_balance(command: HomeArg) -> Result<(), String> {
         &node_config.admin_addr,
         crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec(),
     )
-    .map_err(|err| format!("balance query failed: {err:?}"))?;
+    .map_err(|err| format_admin_error("balance query", &node_config.admin_addr, err))?;
     println!("{}", balance.amount);
     Ok(())
 }
@@ -551,7 +554,7 @@ fn run_status(command: HomeArg) -> Result<(), String> {
         .load_config()
         .map_err(|err| format!("config load failed: {err:?}"))?;
     let status = admin::request_status(&node_config.admin_addr)
-        .map_err(|err| format!("status query failed: {err:?}"))?;
+        .map_err(|err| format_admin_error("status query", &node_config.admin_addr, err))?;
 
     println!("listen addr: {}", node_config.listen_addr);
     println!("admin addr: {}", node_config.admin_addr);
@@ -591,8 +594,9 @@ fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
         .get(&submitted)
         .cloned()
         .ok_or_else(|| format!("built transaction {submitted} missing from local mempool"))?;
-    admin::submit_transaction(&node_config.admin_addr, transaction)
-        .map_err(|err| format!("submit to local server failed: {err:?}"))?;
+    admin::submit_transaction(&node_config.admin_addr, transaction).map_err(|err| {
+        format_admin_error("submit to local server", &node_config.admin_addr, err)
+    })?;
 
     println!("submitted payment {}", submitted);
     println!("local admin: {}", node_config.admin_addr);
@@ -1099,6 +1103,45 @@ fn format_hash(hash: Option<BlockHash>) -> String {
         .unwrap_or_else(|| "<none>".to_string())
 }
 
+/// Formats local admin client failures into operator-facing CLI errors.
+///
+/// Connection failures usually mean the local node server is not running yet,
+/// so those cases get an explicit `wobble serve` hint. Other protocol or
+/// server-side failures keep their original detail for debugging.
+fn format_admin_error(action: &str, admin_addr: &str, err: admin::AdminError) -> String {
+    match err {
+        admin::AdminError::Connect(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            format!(
+                "{action} failed: local admin server is not running at {admin_addr}; start `wobble serve` first ({source})"
+            )
+        }
+        admin::AdminError::Connect(source) => {
+            format!(
+                "{action} failed: could not reach local admin server at {admin_addr} ({source})"
+            )
+        }
+        admin::AdminError::Send(source) => {
+            format!("{action} failed: could not send admin request to {admin_addr} ({source})")
+        }
+        admin::AdminError::Receive(source) => {
+            format!(
+                "{action} failed: did not receive a valid admin response from {admin_addr} ({source})"
+            )
+        }
+        admin::AdminError::Server(message) => {
+            format!("{action} failed: server rejected request: {message}")
+        }
+        admin::AdminError::UnexpectedResponse(response) => {
+            format!("{action} failed: unexpected admin response: {response:?}")
+        }
+    }
+}
+
 fn parse_public_key(value: &str) -> Result<ed25519_dalek::VerifyingKey, String> {
     crypto::parse_verifying_key(&parse_hex_vec(value, "public key")?)
         .ok_or_else(|| format!("invalid public key: {value}"))
@@ -1145,15 +1188,21 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::path::{Path, PathBuf};
 
     use clap::Parser;
-    use wobble::home::{MiningSection, NodeConfig, NodeHome};
+    use wobble::{
+        admin::{AdminError, AdminResponse},
+        home::{MiningSection, NodeConfig, NodeHome},
+        types::Txid,
+    };
 
     use super::{
         BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
-        ServeCommand, SubmitPaymentCommand, resolve_mining_runtime, resolve_serve_runtime,
-        resolve_state_and_wallet_paths, resolve_state_path, resolve_wallet_path,
+        ServeCommand, SubmitPaymentCommand, format_admin_error, resolve_mining_runtime,
+        resolve_serve_runtime, resolve_state_and_wallet_paths, resolve_state_path,
+        resolve_wallet_path,
     };
 
     #[test]
@@ -1273,6 +1322,47 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn formats_connection_refused_admin_errors_with_serve_hint() {
+        let err = AdminError::Connect(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "Connection refused",
+        ));
+
+        let message = format_admin_error("status query", "127.0.0.1:9000", err);
+
+        assert!(message.contains("local admin server is not running at 127.0.0.1:9000"));
+        assert!(message.contains("start `wobble serve` first"));
+    }
+
+    #[test]
+    fn formats_server_side_admin_errors_without_debug_wrappers() {
+        let message = format_admin_error(
+            "submit to local server",
+            "127.0.0.1:9000",
+            AdminError::Server("insufficient fee".to_string()),
+        );
+
+        assert_eq!(
+            message,
+            "submit to local server failed: server rejected request: insufficient fee"
+        );
+    }
+
+    #[test]
+    fn formats_unexpected_admin_responses_with_context() {
+        let message = format_admin_error(
+            "bootstrap",
+            "127.0.0.1:9000",
+            AdminError::UnexpectedResponse(AdminResponse::Submitted {
+                txid: Txid::new([0x11; 32]),
+            }),
+        );
+
+        assert!(message.starts_with("bootstrap failed: unexpected admin response:"));
+        assert!(message.contains("Submitted"));
     }
 
     #[test]
