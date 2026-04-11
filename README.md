@@ -24,7 +24,7 @@ the header until the hash falls below a target. This process is expensive, hard
 to fake, and easy to verify.
 
 Miners send their new blocks to other nodes. Nodes append valid blocks to their
-chain as long as they satisfies proof-of-work. The longest chain wins.
+chain as long as they satisfy proof-of-work. The longest chain wins.
 
 A UTXO is an unspent coint. The current set of UTXOs form the chain state.
 
