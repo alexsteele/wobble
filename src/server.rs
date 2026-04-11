@@ -6,6 +6,14 @@
 //! a time so the protocol loop stays easy to reason about during early
 //! networking work. It now also supports an optional bootstrap sync pass that
 //! can pull missing blocks from configured peers before the main accept loop.
+//!
+//! When integrated mining is enabled, the server reuses the existing
+//! `MinePending` message path instead of maintaining a separate mining engine.
+//! The serve loop polls for inbound connections, and during idle intervals it
+//! builds an internal `MinePending` request from `MiningConfig` and feeds that
+//! request back through normal message handling. That keeps mining,
+//! persistence, relay, and logging behavior aligned with externally triggered
+//! `mine_pending` requests.
 
 use std::{
     io,
@@ -20,6 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     client::{self, ClientError, RequestError},
+    consensus::BLOCK_SUBSIDY,
     net,
     node_state::{NodeState, NodeStateError},
     peer::{self, PeerConfig, PeerError},
@@ -27,6 +36,7 @@ use crate::{
     types::{Block, BlockHash},
     wire::{HelloMessage, WireMessage},
 };
+use ed25519_dalek::VerifyingKey;
 
 /// Outbound relay destination configured for this server.
 ///
@@ -63,6 +73,7 @@ pub struct Server {
     peers: Vec<PeerEndpoint>,
     sqlite_path: Option<PathBuf>,
     bootstrap_sync: bool,
+    mining: Option<MiningConfig>,
 }
 
 /// Errors produced by the live server while handling protocol messages.
@@ -83,6 +94,64 @@ pub enum SyncError {
     SqlitePersist(SqliteStoreError),
 }
 
+/// Background testnet mining configuration for a serving node.
+#[derive(Debug, Clone)]
+pub struct MiningConfig {
+    pub miner_verifying_key: VerifyingKey,
+    pub interval: Duration,
+    pub max_transactions: usize,
+    pub bits: u32,
+    next_uniqueness: u32,
+}
+
+impl MiningConfig {
+    /// Builds a minimal integrated mining policy for local testnet use.
+    ///
+    /// Mining uses the standard block subsidy, mines only when the mempool is
+    /// non-empty, and increments `uniqueness` on each mined block so coinbase
+    /// transactions remain distinct.
+    pub fn new(miner_verifying_key: VerifyingKey) -> Self {
+        Self {
+            miner_verifying_key,
+            interval: Duration::from_millis(250),
+            max_transactions: 100,
+            bits: 0x207f_ffff,
+            next_uniqueness: 0,
+        }
+    }
+
+    /// Sets the poll interval for the integrated miner loop.
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Caps how many mempool transactions a mined block may include.
+    pub fn with_max_transactions(mut self, max_transactions: usize) -> Self {
+        self.max_transactions = max_transactions;
+        self
+    }
+
+    /// Sets the compact proof-of-work target used by the integrated miner.
+    pub fn with_bits(mut self, bits: u32) -> Self {
+        self.bits = bits;
+        self
+    }
+
+    fn next_request(&mut self) -> crate::wire::MinePendingRequest {
+        let request = crate::wire::MinePendingRequest {
+            reward: BLOCK_SUBSIDY,
+            miner_public_key: crate::crypto::verifying_key_bytes(&self.miner_verifying_key)
+                .to_vec(),
+            uniqueness: self.next_uniqueness,
+            bits: self.bits,
+            max_transactions: self.max_transactions,
+        };
+        self.next_uniqueness = self.next_uniqueness.wrapping_add(1);
+        request
+    }
+}
+
 /// Retry budget for best-effort outbound relay dialing.
 const RELAY_CONNECT_ATTEMPTS: usize = 3;
 /// Small pause between relay dial attempts so listeners finishing a prior
@@ -97,6 +166,7 @@ impl Server {
             peers: Vec::new(),
             sqlite_path: None,
             bootstrap_sync: false,
+            mining: None,
         }
     }
 
@@ -121,6 +191,16 @@ impl Server {
     /// runs only once at startup rather than as a background loop.
     pub fn with_bootstrap_sync(mut self, enabled: bool) -> Self {
         self.bootstrap_sync = enabled;
+        self
+    }
+
+    /// Enables the integrated testnet miner for this serving node.
+    ///
+    /// The integrated miner is intentionally simple: while serving, it polls
+    /// for inbound connections and mines only when the local mempool is
+    /// non-empty.
+    pub fn with_mining(mut self, mining: MiningConfig) -> Self {
+        self.mining = Some(mining);
         self
     }
 
@@ -248,8 +328,63 @@ impl Server {
             self.sync_configured_peers_best_effort();
         }
         info!(listen_addr = ?listener.local_addr().ok(), "server listening");
-        for stream in listener.incoming() {
-            self.handle_stream(stream?)?;
+        if self.mining.is_none() {
+            for stream in listener.incoming() {
+                self.handle_stream(stream?)?;
+            }
+            return Ok(());
+        }
+
+        listener.set_nonblocking(true)?;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => self.handle_stream(stream)?,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    self.mine_pending_best_effort()?;
+                    let interval = self
+                        .mining
+                        .as_ref()
+                        .map(|config| config.interval)
+                        .unwrap_or(Duration::from_millis(50));
+                    thread::sleep(interval);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Mines one block from the current mempool when integrated mining is
+    /// enabled and there is pending work to confirm.
+    ///
+    /// This intentionally skips coinbase-only blocks so a quiet testnet node
+    /// does not produce an endless stream of empty blocks.
+    fn mine_pending_best_effort(&mut self) -> io::Result<()> {
+        let Some(mining) = self.mining.as_mut() else {
+            return Ok(());
+        };
+        if self.state.mempool().is_empty() {
+            debug!("mine_pending skipped because mempool is empty");
+            return Ok(());
+        }
+
+        let request = mining.next_request();
+        debug!(
+            uniqueness = request.uniqueness,
+            reward = request.reward,
+            max_transactions = request.max_transactions,
+            bits = format_args!("{:#010x}", request.bits),
+            mempool_size = self.state.mempool().len(),
+            "mine_pending: submitting internal mine_pending request"
+        );
+        let replies = self
+            .handle_message(WireMessage::MinePending(request))
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
+        if let Some(WireMessage::MinedBlock(result)) = replies.first() {
+            info!(
+                block_hash = %format_hash(Some(result.block_hash)),
+                best_tip = %format_hash(self.state.chain().best_tip()),
+                "mine_pending accepted block"
+            );
         }
         Ok(())
     }
@@ -624,14 +759,14 @@ mod tests {
         net::{TcpListener, TcpStream},
         path::PathBuf,
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use crate::{
         crypto, net,
         node_state::NodeState,
         peer::PeerConfig,
-        server::{PeerEndpoint, Server},
+        server::{MiningConfig, PeerEndpoint, Server},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
@@ -1202,5 +1337,40 @@ mod tests {
         )
         .unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn integrated_miner_mines_pending_transaction_when_enabled() {
+        let sender = crypto::signing_key_from_bytes([14; 32]);
+        let recipient = crypto::signing_key_from_bytes([15; 32]);
+        let miner = crypto::signing_key_from_bytes([16; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let txid = transaction.txid();
+
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        state.submit_transaction(transaction).unwrap();
+
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), state).with_mining(
+            MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
+        );
+
+        server.mine_pending_best_effort().unwrap();
+
+        assert!(server.state().mempool().is_empty());
+        let tip = server.state().chain().best_tip().unwrap();
+        let block = server.state().get_block(&tip).unwrap();
+        assert_eq!(block.transactions.len(), 2);
+        assert_eq!(block.transactions[1].txid(), txid);
     }
 }

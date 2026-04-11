@@ -1,14 +1,19 @@
-use std::{env, path::Path};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use tracing::info;
 
 use wobble::{
     aliases::{self, AliasBook},
-    client, crypto, logging, net,
+    client,
+    consensus::BLOCK_SUBSIDY,
+    crypto, logging, net,
     node_state::NodeState,
     peer::PeerConfig,
     peers,
-    server::Server,
+    server::{MiningConfig, Server},
     sqlite_store::SqliteStore,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
@@ -203,21 +208,43 @@ fn run() -> Result<(), String> {
             let sqlite_path = Path::new(&args[2]);
             let listen_addr = &args[3];
             let network = args[4].clone();
-            let (node_name, peers_path) = parse_serve_args(&args[5..])?;
+            let serve_options = parse_serve_args(&args[5..])?;
             let state = SqliteStore::open(sqlite_path)
                 .and_then(|store| store.load_node_state())
                 .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
-            let config =
-                PeerConfig::new(network.clone(), node_name).with_advertised_addr(listen_addr);
-            let peer_endpoints = match peers_path {
+            let config = PeerConfig::new(network.clone(), serve_options.node_name.clone())
+                .with_advertised_addr(listen_addr);
+            let peer_endpoints = match serve_options.peers_path.as_ref() {
                 Some(path) => peers::load_peer_endpoints(path)
                     .map_err(|err| format!("peer config load failed: {err:?}"))?,
                 None => Vec::new(),
+            };
+            let mining = match serve_options.miner_wallet_path.as_ref() {
+                Some(path) => {
+                    let wallet = wallet::load_wallet(path)
+                        .map_err(|err| format!("wallet load failed: {err:?}"))?;
+                    let mut mining = MiningConfig::new(wallet.verifying_key());
+                    if let Some(interval_ms) = serve_options.mining_interval_ms {
+                        mining =
+                            mining.with_interval(std::time::Duration::from_millis(interval_ms));
+                    }
+                    if let Some(max_transactions) = serve_options.mining_max_transactions {
+                        mining = mining.with_max_transactions(max_transactions);
+                    }
+                    if let Some(bits) = serve_options.mining_bits {
+                        mining = mining.with_bits(bits);
+                    }
+                    Some(mining)
+                }
+                None => None,
             };
             let mut server = Server::new(config, state)
                 .with_peers(peer_endpoints.clone())
                 .with_sqlite_path(sqlite_path)
                 .with_bootstrap_sync(true);
+            if let Some(mining) = mining.clone() {
+                server = server.with_mining(mining);
+            }
 
             info!(
                 command = "serve",
@@ -225,6 +252,7 @@ fn run() -> Result<(), String> {
                 listen_addr,
                 network,
                 peer_count = peer_endpoints.len(),
+                mining = mining.is_some(),
                 best_tip = %format_hash(server.state().chain().best_tip()),
                 "starting server"
             );
@@ -239,8 +267,25 @@ fn run() -> Result<(), String> {
                 "best tip: {}",
                 format_hash(server.state().chain().best_tip())
             );
-            if let Some(path) = peers_path {
+            if let Some(path) = serve_options.peers_path {
                 println!("peers file: {}", path.display());
+            }
+            if let Some(path) = serve_options.miner_wallet_path {
+                println!("integrated mining: enabled");
+                println!("miner wallet: {}", path.display());
+                println!("mining reward: {}", BLOCK_SUBSIDY);
+                println!(
+                    "mining interval ms: {}",
+                    serve_options.mining_interval_ms.unwrap_or(250)
+                );
+                println!(
+                    "mining max transactions: {}",
+                    serve_options.mining_max_transactions.unwrap_or(100)
+                );
+                println!(
+                    "mining bits: {:#010x}",
+                    serve_options.mining_bits.unwrap_or(0x207f_ffff)
+                );
             }
             println!("configured peers: {}", peer_endpoints.len());
             for peer in &peer_endpoints {
@@ -534,7 +579,7 @@ fn usage() -> String {
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
-        "  wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>]",
+        "  wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]",
         "  wobble get-tip <peer_addr> <network> [--node_name <name>]",
         "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]",
         "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]",
@@ -557,10 +602,27 @@ fn load_sqlite_state(path: &Path) -> Result<NodeState, String> {
 /// Supported forms:
 /// - `--node_name <name>`
 /// - `--peers_path <path>`
-/// - both flags in either order
-fn parse_serve_args(args: &[String]) -> Result<(Option<String>, Option<&Path>), String> {
+/// - `--miner_wallet <path>`
+/// - `--mining_interval_ms <ms>`
+/// - `--mining_max_transactions <count>`
+/// - `--mining_bits <bits>`
+#[derive(Debug, PartialEq, Eq)]
+struct ServeOptions {
+    node_name: Option<String>,
+    peers_path: Option<PathBuf>,
+    miner_wallet_path: Option<PathBuf>,
+    mining_interval_ms: Option<u64>,
+    mining_max_transactions: Option<usize>,
+    mining_bits: Option<u32>,
+}
+
+fn parse_serve_args(args: &[String]) -> Result<ServeOptions, String> {
     let mut node_name = None;
     let mut peers_path = None;
+    let mut miner_wallet_path = None;
+    let mut mining_interval_ms = None;
+    let mut mining_max_transactions = None;
+    let mut mining_bits = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -582,7 +644,51 @@ fn parse_serve_args(args: &[String]) -> Result<(Option<String>, Option<&Path>), 
                 let Some(path) = args.get(index + 1) else {
                     return Err("missing value for --peers_path".to_string());
                 };
-                peers_path = Some(Path::new(path));
+                peers_path = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--miner_wallet" => {
+                if miner_wallet_path.is_some() {
+                    return Err("duplicate --miner_wallet".to_string());
+                }
+                let Some(path) = args.get(index + 1) else {
+                    return Err("missing value for --miner_wallet".to_string());
+                };
+                miner_wallet_path = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--mining_interval_ms" => {
+                if mining_interval_ms.is_some() {
+                    return Err("duplicate --mining_interval_ms".to_string());
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --mining_interval_ms".to_string());
+                };
+                mining_interval_ms = Some(parse_u64(value, "mining_interval_ms")?);
+                index += 2;
+            }
+            "--mining_max_transactions" => {
+                if mining_max_transactions.is_some() {
+                    return Err("duplicate --mining_max_transactions".to_string());
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --mining_max_transactions".to_string());
+                };
+                mining_max_transactions = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid mining_max_transactions: {value}"))?,
+                );
+                index += 2;
+            }
+            "--mining_bits" => {
+                if mining_bits.is_some() {
+                    return Err("duplicate --mining_bits".to_string());
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --mining_bits".to_string());
+                };
+                mining_bits = Some(parse_bits(value)?);
                 index += 2;
             }
             value => {
@@ -591,7 +697,22 @@ fn parse_serve_args(args: &[String]) -> Result<(Option<String>, Option<&Path>), 
         }
     }
 
-    Ok((node_name, peers_path))
+    if miner_wallet_path.is_none()
+        && (mining_interval_ms.is_some()
+            || mining_max_transactions.is_some()
+            || mining_bits.is_some())
+    {
+        return Err("mining flags require --miner_wallet".to_string());
+    }
+
+    Ok(ServeOptions {
+        node_name,
+        peers_path,
+        miner_wallet_path,
+        mining_interval_ms,
+        mining_max_transactions,
+        mining_bits,
+    })
 }
 
 /// Parses an optional `--node_name <name>` flag used by remote CLI commands.
@@ -665,9 +786,9 @@ fn parse_public_key_or_alias(value: &str) -> Result<ed25519_dalek::VerifyingKey,
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::PathBuf;
 
-    use super::{parse_optional_node_name_flag, parse_serve_args};
+    use super::{ServeOptions, parse_optional_node_name_flag, parse_serve_args};
 
     #[test]
     fn parse_serve_args_accepts_node_name_and_peer_file() {
@@ -678,20 +799,68 @@ mod tests {
             "/tmp/peers.json".to_string(),
         ];
 
-        let (node_name, peers_path) = parse_serve_args(&args).unwrap();
+        let options = parse_serve_args(&args).unwrap();
 
-        assert_eq!(node_name, Some("alpha".to_string()));
-        assert_eq!(peers_path, Some(Path::new("/tmp/peers.json")));
+        assert_eq!(
+            options,
+            ServeOptions {
+                node_name: Some("alpha".to_string()),
+                peers_path: Some(PathBuf::from("/tmp/peers.json")),
+                miner_wallet_path: None,
+                mining_interval_ms: None,
+                mining_max_transactions: None,
+                mining_bits: None,
+            }
+        );
     }
 
     #[test]
     fn parse_serve_args_accepts_peer_file_without_node_name() {
         let args = vec!["--peers_path".to_string(), "/tmp/peers.json".to_string()];
 
-        let (node_name, peers_path) = parse_serve_args(&args).unwrap();
+        let options = parse_serve_args(&args).unwrap();
 
-        assert_eq!(node_name, None);
-        assert_eq!(peers_path, Some(Path::new("/tmp/peers.json")));
+        assert_eq!(
+            options,
+            ServeOptions {
+                node_name: None,
+                peers_path: Some(PathBuf::from("/tmp/peers.json")),
+                miner_wallet_path: None,
+                mining_interval_ms: None,
+                mining_max_transactions: None,
+                mining_bits: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_args_accepts_integrated_mining_flags() {
+        let args = vec![
+            "--node_name".to_string(),
+            "alpha".to_string(),
+            "--miner_wallet".to_string(),
+            "/tmp/miner.wallet".to_string(),
+            "--mining_interval_ms".to_string(),
+            "500".to_string(),
+            "--mining_max_transactions".to_string(),
+            "25".to_string(),
+            "--mining_bits".to_string(),
+            "0x207fffff".to_string(),
+        ];
+
+        let options = parse_serve_args(&args).unwrap();
+
+        assert_eq!(
+            options,
+            ServeOptions {
+                node_name: Some("alpha".to_string()),
+                peers_path: None,
+                miner_wallet_path: Some(PathBuf::from("/tmp/miner.wallet")),
+                mining_interval_ms: Some(500),
+                mining_max_transactions: Some(25),
+                mining_bits: Some(0x207f_ffff),
+            }
+        );
     }
 
     #[test]
@@ -728,6 +897,15 @@ mod tests {
         let err = parse_serve_args(&args).unwrap_err();
 
         assert_eq!(err, "duplicate --node_name");
+    }
+
+    #[test]
+    fn parse_serve_args_rejects_mining_overrides_without_wallet() {
+        let args = vec!["--mining_interval_ms".to_string(), "250".to_string()];
+
+        let err = parse_serve_args(&args).unwrap_err();
+
+        assert_eq!(err, "mining flags require --miner_wallet");
     }
 
     #[test]

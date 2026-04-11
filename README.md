@@ -42,7 +42,7 @@ See [design](docs/design.md).
 
 The current CLI is intentionally small:
 
-```text
+```shell
 wobble init <sqlite_path>
 wobble info <sqlite_path>
 wobble balance <sqlite_path> <public_key>
@@ -54,7 +54,7 @@ wobble wallet-balance <sqlite_path> <wallet_path>
 wobble create-alias-book <alias_book>
 wobble alias-add <alias_book> <name> <public_key>
 wobble alias-list <alias_book>
-wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>]
+wobble serve <sqlite_path> <listen_addr> <network> [--node_name <name>] [--peers_path <path>] [--miner_wallet <path>] [--mining_interval_ms <ms>] [--mining_max_transactions <count>] [--mining_bits <bits>]
 wobble get-tip <peer_addr> <network> [--node_name <name>]
 wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [--node_name <name>]
 wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [--node_name <name>]
@@ -66,7 +66,7 @@ wobble mine-pending <sqlite_path> <reward> <miner_wallet> <uniqueness> <max_tran
 
 Example:
 
-```text
+```shell
 wobble init /tmp/wobble.sqlite
 wobble create-wallet /tmp/miner.wallet
 wobble create-wallet /tmp/recipient.wallet
@@ -94,8 +94,26 @@ Peer bootstrap file example:
 
 Example server startup with peers:
 
-```text
-wobble serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer --peers_path /tmp/peers.json
+```shell
+wobble serve \
+  /tmp/wobble.sqlite \
+  127.0.0.1:9001 \
+  wobble-local \
+  --node_name proposer \
+  --peers_path /tmp/peers.json
+```
+
+Example server startup with integrated mining:
+
+```shell
+wobble serve \
+  /tmp/miner.sqlite \
+  127.0.0.1:9002 \
+  wobble-local \
+  --node_name miner \
+  --peers_path /tmp/miner-peers.json \
+  --miner_wallet /tmp/miner.wallet \
+  --mining_interval_ms 250
 ```
 
 ## Logging
@@ -104,10 +122,22 @@ The server uses structured `tracing` logs on stderr.
 
 Examples:
 
-```text
-cargo run -- serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer
-RUST_LOG=wobble=debug cargo run -- serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer
-RUST_LOG=info cargo run -- serve /tmp/wobble.sqlite 127.0.0.1:9001 wobble-local --node_name proposer
+```shell
+cargo run -- serve \
+  /tmp/wobble.sqlite \
+  127.0.0.1:9001 \
+  wobble-local \
+  --node_name proposer
+RUST_LOG=wobble=debug cargo run -- serve \
+  /tmp/wobble.sqlite \
+  127.0.0.1:9001 \
+  wobble-local \
+  --node_name proposer
+RUST_LOG=info cargo run -- serve \
+  /tmp/wobble.sqlite \
+  127.0.0.1:9001 \
+  wobble-local \
+  --node_name proposer
 ```
 
 Notes:
@@ -119,7 +149,7 @@ Notes:
 
 Common development commands:
 
-```text
+```shell
 cargo build
 cargo test
 cargo unit-test
