@@ -225,6 +225,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_outputs() {
+        let utxo = spendable_utxo(10);
+        let mut set = UtxoSet::new();
+        set.insert(utxo.clone());
+
+        let tx = spending_transaction(utxo.outpoint, Vec::new());
+
+        assert_eq!(
+            set.validate_transaction(&tx),
+            Err(ValidationError::EmptyOutputs)
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_inputs() {
         let utxo = spendable_utxo(10);
         let mut set = UtxoSet::new();
@@ -275,6 +289,87 @@ mod tests {
                 input_value: 10,
                 output_value: 11,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_output_value_overflow() {
+        let utxo = spendable_utxo(u64::MAX);
+        let mut set = UtxoSet::new();
+        set.insert(utxo.clone());
+
+        let tx = spending_transaction(
+            utxo.outpoint,
+            vec![
+                TxOut {
+                    value: u64::MAX,
+                    locking_data: vec![0x51],
+                },
+                TxOut {
+                    value: 1,
+                    locking_data: vec![0x52],
+                },
+            ],
+        );
+
+        assert_eq!(
+            set.validate_transaction(&tx),
+            Err(ValidationError::OutputValueOverflow)
+        );
+    }
+
+    #[test]
+    fn rejects_input_value_overflow() {
+        let left = Utxo {
+            outpoint: OutPoint {
+                txid: Txid::new([0x10; 32]),
+                vout: 0,
+            },
+            output: TxOut {
+                value: u64::MAX,
+                locking_data: vec![0x51],
+            },
+            created_at_height: 1,
+            is_coinbase: false,
+        };
+        let right = Utxo {
+            outpoint: OutPoint {
+                txid: Txid::new([0x20; 32]),
+                vout: 0,
+            },
+            output: TxOut {
+                value: 1,
+                locking_data: vec![0x52],
+            },
+            created_at_height: 1,
+            is_coinbase: false,
+        };
+        let mut set = UtxoSet::new();
+        set.insert(left.clone());
+        set.insert(right.clone());
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: left.outpoint,
+                    unlocking_data: vec![0xaa],
+                },
+                TxIn {
+                    previous_output: right.outpoint,
+                    unlocking_data: vec![0xbb],
+                },
+            ],
+            outputs: vec![TxOut {
+                value: 1,
+                locking_data: vec![0x53],
+            }],
+            lock_time: 0,
+        };
+
+        assert_eq!(
+            set.validate_transaction(&tx),
+            Err(ValidationError::InputValueOverflow)
         );
     }
 

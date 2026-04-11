@@ -1,5 +1,7 @@
 # Design
 
+authors: codex, alex
+
 ## Goal
 
 Build a Bitcoin-inspired blockchain in Rust.
