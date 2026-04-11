@@ -2,7 +2,7 @@ use std::{env, path::Path};
 
 use wobble::{
     aliases::{self, AliasBook},
-    crypto, net,
+    client, crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
     peers,
@@ -10,7 +10,7 @@ use wobble::{
     sqlite_store::SqliteStore,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
-    wire::{HelloMessage, MinePendingRequest, PROTOCOL_VERSION, WireMessage},
+    wire::{MinePendingRequest, WireMessage},
 };
 
 fn main() {
@@ -249,38 +249,19 @@ fn run() -> Result<(), String> {
             let peer_addr = &args[2];
             let network = args[3].clone();
             let node_name = parse_optional_node_name_flag(&args[4..])?;
-            let mut stream =
-                net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
-
-            let hello = WireMessage::Hello(HelloMessage {
-                network,
-                version: PROTOCOL_VERSION,
-                node_name,
-                advertised_addr: None,
-                tip: None,
-                height: None,
-            });
-            net::send_message(&mut stream, &hello)
-                .map_err(|err| format!("send hello failed: {err}"))?;
+            let config = PeerConfig::new(network, node_name);
+            let (mut stream, remote_hello) = client::connect_and_handshake(peer_addr, &config)
+                .map_err(|err| format!("handshake failed: {err:?}"))?;
             net::send_message(&mut stream, &WireMessage::GetTip)
                 .map_err(|err| format!("send get_tip failed: {err}"))?;
 
-            let remote_hello = net::receive_message(&mut stream)
-                .map_err(|err| format!("receive hello failed: {err}"))?;
             let remote_tip = net::receive_message(&mut stream)
                 .map_err(|err| format!("receive tip failed: {err}"))?;
 
-            match remote_hello {
-                WireMessage::Hello(message) => {
-                    println!("peer network: {}", message.network);
-                    println!("peer version: {}", message.version);
-                    if let Some(name) = message.node_name {
-                        println!("peer node name: {name}");
-                    }
-                }
-                other => {
-                    return Err(format!("unexpected first response: {other:?}"));
-                }
+            println!("peer network: {}", remote_hello.network);
+            println!("peer version: {}", remote_hello.version);
+            if let Some(name) = remote_hello.node_name {
+                println!("peer node name: {name}");
             }
 
             match remote_tip {
@@ -314,6 +295,7 @@ fn run() -> Result<(), String> {
             let peer_addr = &args[7];
             let network = args[8].clone();
             let node_name = parse_optional_node_name_flag(&args[9..])?;
+            let config = PeerConfig::new(network, node_name);
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let mut local_state = load_sqlite_state(sqlite_path)?;
@@ -331,23 +313,8 @@ fn run() -> Result<(), String> {
                     format!("built transaction {txid} missing from local mempool")
                 })?;
 
-            let mut stream =
-                net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
-            let hello = WireMessage::Hello(HelloMessage {
-                network,
-                version: PROTOCOL_VERSION,
-                node_name,
-                advertised_addr: None,
-                tip: None,
-                height: None,
-            });
-            net::send_message(&mut stream, &hello)
-                .map_err(|err| format!("send hello failed: {err}"))?;
-            let remote_hello = net::receive_message(&mut stream)
-                .map_err(|err| format!("receive hello failed: {err}"))?;
-            if !matches!(remote_hello, WireMessage::Hello(_)) {
-                return Err(format!("unexpected handshake response: {remote_hello:?}"));
-            }
+            let (mut stream, _) = client::connect_and_handshake(peer_addr, &config)
+                .map_err(|err| format!("handshake failed: {err:?}"))?;
             net::send_message(&mut stream, &WireMessage::AnnounceTx { transaction })
                 .map_err(|err| format!("send transaction failed: {err}"))?;
 
@@ -368,26 +335,11 @@ fn run() -> Result<(), String> {
             let peer_addr = &args[6];
             let network = args[7].clone();
             let node_name = parse_optional_node_name_flag(&args[8..])?;
+            let config = PeerConfig::new(network, node_name);
             let miner_wallet = wallet::load_wallet(miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut stream =
-                net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
-
-            let hello = WireMessage::Hello(HelloMessage {
-                network,
-                version: PROTOCOL_VERSION,
-                node_name,
-                advertised_addr: None,
-                tip: None,
-                height: None,
-            });
-            net::send_message(&mut stream, &hello)
-                .map_err(|err| format!("send hello failed: {err}"))?;
-            let remote_hello = net::receive_message(&mut stream)
-                .map_err(|err| format!("receive hello failed: {err}"))?;
-            if !matches!(remote_hello, WireMessage::Hello(_)) {
-                return Err(format!("unexpected handshake response: {remote_hello:?}"));
-            }
+            let (mut stream, _) = client::connect_and_handshake(peer_addr, &config)
+                .map_err(|err| format!("handshake failed: {err:?}"))?;
 
             net::send_message(
                 &mut stream,

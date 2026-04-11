@@ -1,5 +1,6 @@
 pub mod aliases;
 pub mod chain;
+pub mod client;
 pub mod consensus;
 pub mod crypto;
 pub mod mempool;
