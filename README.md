@@ -6,22 +6,25 @@ Developed with OpenAI codex
 
 ## Overview
 
-A blockchain is an ordered sequence of blocks. Each block contains a header and
-a list of transactions. Miners submit blocks to the chain after satisfying
-proof-of-work. Validation rules prevent double spends, and proof-of-work makes
-it costly to replace a chain with a conflicting one.
+A blockchain models a distributed ledger of transactions transferring coins
+between participants. Validation rules prevent double spends, and proof-of-work
+makes it costly to replace a chain with a conflicting one. This allows the
+participants to agree on the current chain while being completely decentralized.
 
-Transactions move coins through the blockchain. Transactions consume coins and
-create new ones that can be spent later on. The one exception is the coinbase
-transaction, which creates a new coin for the miner.
+It consists of a sequence of blocks. Each block contains a header and a list of
+transactions.
 
-Proof-of-work decides who gets to add the next block. Miners repeatedly vary
-their block `nonce` and hash the header until it follows below a target. This is
-expensive and hard to fake. But it is cheap to verify.
+Transactions move coins through the blockchain by consuming coins and create new
+ones that can be spent later on. The one exception is a coinbase transaction,
+which creates a new coin for the miner.
 
-Miners submit new blocks to other nodes in the network. Nodes append valid
-blocks to their chain as long as they satisfies proof-of-work. The longest chain
-wins.
+Miners submit blocks to the chain with new transactions after satisfying a
+proof-of-work. This involves repeatedly varying the header `nonce` and hashing
+the header until the hash falls below a target. This process is expensive, hard
+to fake, and easy to verify.
+
+Miners send their new blocks to other nodes. Nodes append valid blocks to their
+chain as long as they satisfies proof-of-work. The longest chain wins.
 
 A UTXO is an unspent coint. The current set of UTXOs form the chain state.
 
