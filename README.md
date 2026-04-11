@@ -104,11 +104,13 @@ Common development commands:
 
 ```text
 cargo build
-cargo test --lib
+cargo test
+cargo unit-test
 cargo test --features e2e --test testnet_e2e
 ```
 
 Notes:
 - `cargo build` compiles the library and CLI binary
-- `cargo test --lib` runs the fast library and unit test path
-- `cargo test --features e2e --test testnet_e2e` runs the slower real-TCP integration scenario
+- `cargo test` runs the default full suite, including the E2E coverage
+- `cargo unit-test` runs the fast library-only path without default features
+- `cargo test --features e2e --test testnet_e2e` still runs just the E2E integration target when you want it in isolation
