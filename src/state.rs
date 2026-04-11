@@ -9,13 +9,19 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Amount, BlockHeight, OutPoint, Transaction, TxOut, Utxo};
+use crate::{
+    crypto,
+    types::{Amount, BlockHeight, OutPoint, Transaction, TxOut, Utxo},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     EmptyOutputs,
     MissingInput(OutPoint),
     DuplicateInput(OutPoint),
+    InvalidLockingData(OutPoint),
+    InvalidUnlockingData(OutPoint),
+    SignatureMismatch(OutPoint),
     OutputValueOverflow,
     InputValueOverflow,
     Overspend {
@@ -106,6 +112,7 @@ impl UtxoSet {
 
         let mut seen_inputs = HashSet::new();
         let mut input_value = 0_u64;
+        let signing_digest = tx.signing_digest();
 
         // Resolve each referenced input exactly once and accumulate its value.
         for input in &tx.inputs {
@@ -118,6 +125,14 @@ impl UtxoSet {
                 .entries
                 .get(&outpoint)
                 .ok_or(ValidationError::MissingInput(outpoint))?;
+
+            let verifying_key = crypto::parse_verifying_key(&utxo.output.locking_data)
+                .ok_or(ValidationError::InvalidLockingData(outpoint))?;
+            let signature = crypto::parse_signature(&input.unlocking_data)
+                .ok_or(ValidationError::InvalidUnlockingData(outpoint))?;
+            if !crypto::verify_message(&signature, &verifying_key, &signing_digest) {
+                return Err(ValidationError::SignatureMismatch(outpoint));
+            }
 
             input_value = input_value
                 .checked_add(utxo.output.value)
@@ -152,11 +167,15 @@ fn sum_outputs(outputs: &[TxOut]) -> Result<Amount, ValidationError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{OutPoint, Transaction, TxIn, TxOut, Txid, Utxo};
+    use crate::{
+        crypto,
+        types::{OutPoint, Transaction, TxIn, TxOut, Txid, Utxo},
+    };
 
     use super::{UtxoSet, ValidationError};
 
     fn spendable_utxo(value: u64) -> Utxo {
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
         Utxo {
             outpoint: OutPoint {
                 txid: Txid::new([0x10; 32]),
@@ -164,7 +183,7 @@ mod tests {
             },
             output: TxOut {
                 value,
-                locking_data: vec![0x51],
+                locking_data: crypto::verifying_key_bytes(&signing_key.verifying_key()).to_vec(),
             },
             created_at_height: 1,
             is_coinbase: false,
@@ -172,15 +191,19 @@ mod tests {
     }
 
     fn spending_transaction(input: OutPoint, outputs: Vec<TxOut>) -> Transaction {
-        Transaction {
+        let mut tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
                 previous_output: input,
-                unlocking_data: vec![0xaa],
+                unlocking_data: Vec::new(),
             }],
             outputs,
             lock_time: 0,
-        }
+        };
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
+        let signature = crypto::sign_message(&signing_key, &tx.signing_digest());
+        tx.inputs[0].unlocking_data = signature.to_vec();
+        tx
     }
 
     #[test]
@@ -250,24 +273,31 @@ mod tests {
         let mut set = UtxoSet::new();
         set.insert(utxo.clone());
 
-        let tx = Transaction {
+        let mut tx = Transaction {
             version: 1,
             inputs: vec![
                 TxIn {
                     previous_output: utxo.outpoint,
-                    unlocking_data: vec![0xaa],
+                    unlocking_data: Vec::new(),
                 },
                 TxIn {
                     previous_output: utxo.outpoint,
-                    unlocking_data: vec![0xbb],
+                    unlocking_data: Vec::new(),
                 },
             ],
             outputs: vec![TxOut {
                 value: 10,
-                locking_data: vec![0x51],
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
             }],
             lock_time: 0,
         };
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
+        let signature = crypto::sign_message(&signing_key, &tx.signing_digest()).to_vec();
+        tx.inputs[0].unlocking_data = signature.clone();
+        tx.inputs[1].unlocking_data = signature;
 
         assert_eq!(
             set.validate_transaction(&tx),
@@ -333,7 +363,10 @@ mod tests {
             },
             output: TxOut {
                 value: u64::MAX,
-                locking_data: vec![0x51],
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([7; 32]).verifying_key(),
+                )
+                .to_vec(),
             },
             created_at_height: 1,
             is_coinbase: false,
@@ -345,7 +378,10 @@ mod tests {
             },
             output: TxOut {
                 value: 1,
-                locking_data: vec![0x52],
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([7; 32]).verifying_key(),
+                )
+                .to_vec(),
             },
             created_at_height: 1,
             is_coinbase: false,
@@ -359,19 +395,27 @@ mod tests {
             inputs: vec![
                 TxIn {
                     previous_output: left.outpoint,
-                    unlocking_data: vec![0xaa],
+                    unlocking_data: Vec::new(),
                 },
                 TxIn {
                     previous_output: right.outpoint,
-                    unlocking_data: vec![0xbb],
+                    unlocking_data: Vec::new(),
                 },
             ],
             outputs: vec![TxOut {
                 value: 1,
-                locking_data: vec![0x53],
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
             }],
             lock_time: 0,
         };
+        let mut tx = tx;
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
+        let signature = crypto::sign_message(&signing_key, &tx.signing_digest()).to_vec();
+        tx.inputs[0].unlocking_data = signature.clone();
+        tx.inputs[1].unlocking_data = signature;
 
         assert_eq!(
             set.validate_transaction(&tx),
@@ -387,7 +431,10 @@ mod tests {
             inputs: Vec::new(),
             outputs: vec![TxOut {
                 value: 50,
-                locking_data: vec![0x51],
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([7; 32]).verifying_key(),
+                )
+                .to_vec(),
             }],
             lock_time: 0,
         };
@@ -402,5 +449,62 @@ mod tests {
             .expect("coinbase output exists");
         assert!(created.is_coinbase);
         assert_eq!(created.created_at_height, 1);
+    }
+
+    #[test]
+    fn rejects_invalid_unlocking_data() {
+        let utxo = spendable_utxo(10);
+        let mut set = UtxoSet::new();
+        set.insert(utxo.clone());
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: utxo.outpoint,
+                unlocking_data: vec![0xaa],
+            }],
+            outputs: vec![TxOut {
+                value: 10,
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
+            }],
+            lock_time: 0,
+        };
+
+        assert_eq!(
+            set.validate_transaction(&tx),
+            Err(ValidationError::InvalidUnlockingData(utxo.outpoint))
+        );
+    }
+
+    #[test]
+    fn rejects_signature_mismatch() {
+        let utxo = spendable_utxo(10);
+        let mut set = UtxoSet::new();
+        set.insert(utxo.clone());
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: utxo.outpoint,
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 10,
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
+            }],
+            lock_time: 0,
+        };
+        let wrong_key = crypto::signing_key_from_bytes([8; 32]);
+        tx.inputs[0].unlocking_data =
+            crypto::sign_message(&wrong_key, &tx.signing_digest()).to_vec();
+
+        assert_eq!(
+            set.validate_transaction(&tx),
+            Err(ValidationError::SignatureMismatch(utxo.outpoint))
+        );
     }
 }

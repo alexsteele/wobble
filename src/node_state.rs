@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     chain::{ChainError, ChainIndex},
     consensus::{self, ConsensusError},
+    crypto,
     mempool::{Mempool, MempoolError},
     state::UtxoSet,
     types::{
@@ -18,6 +19,7 @@ use crate::{
         Txid,
     },
 };
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeStateError {
@@ -80,19 +82,20 @@ impl NodeState {
             .map_err(NodeStateError::Mempool)
     }
 
-    /// Builds a simple payment transaction by selecting active UTXOs with the
-    /// given `sender_lock_tag`, then submits it to the mempool.
+    /// Builds a signed payment transaction by selecting active UTXOs locked to
+    /// `sender_signing_key`, then submits it to the mempool.
     ///
     /// If the selected inputs exceed `amount`, a change output is created back
-    /// to the same sender tag.
+    /// to the sender's verifying key.
     pub fn submit_payment(
         &mut self,
-        sender_lock_tag: u32,
-        recipient_lock_tag: u32,
+        sender_signing_key: &SigningKey,
+        recipient_verifying_key: &VerifyingKey,
         amount: Amount,
         uniqueness: u32,
     ) -> Result<Txid, NodeStateError> {
-        let sender_locking_data = sender_lock_tag.to_le_bytes().to_vec();
+        let sender_verifying_key = sender_signing_key.verifying_key();
+        let sender_locking_data = crypto::verifying_key_bytes(&sender_verifying_key).to_vec();
         let mut selected = Vec::new();
         let mut total = 0_u64;
 
@@ -122,28 +125,32 @@ impl NodeState {
 
         let mut outputs = vec![TxOut {
             value: amount,
-            locking_data: recipient_lock_tag.to_le_bytes().to_vec(),
+            locking_data: crypto::verifying_key_bytes(recipient_verifying_key).to_vec(),
         }];
         let change = total - amount;
         if change > 0 {
             outputs.push(TxOut {
                 value: change,
-                locking_data: sender_lock_tag.to_le_bytes().to_vec(),
+                locking_data: sender_locking_data.clone(),
             });
         }
 
-        let tx = Transaction {
+        let mut tx = Transaction {
             version: 1,
             inputs: selected
                 .into_iter()
                 .map(|(previous_output, _)| TxIn {
                     previous_output,
-                    unlocking_data: uniqueness.to_le_bytes().to_vec(),
+                    unlocking_data: Vec::new(),
                 })
                 .collect(),
             outputs,
             lock_time: uniqueness,
         };
+        let signature = crypto::sign_message(sender_signing_key, &tx.signing_digest()).to_vec();
+        for input in &mut tx.inputs {
+            input.unlocking_data = signature.clone();
+        }
 
         self.submit_transaction(tx)
     }
@@ -153,6 +160,7 @@ impl NodeState {
     pub fn mine_block(
         &mut self,
         reward: u64,
+        miner_verifying_key: &VerifyingKey,
         uniqueness: u32,
         bits: u32,
         max_transactions: usize,
@@ -161,7 +169,14 @@ impl NodeState {
         let (pending, included_ids) = self
             .mempool
             .collect_valid(&self.active_utxos, max_transactions);
-        let block = mine_block_from_transactions(prev, reward, uniqueness, bits, pending);
+        let block = mine_block_from_transactions(
+            prev,
+            reward,
+            miner_verifying_key,
+            uniqueness,
+            bits,
+            pending,
+        );
         let block_hash = block.header.block_hash();
         self.accept_block(block)?;
         self.mempool.remove_many(&included_ids);
@@ -222,13 +237,17 @@ impl NodeState {
     }
 }
 
-fn coinbase_transaction(reward: u64, uniqueness: u32) -> Transaction {
+fn coinbase_transaction(
+    reward: u64,
+    miner_verifying_key: &VerifyingKey,
+    uniqueness: u32,
+) -> Transaction {
     Transaction {
         version: 1,
         inputs: Vec::new(),
         outputs: vec![TxOut {
             value: reward,
-            locking_data: uniqueness.to_le_bytes().to_vec(),
+            locking_data: crypto::verifying_key_bytes(miner_verifying_key).to_vec(),
         }],
         lock_time: uniqueness,
     }
@@ -237,12 +256,17 @@ fn coinbase_transaction(reward: u64, uniqueness: u32) -> Transaction {
 fn mine_block_from_transactions(
     prev_blockhash: BlockHash,
     reward: u64,
+    miner_verifying_key: &VerifyingKey,
     uniqueness: u32,
     bits: u32,
     mut transactions: Vec<Transaction>,
 ) -> Block {
     let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
-    full_transactions.push(coinbase_transaction(reward, uniqueness));
+    full_transactions.push(coinbase_transaction(
+        reward,
+        miner_verifying_key,
+        uniqueness,
+    ));
     full_transactions.append(&mut transactions);
 
     let mut block = Block {
@@ -268,35 +292,51 @@ fn mine_block_from_transactions(
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut};
+    use crate::{
+        crypto,
+        types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
+    };
+    use ed25519_dalek::{SigningKey, VerifyingKey};
 
     use super::{NodeState, NodeStateError};
 
-    fn coinbase(value: u64, uniqueness: u32) -> Transaction {
+    fn signing_key(seed: u8) -> SigningKey {
+        crypto::signing_key_from_bytes([seed; 32])
+    }
+
+    fn coinbase(value: u64, owner: &VerifyingKey, uniqueness: u32) -> Transaction {
         Transaction {
             version: 1,
             inputs: Vec::new(),
             outputs: vec![TxOut {
                 value,
-                locking_data: uniqueness.to_le_bytes().to_vec(),
+                locking_data: crypto::verifying_key_bytes(owner).to_vec(),
             }],
             lock_time: uniqueness,
         }
     }
 
-    fn spend(previous_output: OutPoint, value: u64, uniqueness: u32) -> Transaction {
-        Transaction {
+    fn spend(
+        previous_output: OutPoint,
+        signer: &SigningKey,
+        recipient: &VerifyingKey,
+        value: u64,
+        uniqueness: u32,
+    ) -> Transaction {
+        let mut tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
                 previous_output,
-                unlocking_data: vec![uniqueness as u8],
+                unlocking_data: Vec::new(),
             }],
             outputs: vec![TxOut {
                 value,
-                locking_data: vec![0x52],
+                locking_data: crypto::verifying_key_bytes(recipient).to_vec(),
             }],
             lock_time: uniqueness,
-        }
+        };
+        tx.inputs[0].unlocking_data = crypto::sign_message(signer, &tx.signing_digest()).to_vec();
+        tx
     }
 
     fn mine_block(prev_blockhash: BlockHash, bits: u32, transactions: Vec<Transaction>) -> Block {
@@ -323,7 +363,12 @@ mod tests {
 
     #[test]
     fn accepts_genesis_and_populates_utxos() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let miner = signing_key(1);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &miner.verifying_key(), 0)],
+        );
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
 
@@ -343,7 +388,14 @@ mod tests {
 
     #[test]
     fn accepts_direct_extension_of_best_tip() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let miner = signing_key(3);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &sender.verifying_key(), 0)],
+        );
         let spendable = OutPoint {
             txid: genesis.transactions[0].txid(),
             vout: 0,
@@ -351,7 +403,10 @@ mod tests {
         let child = mine_block(
             genesis.header.block_hash(),
             0x207f_ffff,
-            vec![coinbase(50, 1), spend(spendable, 30, 2)],
+            vec![
+                coinbase(50, &miner.verifying_key(), 1),
+                spend(spendable, &sender, &recipient.verifying_key(), 30, 2),
+            ],
         );
         let mut state = NodeState::new();
 
@@ -372,10 +427,24 @@ mod tests {
 
     #[test]
     fn indexes_side_branch_without_mutating_active_utxos() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let owner = signing_key(1);
+        let alt = signing_key(2);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &owner.verifying_key(), 0)],
+        );
         let genesis_hash = genesis.header.block_hash();
-        let active_child = mine_block(genesis_hash, 0x207f_ffff, vec![coinbase(50, 1)]);
-        let side_child = mine_block(genesis_hash, 0x207f_ffff, vec![coinbase(50, 2)]);
+        let active_child = mine_block(
+            genesis_hash,
+            0x207f_ffff,
+            vec![coinbase(50, &owner.verifying_key(), 1)],
+        );
+        let side_child = mine_block(
+            genesis_hash,
+            0x207f_ffff,
+            vec![coinbase(50, &alt.verifying_key(), 2)],
+        );
         let active_tip_hash = active_child.header.block_hash();
         let side_tip_hash = side_child.header.block_hash();
         let mut state = NodeState::new();
@@ -393,10 +462,24 @@ mod tests {
 
     #[test]
     fn reorgs_active_utxos_when_better_branch_arrives() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let owner = signing_key(1);
+        let alt = signing_key(2);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &owner.verifying_key(), 0)],
+        );
         let genesis_hash = genesis.header.block_hash();
-        let easy_child = mine_block(genesis_hash, 0x207f_ffff, vec![coinbase(50, 1)]);
-        let harder_child = mine_block(genesis_hash, 0x1f00ffff, vec![coinbase(50, 2)]);
+        let easy_child = mine_block(
+            genesis_hash,
+            0x207f_ffff,
+            vec![coinbase(50, &owner.verifying_key(), 1)],
+        );
+        let harder_child = mine_block(
+            genesis_hash,
+            0x1f00ffff,
+            vec![coinbase(50, &alt.verifying_key(), 2)],
+        );
         let harder_hash = harder_child.header.block_hash();
         let mut state = NodeState::new();
 
@@ -418,7 +501,14 @@ mod tests {
 
     #[test]
     fn mines_pending_transactions_from_mempool() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let miner = signing_key(3);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &sender.verifying_key(), 0)],
+        );
         let spendable = OutPoint {
             txid: genesis.transactions[0].txid(),
             vout: 0,
@@ -426,8 +516,12 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
 
-        state.submit_transaction(spend(spendable, 30, 2)).unwrap();
-        let block_hash = state.mine_block(50, 3, 0x207f_ffff, 100).unwrap();
+        state
+            .submit_transaction(spend(spendable, &sender, &recipient.verifying_key(), 30, 2))
+            .unwrap();
+        let block_hash = state
+            .mine_block(50, &miner.verifying_key(), 3, 0x207f_ffff, 100)
+            .unwrap();
         let block = state
             .get_block(&block_hash)
             .expect("mined block is indexed");
@@ -439,11 +533,19 @@ mod tests {
 
     #[test]
     fn submits_payment_with_change_output() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &sender.verifying_key(), 0)],
+        );
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
 
-        let txid = state.submit_payment(0, 99, 30, 7).unwrap();
+        let txid = state
+            .submit_payment(&sender, &recipient.verifying_key(), 30, 7)
+            .unwrap();
         let tx = state
             .mempool()
             .get(&txid)
@@ -457,12 +559,18 @@ mod tests {
 
     #[test]
     fn rejects_payment_when_sender_funds_are_insufficient() {
-        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, vec![coinbase(50, 0)]);
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(50, &sender.verifying_key(), 0)],
+        );
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
 
         assert_eq!(
-            state.submit_payment(123, 99, 30, 7),
+            state.submit_payment(&recipient, &sender.verifying_key(), 30, 7),
             Err(NodeStateError::InsufficientFunds {
                 requested: 30,
                 available: 0,

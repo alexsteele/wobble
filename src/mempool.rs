@@ -92,11 +92,13 @@ impl Mempool {
 
 #[cfg(test)]
 mod tests {
+    use crate::crypto;
     use crate::types::{OutPoint, Transaction, TxIn, TxOut, Txid, Utxo};
 
     use super::{Mempool, MempoolError};
 
     fn spendable_utxo(value: u64) -> Utxo {
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
         Utxo {
             outpoint: OutPoint {
                 txid: Txid::new([0x10; 32]),
@@ -104,7 +106,7 @@ mod tests {
             },
             output: TxOut {
                 value,
-                locking_data: vec![0x51],
+                locking_data: crypto::verifying_key_bytes(&signing_key.verifying_key()).to_vec(),
             },
             created_at_height: 1,
             is_coinbase: false,
@@ -112,18 +114,25 @@ mod tests {
     }
 
     fn tx(previous_output: OutPoint, value: u64, uniqueness: u32) -> Transaction {
-        Transaction {
+        let mut tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
                 previous_output,
-                unlocking_data: uniqueness.to_le_bytes().to_vec(),
+                unlocking_data: Vec::new(),
             }],
             outputs: vec![TxOut {
                 value,
-                locking_data: vec![0x52],
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
             }],
             lock_time: uniqueness,
-        }
+        };
+        let signing_key = crypto::signing_key_from_bytes([7; 32]);
+        tx.inputs[0].unlocking_data =
+            crypto::sign_message(&signing_key, &tx.signing_digest()).to_vec();
+        tx
     }
 
     #[test]

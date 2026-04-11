@@ -158,13 +158,25 @@ pub struct Utxo {
 
 impl Transaction {
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_with_unlocking_data(true)
+    }
+
+    pub fn signing_digest(&self) -> [u8; 32] {
+        crypto::double_sha256(&self.encode_with_unlocking_data(false))
+    }
+
+    fn encode_with_unlocking_data(&self, include_unlocking_data: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.version.to_le_bytes());
         encode_len(self.inputs.len(), &mut bytes);
         for input in &self.inputs {
             bytes.extend_from_slice(&input.previous_output.txid.0);
             bytes.extend_from_slice(&input.previous_output.vout.to_le_bytes());
-            encode_bytes(&input.unlocking_data, &mut bytes);
+            if include_unlocking_data {
+                encode_bytes(&input.unlocking_data, &mut bytes);
+            } else {
+                encode_bytes(&[], &mut bytes);
+            }
         }
         encode_len(self.outputs.len(), &mut bytes);
         for output in &self.outputs {

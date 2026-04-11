@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 bincode = { version = "2", features = ["serde"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

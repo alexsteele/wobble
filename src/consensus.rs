@@ -171,6 +171,7 @@ fn validate_header_pow(block: &Block) -> Result<(), ConsensusError> {
 #[cfg(test)]
 mod tests {
     use crate::{
+        crypto,
         state::UtxoSet,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut, Txid},
     };
@@ -180,30 +181,35 @@ mod tests {
     // `uniqueness` perturbs the coinbase so separate test blocks do not reuse
     // the same transaction id for otherwise identical rewards.
     fn coinbase(value: u64, uniqueness: u32) -> Transaction {
+        let miner = crypto::signing_key_from_bytes([uniqueness as u8 + 1; 32]);
         Transaction {
             version: 1,
             inputs: Vec::new(),
             outputs: vec![TxOut {
                 value,
-                locking_data: uniqueness.to_le_bytes().to_vec(),
+                locking_data: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
             }],
             lock_time: uniqueness,
         }
     }
 
     fn spend(previous_output: OutPoint, value: u64) -> Transaction {
-        Transaction {
+        let owner = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([9; 32]);
+        let mut tx = Transaction {
             version: 1,
             inputs: vec![TxIn {
                 previous_output,
-                unlocking_data: vec![0xaa],
+                unlocking_data: Vec::new(),
             }],
             outputs: vec![TxOut {
                 value,
-                locking_data: vec![0x52],
+                locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
             }],
             lock_time: 0,
-        }
+        };
+        tx.inputs[0].unlocking_data = crypto::sign_message(&owner, &tx.signing_digest()).to_vec();
+        tx
     }
 
     fn mine_block(transactions: Vec<Transaction>) -> Block {

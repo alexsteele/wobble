@@ -44,19 +44,21 @@ The current CLI is intentionally small:
 wobble init <snapshot>
 wobble info <snapshot>
 wobble utxos <snapshot>
-wobble submit-payment <snapshot> <sender_lock_tag> <recipient_lock_tag> <amount> <uniqueness>
-wobble submit-transfer <snapshot> <txid> <vout> <amount> <uniqueness> <lock_tag>
-wobble mine-coinbase <snapshot> <reward> <uniqueness> [bits]
-wobble mine-pending <snapshot> <reward> <uniqueness> <max_transactions> [bits]
+wobble generate-key
+wobble submit-payment <snapshot> <sender_secret_key> <recipient_public_key> <amount> <uniqueness>
+wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_secret_key> <recipient_public_key>
+wobble mine-coinbase <snapshot> <reward> <miner_public_key> [uniqueness] [bits]
+wobble mine-pending <snapshot> <reward> <miner_public_key> <uniqueness> <max_transactions> [bits]
 ```
 
 Example:
 
 ```text
 wobble init /tmp/wobble.bin
-wobble mine-coinbase /tmp/wobble.bin 50 0
+wobble generate-key
+wobble mine-coinbase /tmp/wobble.bin 50 <miner_public_key> 0
 wobble utxos /tmp/wobble.bin
-wobble submit-payment /tmp/wobble.bin 0 99 30 1
-wobble mine-pending /tmp/wobble.bin 50 2 100
+wobble submit-payment /tmp/wobble.bin <sender_secret_key> <recipient_public_key> 30 1
+wobble mine-pending /tmp/wobble.bin 50 <miner_public_key> 2 100
 wobble info /tmp/wobble.bin
 ```
