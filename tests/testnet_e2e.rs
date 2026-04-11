@@ -9,7 +9,7 @@ use wobble::{
     crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
-    server::Server,
+    server::{PeerEndpoint, Server},
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
     wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
 };
@@ -101,6 +101,7 @@ fn connect_and_handshake(addr: &str, node_name: &str) -> std::net::TcpStream {
             network: "wobble-local".to_string(),
             version: PROTOCOL_VERSION,
             node_name: Some(node_name.to_string()),
+            advertised_addr: None,
             tip: None,
             height: None,
         }),
@@ -141,21 +142,29 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     let miner_addr = miner_listener.local_addr().unwrap().to_string();
 
     let proposer = Server::new(
-        PeerConfig::new("wobble-local", Some("proposer".to_string())),
+        PeerConfig::new("wobble-local", Some("proposer".to_string()))
+            .with_advertised_addr(proposer_addr.clone()),
         proposer_state,
     )
-    .with_peers(vec![miner_addr.clone()]);
+    .with_peers(vec![PeerEndpoint::new(
+        miner_addr.clone(),
+        Some("miner".to_string()),
+    )]);
     let miner_server = Server::new(
-        PeerConfig::new("wobble-local", Some("miner".to_string())),
+        PeerConfig::new("wobble-local", Some("miner".to_string()))
+            .with_advertised_addr(miner_addr.clone()),
         miner_state,
     )
-    .with_peers(vec![proposer_addr.clone()]);
+    .with_peers(vec![PeerEndpoint::new(
+        proposer_addr.clone(),
+        Some("proposer".to_string()),
+    )]);
 
-    // With bidirectional best-effort relay enabled, this scenario produces:
-    // - proposer inbound: submitter, relayed tx duplicate, relayed mined block
-    // - miner inbound: relayed tx, mining request, relayed block duplicate
-    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 3));
-    let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 3));
+    // Origin suppression avoids relaying accepted objects back to the named
+    // peer that just sent them, so this path needs only one tx relay and one
+    // block relay in addition to the direct client connections.
+    let proposer_worker = thread::spawn(move || serve_n(proposer, proposer_listener, 2));
+    let miner_worker = thread::spawn(move || serve_n(miner_server, miner_listener, 2));
 
     let mut proposer_client = connect_and_handshake(&proposer_addr, "submitter");
     net::send_message(

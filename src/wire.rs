@@ -24,6 +24,8 @@ pub struct HelloMessage {
     pub network: String,
     pub version: u32,
     pub node_name: Option<String>,
+    /// Listener address this peer wants others to use for future relay.
+    pub advertised_addr: Option<String>,
     pub tip: Option<BlockHash>,
     pub height: Option<u64>,
 }
@@ -108,6 +110,7 @@ mod tests {
             network: "wobble-local".to_string(),
             version: 1,
             node_name: Some("alpha".to_string()),
+            advertised_addr: Some("127.0.0.1:9000".to_string()),
             tip: Some(BlockHash::new([0x33; 32])),
             height: Some(12),
         });
@@ -117,6 +120,7 @@ mod tests {
         assert!(json.contains("\"type\":\"hello\""));
         assert!(json.contains("\"network\":\"wobble-local\""));
         assert!(json.contains("\"node_name\":\"alpha\""));
+        assert!(json.contains("\"advertised_addr\":\"127.0.0.1:9000\""));
     }
 
     #[test]

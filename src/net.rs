@@ -84,6 +84,7 @@ mod tests {
             network: "wobble-local".to_string(),
             version: 1,
             node_name: Some("alpha".to_string()),
+            advertised_addr: Some("127.0.0.1:9000".to_string()),
             tip: Some(BlockHash::new([0x11; 32])),
             height: Some(3),
         });
@@ -98,6 +99,7 @@ mod tests {
                 network: "wobble-local".to_string(),
                 version: 1,
                 node_name: Some("alpha".to_string()),
+                advertised_addr: Some("127.0.0.1:9000".to_string()),
                 tip: Some(BlockHash::new([0x11; 32])),
                 height: Some(3),
             })

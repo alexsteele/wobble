@@ -16,6 +16,7 @@ use crate::{
 pub struct PeerConfig {
     pub network: String,
     pub node_name: Option<String>,
+    pub advertised_addr: Option<String>,
 }
 
 /// Reasons a remote peer message was rejected at the protocol layer.
@@ -34,7 +35,14 @@ impl PeerConfig {
         Self {
             network: network.into(),
             node_name,
+            advertised_addr: None,
         }
+    }
+
+    /// Records the listener address this node should advertise during handshake.
+    pub fn with_advertised_addr(mut self, advertised_addr: impl Into<String>) -> Self {
+        self.advertised_addr = Some(advertised_addr.into());
+        self
     }
 }
 
@@ -45,6 +53,7 @@ pub fn local_hello(config: &PeerConfig, state: &NodeState) -> HelloMessage {
         network: config.network.clone(),
         version: PROTOCOL_VERSION,
         node_name: config.node_name.clone(),
+        advertised_addr: config.advertised_addr.clone(),
         tip: tip.tip,
         height: tip.height,
     }
@@ -199,13 +208,15 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = PeerConfig::new("wobble-local", Some("alpha".to_string()));
+        let config = PeerConfig::new("wobble-local", Some("alpha".to_string()))
+            .with_advertised_addr("127.0.0.1:9000");
 
         let hello = local_hello(&config, &state);
 
         assert_eq!(hello.network, "wobble-local");
         assert_eq!(hello.version, PROTOCOL_VERSION);
         assert_eq!(hello.node_name, Some("alpha".to_string()));
+        assert_eq!(hello.advertised_addr, Some("127.0.0.1:9000".to_string()));
         assert_eq!(hello.tip, Some(genesis_hash));
         assert_eq!(hello.height, Some(0));
     }
@@ -268,6 +279,7 @@ mod tests {
                 network: "other-net".to_string(),
                 version: PROTOCOL_VERSION,
                 node_name: None,
+                advertised_addr: None,
                 tip: None,
                 height: None,
             }),
@@ -295,6 +307,7 @@ mod tests {
                 network: "wobble-local".to_string(),
                 version: PROTOCOL_VERSION + 1,
                 node_name: None,
+                advertised_addr: None,
                 tip: None,
                 height: None,
             }),

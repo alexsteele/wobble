@@ -60,8 +60,9 @@ For now, a node is identified only by:
 - a listen address
 - an optional human-readable node name for logs
 
-There is no persistent peer identity yet. Connections are trusted only as much
-as the local test environment is trusted.
+The `hello` message may also carry an advertised listener address so relay
+logic can avoid bouncing an accepted object straight back to the announcing
+peer. There is still no persistent cryptographic peer identity.
 
 ## Handshake
 
@@ -71,6 +72,7 @@ When a TCP connection is established, each side should send `hello`.
 - `network`: string identifying the local network, for example `wobble-local`
 - `version`: protocol version number
 - `node_name`: optional display name
+- `advertised_addr`: optional listener address this node wants peers to use
 - `tip`: current best tip block hash, if known
 - `height`: current best tip height, if known
 
@@ -93,6 +95,7 @@ Fields:
 - `network: String`
 - `version: u32`
 - `node_name: Option<String>`
+- `advertised_addr: Option<String>`
 - `tip: Option<BlockHash>`
 - `height: Option<u64>`
 
@@ -214,6 +217,8 @@ Transaction relay:
 - do not relay a transaction already known locally
 - do not relay a transaction rejected by mempool policy
 - relay newly accepted transactions to connected peers except the sender
+- prefer matching the sender by advertised listener address from `hello`
+- fall back to `node_name` only when no advertised address is available
 
 Block relay:
 - do not relay a block already indexed locally

@@ -203,8 +203,9 @@ fn run() -> Result<(), String> {
             let state = SqliteStore::open(sqlite_path)
                 .and_then(|store| store.load_node_state())
                 .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
-            let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
-                .with_sqlite_path(sqlite_path);
+            let config =
+                PeerConfig::new(network.clone(), node_name).with_advertised_addr(listen_addr);
+            let mut server = Server::new(config, state).with_sqlite_path(sqlite_path);
 
             println!("serving sqlite {}", sqlite_path.display());
             println!("bootstrap source: sqlite");
@@ -237,6 +238,7 @@ fn run() -> Result<(), String> {
                 network,
                 version: PROTOCOL_VERSION,
                 node_name,
+                advertised_addr: None,
                 tip: None,
                 height: None,
             });
@@ -317,6 +319,7 @@ fn run() -> Result<(), String> {
                 network,
                 version: PROTOCOL_VERSION,
                 node_name,
+                advertised_addr: None,
                 tip: None,
                 height: None,
             });
@@ -356,6 +359,7 @@ fn run() -> Result<(), String> {
                 network,
                 version: PROTOCOL_VERSION,
                 node_name,
+                advertised_addr: None,
                 tip: None,
                 height: None,
             });

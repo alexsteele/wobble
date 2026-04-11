@@ -35,9 +35,8 @@ Implemented in the first slice:
 
 Current limitation:
 - relay is still short-lived request/response TCP rather than persistent peer sessions
-- the deterministic test harness must budget for duplicate gossip because nodes
-  currently relay newly accepted objects back to configured peers without
-  origin tracking or inventory suppression
+- origin suppression now prefers the advertised listener address from `hello`
+  and falls back to `node_name` only when that address is unavailable
 
 ## Implementation Plan
 

@@ -20,15 +20,42 @@ use crate::{
     peer::{self, PeerConfig, PeerError},
     sqlite_store::{self, SqliteStoreError},
     types::BlockHash,
-    wire::WireMessage,
+    wire::{HelloMessage, WireMessage},
 };
+
+/// Outbound relay destination configured for this server.
+///
+/// `node_name` is optional because some callers may know only the socket
+/// address. When present, it lets the server avoid relaying an accepted object
+/// straight back to the peer that just announced it on the current stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerEndpoint {
+    pub addr: String,
+    pub node_name: Option<String>,
+}
+
+impl PeerEndpoint {
+    pub fn new(addr: impl Into<String>, node_name: Option<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            node_name,
+        }
+    }
+}
+
+/// Origin identity learned from the remote `hello` on a live stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RelayOrigin {
+    advertised_addr: Option<String>,
+    node_name: Option<String>,
+}
 
 /// Owns local protocol configuration and mutable node state for networking.
 #[derive(Debug, Clone)]
 pub struct Server {
     config: PeerConfig,
     state: NodeState,
-    peers: Vec<String>,
+    peers: Vec<PeerEndpoint>,
     sqlite_path: Option<PathBuf>,
 }
 
@@ -56,7 +83,7 @@ impl Server {
     }
 
     /// Configures the peer addresses that should receive relayed transactions and blocks.
-    pub fn with_peers(mut self, peers: Vec<String>) -> Self {
+    pub fn with_peers(mut self, peers: Vec<PeerEndpoint>) -> Self {
         self.peers = peers;
         self
     }
@@ -90,6 +117,16 @@ impl Server {
         &mut self,
         message: WireMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
+        self.handle_message_from_peer(message, None)
+    }
+
+    /// Handles one decoded wire message and optionally suppresses relay back to
+    /// the named peer that sent it on the current stream.
+    fn handle_message_from_peer(
+        &mut self,
+        message: WireMessage,
+        origin: Option<&RelayOrigin>,
+    ) -> Result<Vec<WireMessage>, ServerError> {
         let should_persist = message_mutates_state(&message);
         let relay = self.relay_message_before_handle(&message);
         let sqlite_block_hash = persisted_block_hash(&message);
@@ -100,7 +137,7 @@ impl Server {
                 .map_err(ServerError::SqlitePersist)?;
         }
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
-            self.relay_best_effort(&relay);
+            self.relay_best_effort(&relay, origin);
         }
         Ok(replies)
     }
@@ -114,6 +151,7 @@ impl Server {
     pub fn handle_stream(&mut self, mut stream: TcpStream) -> io::Result<()> {
         let reader_stream = stream.try_clone()?;
         let mut reader = io::BufReader::new(reader_stream);
+        let mut origin = RelayOrigin::default();
 
         loop {
             let message = match net::receive_message_from_reader(&mut reader) {
@@ -122,8 +160,19 @@ impl Server {
                 Err(err) => return Err(err),
             };
 
+            if let WireMessage::Hello(HelloMessage {
+                node_name,
+                advertised_addr,
+                ..
+            }) = &message
+            {
+                origin = RelayOrigin {
+                    advertised_addr: advertised_addr.clone(),
+                    node_name: node_name.clone(),
+                };
+            }
             let replies = self
-                .handle_message(message)
+                .handle_message_from_peer(message, Some(&origin))
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
             for reply in replies {
                 net::send_message(&mut stream, &reply)?;
@@ -174,9 +223,14 @@ impl Server {
         store.save_block_record(block, entry, self.state.chain().best_tip())
     }
 
-    fn relay_best_effort(&self, message: &WireMessage) {
-        for peer_addr in &self.peers {
-            let _ = relay_to_peer(peer_addr, &self.config, message);
+    /// Announces an accepted object to configured peers except the one that
+    /// originated it on the current stream, when that peer identity is known.
+    fn relay_best_effort(&self, message: &WireMessage, origin: Option<&RelayOrigin>) {
+        for peer in &self.peers {
+            if peer_matches_origin(peer, origin) {
+                continue;
+            }
+            let _ = relay_to_peer(&peer.addr, &self.config, message);
         }
     }
 
@@ -220,6 +274,16 @@ impl Server {
             _ => None,
         })
     }
+}
+
+fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&RelayOrigin>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    if let Some(origin_addr) = origin.advertised_addr.as_deref() {
+        return peer.addr == origin_addr;
+    }
+    peer.node_name.as_deref() == origin.node_name.as_deref()
 }
 
 fn message_mutates_state(message: &WireMessage) -> bool {
@@ -280,6 +344,7 @@ fn relay_to_peer_once(
             network: config.network.clone(),
             version: crate::wire::PROTOCOL_VERSION,
             node_name: config.node_name.clone(),
+            advertised_addr: config.advertised_addr.clone(),
             tip: None,
             height: None,
         }),
@@ -304,11 +369,13 @@ mod tests {
         crypto, net,
         node_state::NodeState,
         peer::PeerConfig,
-        server::Server,
+        server::{PeerEndpoint, Server},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
+
+    use super::{RelayOrigin, peer_matches_origin};
 
     fn connected_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -428,6 +495,7 @@ mod tests {
                 network: "wobble-local".to_string(),
                 version: PROTOCOL_VERSION,
                 node_name: Some("alpha".to_string()),
+                advertised_addr: None,
                 tip: None,
                 height: None,
             })
@@ -497,6 +565,7 @@ mod tests {
                 network: "wobble-local".to_string(),
                 version: PROTOCOL_VERSION,
                 node_name: Some("client".to_string()),
+                advertised_addr: None,
                 tip: None,
                 height: None,
             }),
@@ -605,6 +674,38 @@ mod tests {
         let relay = server.relay_message_before_handle(&WireMessage::AnnounceTx { transaction });
 
         assert_eq!(relay, None);
+    }
+
+    #[test]
+    fn relay_best_effort_skips_origin_peer_by_node_name() {
+        let server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        )
+        .with_peers(vec![
+            PeerEndpoint::new("127.0.0.1:1", Some("beta".to_string())),
+            PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string())),
+        ]);
+
+        let selected: Vec<_> = server
+            .peers
+            .iter()
+            .filter(|peer| peer.node_name.as_deref() != Some("beta"))
+            .map(|peer| peer.addr.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["127.0.0.1:2"]);
+    }
+
+    #[test]
+    fn peer_match_prefers_advertised_addr_over_node_name() {
+        let peer = PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string()));
+        let origin = RelayOrigin {
+            advertised_addr: Some("127.0.0.1:2".to_string()),
+            node_name: Some("beta".to_string()),
+        };
+
+        assert!(peer_matches_origin(&peer, Some(&origin)));
     }
 
     #[test]
