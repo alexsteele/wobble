@@ -17,6 +17,7 @@ use crate::{
     node_state::NodeState,
     peer::{self, PeerConfig, PeerError},
     sqlite_store::{self, SqliteStoreError},
+    types::BlockHash,
     wire::WireMessage,
 };
 
@@ -25,6 +26,7 @@ use crate::{
 pub struct Server {
     config: PeerConfig,
     state: NodeState,
+    peers: Vec<String>,
     sqlite_path: Option<PathBuf>,
 }
 
@@ -40,8 +42,15 @@ impl Server {
         Self {
             config,
             state,
+            peers: Vec::new(),
             sqlite_path: None,
         }
+    }
+
+    /// Configures the peer addresses that should receive relayed transactions and blocks.
+    pub fn with_peers(mut self, peers: Vec<String>) -> Self {
+        self.peers = peers;
+        self
     }
 
     /// Configures the server to persist accepted blocks and chain metadata to SQLite.
@@ -74,12 +83,16 @@ impl Server {
         message: WireMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
         let should_persist = message_mutates_state(&message);
+        let relay = self.relay_message_before_handle(&message);
         let sqlite_block_hash = persisted_block_hash(&message);
         let replies = peer::handle_message(&self.config, &mut self.state, message)
             .map_err(ServerError::Peer)?;
         if should_persist {
             self.persist_sqlite(sqlite_block_hash, &replies)
                 .map_err(ServerError::SqlitePersist)?;
+        }
+        if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
+            self.relay_best_effort(&relay);
         }
         Ok(replies)
     }
@@ -129,7 +142,7 @@ impl Server {
 
     fn persist_sqlite(
         &self,
-        request_block_hash: Option<crate::types::BlockHash>,
+        request_block_hash: Option<BlockHash>,
         replies: &[WireMessage],
     ) -> Result<(), SqliteStoreError> {
         let Some(path) = self.sqlite_path.as_deref() else {
@@ -152,6 +165,53 @@ impl Server {
         };
         store.save_block_record(block, entry, self.state.chain().best_tip())
     }
+
+    fn relay_best_effort(&self, message: &WireMessage) {
+        for peer_addr in &self.peers {
+            let _ = relay_to_peer(peer_addr, &self.config, message);
+        }
+    }
+
+    /// Decides whether an inbound message should be relayed if local handling succeeds.
+    ///
+    /// Relay happens only when this server does not already know the announced
+    /// object. That keeps duplicate gossip idempotent and avoids forwarding an
+    /// object we already had before this peer sent it.
+    fn relay_message_before_handle(&self, message: &WireMessage) -> Option<WireMessage> {
+        match message {
+            WireMessage::AnnounceTx { transaction } => {
+                if self.state.mempool().get(&transaction.txid()).is_some() {
+                    None
+                } else {
+                    Some(message.clone())
+                }
+            }
+            WireMessage::AnnounceBlock { block } => {
+                if self.state.get_block(&block.header.block_hash()).is_some() {
+                    None
+                } else {
+                    Some(message.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Builds any relay message implied by successful local side effects.
+    ///
+    /// `mine_pending` returns only the mined block hash on the wire, so the
+    /// server resolves that hash back into the concrete block from local state
+    /// before announcing it to peers.
+    fn relay_message_from_replies(&self, replies: &[WireMessage]) -> Option<WireMessage> {
+        replies.iter().find_map(|reply| match reply {
+            WireMessage::MinedBlock(result) => self
+                .state
+                .get_block(&result.block_hash)
+                .cloned()
+                .map(|block| WireMessage::AnnounceBlock { block }),
+            _ => None,
+        })
+    }
 }
 
 fn message_mutates_state(message: &WireMessage) -> bool {
@@ -163,18 +223,35 @@ fn message_mutates_state(message: &WireMessage) -> bool {
     )
 }
 
-fn persisted_block_hash(message: &WireMessage) -> Option<crate::types::BlockHash> {
+fn persisted_block_hash(message: &WireMessage) -> Option<BlockHash> {
     match message {
         WireMessage::AnnounceBlock { block } => Some(block.header.block_hash()),
         _ => None,
     }
 }
 
-fn mined_block_hash(replies: &[WireMessage]) -> Option<crate::types::BlockHash> {
+fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
     replies.iter().find_map(|reply| match reply {
         WireMessage::MinedBlock(result) => Some(result.block_hash),
         _ => None,
     })
+}
+
+fn relay_to_peer(peer_addr: &str, config: &PeerConfig, message: &WireMessage) -> io::Result<()> {
+    let mut stream = net::connect(peer_addr)?;
+    net::send_message(
+        &mut stream,
+        &WireMessage::Hello(crate::wire::HelloMessage {
+            network: config.network.clone(),
+            version: crate::wire::PROTOCOL_VERSION,
+            node_name: config.node_name.clone(),
+            tip: None,
+            height: None,
+        }),
+    )?;
+    let _ = net::receive_message(&mut stream)?;
+    net::send_message(&mut stream, message)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -468,5 +545,74 @@ mod tests {
         );
         assert_eq!(loaded_best_tip, server.state().chain().best_tip());
         assert_eq!(loaded_utxos.len(), server.state().active_utxos().len());
+    }
+
+    #[test]
+    fn relay_policy_skips_known_transaction_announcements() {
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        state.submit_transaction(transaction.clone()).unwrap();
+        let server = Server::new(PeerConfig::new("wobble-local", None), state);
+
+        let relay = server.relay_message_before_handle(&WireMessage::AnnounceTx { transaction });
+
+        assert_eq!(relay, None);
+    }
+
+    #[test]
+    fn mined_block_reply_relays_the_concrete_block_from_state() {
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let miner = crypto::signing_key_from_bytes([3; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        state.submit_transaction(transaction.clone()).unwrap();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), state);
+
+        let replies = server
+            .handle_message(WireMessage::MinePending(crate::wire::MinePendingRequest {
+                reward: 50,
+                miner_public_key: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
+                uniqueness: 2,
+                bits: 0x207f_ffff,
+                max_transactions: 10,
+            }))
+            .unwrap();
+        let relay = server.relay_message_from_replies(&replies);
+
+        let Some(WireMessage::AnnounceBlock { block }) = relay else {
+            panic!("expected mined block relay");
+        };
+        let [WireMessage::MinedBlock(crate::wire::MinedBlock { block_hash })] = replies.as_slice()
+        else {
+            panic!("expected mined block reply");
+        };
+        assert_eq!(block.header.block_hash(), *block_hash);
+        assert_eq!(block.transactions.len(), 2);
+        assert_eq!(block.transactions[1], transaction);
     }
 }

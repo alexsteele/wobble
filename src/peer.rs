@@ -6,6 +6,7 @@
 //! and block fetches before adding background relay loops or peer management.
 
 use crate::{
+    mempool::MempoolError,
     node_state::{NodeState, NodeStateError},
     wire::{HelloMessage, MinedBlock, PROTOCOL_VERSION, WireMessage},
 };
@@ -86,9 +87,11 @@ pub fn handle_message(
             block: state.get_block(&block_hash).cloned(),
         }]),
         WireMessage::AnnounceTx { transaction } => {
-            state
-                .submit_transaction(transaction)
-                .map_err(PeerError::TransactionRejected)?;
+            match state.submit_transaction(transaction) {
+                Ok(_) => {}
+                Err(NodeStateError::Mempool(MempoolError::DuplicateTransaction(_))) => {}
+                Err(err) => return Err(PeerError::TransactionRejected(err)),
+            }
             Ok(Vec::new())
         }
         WireMessage::AnnounceBlock { block } => {
