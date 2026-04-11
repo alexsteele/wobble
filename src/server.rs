@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::{
+    admin::{AdminRequest, AdminResponse, BalanceSummary, StatusSummary},
     client::{self, ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
     net,
@@ -312,6 +313,25 @@ impl Server {
         }
     }
 
+    /// Serves one localhost admin stream until the client closes the connection.
+    ///
+    /// Admin requests are intentionally separate from the public peer protocol
+    /// so local management operations are not exposed to arbitrary peers.
+    pub fn handle_admin_stream(&mut self, mut stream: TcpStream) -> io::Result<()> {
+        let reader_stream = stream.try_clone()?;
+        let mut reader = io::BufReader::new(reader_stream);
+
+        loop {
+            let request = match receive_admin_request_from_reader(&mut reader) {
+                Ok(request) => request,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            };
+            let response = self.handle_admin_request(request);
+            send_admin_response(&mut stream, &response)?;
+        }
+    }
+
     /// Binds a listener and serves inbound peers sequentially.
     ///
     /// This is enough for local manual testing. Later versions can move to
@@ -321,34 +341,94 @@ impl Server {
         self.serve_listener(listener)
     }
 
+    /// Binds peer and localhost admin listeners and serves both.
+    pub fn serve_with_admin<A: ToSocketAddrs, B: ToSocketAddrs>(
+        &mut self,
+        peer_addr: A,
+        admin_addr: B,
+    ) -> io::Result<()> {
+        let peer_listener = TcpListener::bind(peer_addr)?;
+        let admin_listener = TcpListener::bind(admin_addr)?;
+        self.serve_listeners(peer_listener, Some(admin_listener))
+    }
+
     /// Accepts inbound peer connections from an existing listener.
     pub fn serve_listener(&mut self, listener: TcpListener) -> io::Result<()> {
+        self.serve_listeners(listener, None)
+    }
+
+    /// Accepts inbound peer and optional admin connections.
+    fn serve_listeners(
+        &mut self,
+        listener: TcpListener,
+        admin_listener: Option<TcpListener>,
+    ) -> io::Result<()> {
         if self.bootstrap_sync {
             info!(peer_count = self.peers.len(), "starting bootstrap sync");
             self.sync_configured_peers_best_effort();
         }
         info!(listen_addr = ?listener.local_addr().ok(), "server listening");
-        if self.mining.is_none() {
-            for stream in listener.incoming() {
-                self.handle_stream(stream?)?;
-            }
-            return Ok(());
+        if let Some(admin_listener) = admin_listener.as_ref() {
+            info!(admin_addr = ?admin_listener.local_addr().ok(), "admin listener active");
         }
 
         listener.set_nonblocking(true)?;
+        if let Some(admin_listener) = admin_listener.as_ref() {
+            admin_listener.set_nonblocking(true)?;
+        }
         loop {
             match listener.accept() {
                 Ok((stream, _)) => self.handle_stream(stream)?,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    self.mine_pending_best_effort()?;
-                    let interval = self
-                        .mining
-                        .as_ref()
-                        .map(|config| config.interval)
-                        .unwrap_or(Duration::from_millis(50));
-                    thread::sleep(interval);
-                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(err) => return Err(err),
+            }
+            if let Some(admin_listener) = admin_listener.as_ref() {
+                match admin_listener.accept() {
+                    Ok((stream, _)) => self.handle_admin_stream(stream)?,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            self.mine_pending_best_effort()?;
+            let interval = self
+                .mining
+                .as_ref()
+                .map(|config| config.interval)
+                .unwrap_or(Duration::from_millis(50));
+            thread::sleep(interval);
+        }
+    }
+
+    /// Handles one localhost admin request against the live node state.
+    fn handle_admin_request(&mut self, request: AdminRequest) -> AdminResponse {
+        match request {
+            AdminRequest::GetStatus => {
+                let tip = self.state.tip_summary();
+                AdminResponse::Status(StatusSummary {
+                    tip: tip.tip,
+                    height: tip.height,
+                    mempool_size: self.state.mempool().len(),
+                    peer_count: self.peers.len(),
+                })
+            }
+            AdminRequest::GetBalance { public_key } => {
+                let Some(owner) = crate::crypto::parse_verifying_key(&public_key) else {
+                    return AdminResponse::Error {
+                        message: "invalid public key".to_string(),
+                    };
+                };
+                AdminResponse::Balance(BalanceSummary {
+                    amount: self.state.balance_for_key(&owner),
+                })
+            }
+            AdminRequest::SubmitTransaction { transaction } => {
+                let txid = transaction.txid();
+                match self.handle_message(WireMessage::AnnounceTx { transaction }) {
+                    Ok(_) => AdminResponse::Submitted { txid },
+                    Err(err) => AdminResponse::Error {
+                        message: format!("{err:?}"),
+                    },
+                }
             }
         }
     }
@@ -749,6 +829,28 @@ fn relay_to_peer_once(
     let _ = net::receive_message(&mut stream)?;
     net::send_message(&mut stream, message)?;
     Ok(())
+}
+
+fn receive_admin_request_from_reader<R: io::BufRead>(mut reader: R) -> io::Result<AdminRequest> {
+    let mut line = String::new();
+    let bytes_read = reader.read_line(&mut line)?;
+    if bytes_read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "admin client closed connection",
+        ));
+    }
+    serde_json::from_str(line.trim_end_matches('\n'))
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn send_admin_response(stream: &mut TcpStream, response: &AdminResponse) -> io::Result<()> {
+    let mut line = serde_json::to_string(response)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    line.push('\n');
+    use io::Write;
+    stream.write_all(line.as_bytes())?;
+    stream.flush()
 }
 
 #[cfg(test)]

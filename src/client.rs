@@ -4,8 +4,8 @@
 //! peer, send the local `hello`, and validate that the first response is also a
 //! `hello`. Keeping that flow here avoids repeating the same handshake code in
 //! each remote CLI command. It also provides a few one-shot request helpers
-//! for explicit tip, block, and transaction submission flows during sync tests
-//! and CLI operations.
+//! for explicit tip, block, and transaction announcement flows during sync
+//! tests and CLI operations.
 
 use std::{io, net::TcpStream};
 

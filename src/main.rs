@@ -13,6 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing::info;
 
 use wobble::{
+    admin,
     aliases::{self, AliasBook},
     client,
     consensus::BLOCK_SUBSIDY,
@@ -49,6 +50,8 @@ enum Command {
     WalletAddress(HomeArg),
     /// Prints the local node wallet balance.
     WalletBalance(HomeArg),
+    /// Prints status from the running local node server.
+    Status(HomeArg),
     /// Builds and queues a local payment from the node wallet.
     SubmitPayment(SubmitPaymentCommand),
     /// Reads chain or peer state without mutating local data.
@@ -354,6 +357,7 @@ fn run() -> Result<(), String> {
         Command::Serve(command) => run_serve(command),
         Command::WalletAddress(command) => run_wallet_address(command),
         Command::WalletBalance(command) => run_wallet_balance(command),
+        Command::Status(command) => run_status(command),
         Command::SubmitPayment(command) => run_submit_payment(command),
         Command::Inspect { command } => run_inspect(command),
         Command::Admin { command } => run_admin(command),
@@ -378,6 +382,7 @@ fn run_init(command: HomeArg) -> Result<(), String> {
     println!("peers: {}", home.peers_path().display());
     println!("config: {}", home.config_path().display());
     println!("listen addr: {}", config.listen_addr);
+    println!("admin addr: {}", config.admin_addr);
     println!("network: {}", config.network);
     if let Some(name) = config.node_name.as_deref() {
         println!("node name: {name}");
@@ -444,6 +449,7 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     println!("bootstrap source: sqlite");
     println!("config: {}", home.config_path().display());
     println!("listen addr: {}", runtime.listen_addr);
+    println!("admin addr: {}", config_file.admin_addr);
     println!("network: {}", runtime.network);
     if let Some(name) = server.config().node_name.as_deref() {
         println!("node name: {name}");
@@ -470,7 +476,7 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     }
 
     server
-        .serve(&runtime.listen_addr)
+        .serve_with_admin(&runtime.listen_addr, &config_file.admin_addr)
         .map_err(|err| format!("server failed: {err}"))
 }
 
@@ -489,10 +495,41 @@ fn run_wallet_address(command: HomeArg) -> Result<(), String> {
 /// Prints the balance for the local node wallet from the selected home.
 fn run_wallet_balance(command: HomeArg) -> Result<(), String> {
     let home = resolve_node_home(command.home.as_deref())?;
+    let node_config = home
+        .load_config()
+        .map_err(|err| format!("config load failed: {err:?}"))?;
     let wallet = wallet::load_wallet(&home.wallet_path())
         .map_err(|err| format!("wallet load failed: {err:?}"))?;
-    let state = load_sqlite_state(&home.state_path())?;
-    println!("{}", state.balance_for_key(&wallet.verifying_key()));
+    let balance = admin::request_balance(
+        &node_config.admin_addr,
+        crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec(),
+    )
+    .map_err(|err| format!("balance query failed: {err:?}"))?;
+    println!("{}", balance.amount);
+    Ok(())
+}
+
+/// Prints live status from the running local node server selected by `home`.
+fn run_status(command: HomeArg) -> Result<(), String> {
+    let home = resolve_node_home(command.home.as_deref())?;
+    let node_config = home
+        .load_config()
+        .map_err(|err| format!("config load failed: {err:?}"))?;
+    let status = admin::request_status(&node_config.admin_addr)
+        .map_err(|err| format!("status query failed: {err:?}"))?;
+
+    println!("listen addr: {}", node_config.listen_addr);
+    println!("admin addr: {}", node_config.admin_addr);
+    println!("best tip: {}", format_hash(status.tip));
+    println!(
+        "height: {}",
+        status
+            .height
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!("mempool txs: {}", status.mempool_size);
+    println!("configured peers: {}", status.peer_count);
     Ok(())
 }
 
@@ -519,15 +556,11 @@ fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
         .get(&submitted)
         .cloned()
         .ok_or_else(|| format!("built transaction {submitted} missing from local mempool"))?;
-    client::announce_transaction(
-        &node_config.listen_addr,
-        &PeerConfig::new(node_config.network, None),
-        transaction,
-    )
-    .map_err(|err| format!("submit to local server failed: {err:?}"))?;
+    admin::submit_transaction(&node_config.admin_addr, transaction)
+        .map_err(|err| format!("submit to local server failed: {err:?}"))?;
 
     println!("submitted payment {}", submitted);
-    println!("local node: {}", node_config.listen_addr);
+    println!("local admin: {}", node_config.admin_addr);
     Ok(())
 }
 
@@ -1083,7 +1116,7 @@ mod tests {
     use wobble::home::{MiningSection, NodeConfig, NodeHome};
 
     use super::{
-        Cli, Command, DebugCommand, InspectCommand, MinePendingCommand, ServeCommand,
+        Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand, ServeCommand,
         SubmitPaymentCommand, resolve_mining_runtime, resolve_serve_runtime,
         resolve_state_and_wallet_paths, resolve_state_path, resolve_wallet_path,
     };
@@ -1112,6 +1145,18 @@ mod tests {
                 assert_eq!(recipient, "@/tmp/book.json:alice");
                 assert_eq!(amount, 25);
                 assert_eq!(uniqueness, Some(7));
+                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_status_with_home_override() {
+        let cli = Cli::try_parse_from(["wobble", "status", "--home", "/tmp/node"]).unwrap();
+
+        match cli.command {
+            Command::Status(HomeArg { home }) => {
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1287,6 +1332,7 @@ mod tests {
     fn resolve_serve_runtime_prefers_cli_over_home_config() {
         let config = NodeConfig {
             listen_addr: "127.0.0.1:9001".to_string(),
+            admin_addr: "127.0.0.1:9000".to_string(),
             network: "wobble-local".to_string(),
             node_name: Some("saved".to_string()),
             mining: MiningSection::default(),

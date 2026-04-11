@@ -32,7 +32,11 @@ const CONFIG_FILENAME: &str = "config.json";
 /// Default runtime configuration stored in a node home.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfig {
+    #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
+    #[serde(default = "default_admin_addr")]
+    pub admin_addr: String,
+    #[serde(default = "default_network")]
     pub network: String,
     pub node_name: Option<String>,
     #[serde(default)]
@@ -57,8 +61,9 @@ pub struct MiningSection {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:9001".to_string(),
-            network: "wobble-local".to_string(),
+            listen_addr: default_listen_addr(),
+            admin_addr: default_admin_addr(),
+            network: default_network(),
             node_name: None,
             mining: MiningSection::default(),
         }
@@ -79,6 +84,18 @@ impl Default for MiningSection {
 
 fn default_mining_interval_ms() -> u64 {
     250
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1:9001".to_string()
+}
+
+fn default_admin_addr() -> String {
+    "127.0.0.1:9000".to_string()
+}
+
+fn default_network() -> String {
+    "wobble-local".to_string()
 }
 
 fn default_mining_max_transactions() -> usize {
@@ -312,6 +329,7 @@ mod tests {
         fs::create_dir_all(home.root()).unwrap();
         home.save_config(&NodeConfig {
             listen_addr: "127.0.0.1:9010".to_string(),
+            admin_addr: "127.0.0.1:9000".to_string(),
             network: "custom-net".to_string(),
             node_name: Some("alpha".to_string()),
             mining: MiningSection::default(),
@@ -321,6 +339,7 @@ mod tests {
         let config = home.load_config().unwrap();
 
         assert_eq!(config.listen_addr, "127.0.0.1:9010");
+        assert_eq!(config.admin_addr, "127.0.0.1:9000");
         assert_eq!(config.network, "custom-net");
         assert_eq!(config.node_name.as_deref(), Some("alpha"));
         assert_eq!(config.mining, MiningSection::default());
@@ -333,6 +352,7 @@ mod tests {
         let config = serde_json::from_str::<NodeConfig>(
             r#"{
               "listen_addr": "127.0.0.1:9001",
+              "admin_addr": "127.0.0.1:9000",
               "network": "wobble-local",
               "node_name": "miner"
             }"#,
@@ -349,6 +369,7 @@ mod tests {
         fs::create_dir_all(home.root()).unwrap();
         home.save_config(&NodeConfig {
             listen_addr: "127.0.0.1:9010".to_string(),
+            admin_addr: "127.0.0.1:9011".to_string(),
             network: "custom-net".to_string(),
             node_name: Some("miner".to_string()),
             mining: MiningSection {
@@ -364,6 +385,7 @@ mod tests {
         let config = home.load_config().unwrap();
 
         assert!(config.mining.enabled);
+        assert_eq!(config.admin_addr, "127.0.0.1:9011");
         assert_eq!(
             config.mining.reward_wallet.as_deref(),
             Some(Path::new("miner-wallet.bin"))

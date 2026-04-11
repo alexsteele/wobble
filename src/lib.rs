@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod aliases;
 pub mod chain;
 pub mod client;
