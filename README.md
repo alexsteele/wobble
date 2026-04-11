@@ -66,7 +66,7 @@ Example:
 wobble init                                            # create ~/.wobble with wallet, state, and config
 wobble wallet-address                                  # print this node's public key
 wobble serve                                           # start the local node using ~/.wobble/config.json
-wobble serve --miner-wallet /tmp/miner.bin             # start server with mining on
+wobble serve --mining                                  # start server with mining enabled
 wobble submit-payment <recipient_public_key> 30        # queue a payment from the local wallet
 wobble wallet-balance
 ```
@@ -76,6 +76,29 @@ wobble wallet-balance
 - `wallet.bin`
 - `aliases.json`
 - `peers.json`
+- `config.json`
+
+Node config example:
+
+```json
+{
+  "listen_addr": "127.0.0.1:9001",
+  "network": "wobble-local",
+  "node_name": "miner",
+  "mining": {
+    "enabled": true,
+    "reward_wallet": "wallet.bin",
+    "interval_ms": 250,
+    "max_transactions": 100,
+    "bits": "0x207fffff"
+  }
+}
+```
+
+Notes:
+- `reward_wallet` may be relative to the node home or an absolute path
+- if `reward_wallet` is omitted, mining rewards go to the node home's default `wallet.bin`
+- `wobble serve --mining` forces mining on for one run, and `wobble serve --no-mining` forces it off
 
 Peer bootstrap file example:
 

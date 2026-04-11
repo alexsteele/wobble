@@ -35,6 +35,23 @@ pub struct NodeConfig {
     pub listen_addr: String,
     pub network: String,
     pub node_name: Option<String>,
+    #[serde(default)]
+    pub mining: MiningSection,
+}
+
+/// Integrated miner defaults persisted in the node home config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MiningSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reward_wallet: Option<PathBuf>,
+    #[serde(default = "default_mining_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_mining_max_transactions")]
+    pub max_transactions: usize,
+    #[serde(default = "default_mining_bits")]
+    pub bits: String,
 }
 
 impl Default for NodeConfig {
@@ -43,8 +60,33 @@ impl Default for NodeConfig {
             listen_addr: "127.0.0.1:9001".to_string(),
             network: "wobble-local".to_string(),
             node_name: None,
+            mining: MiningSection::default(),
         }
     }
+}
+
+impl Default for MiningSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reward_wallet: None,
+            interval_ms: default_mining_interval_ms(),
+            max_transactions: default_mining_max_transactions(),
+            bits: default_mining_bits(),
+        }
+    }
+}
+
+fn default_mining_interval_ms() -> u64 {
+    250
+}
+
+fn default_mining_max_transactions() -> usize {
+    100
+}
+
+fn default_mining_bits() -> String {
+    "0x207fffff".to_string()
 }
 
 /// Errors returned while resolving or initializing a node home.
@@ -192,10 +234,11 @@ fn default_home_root() -> Result<PathBuf, NodeHomeError> {
 mod tests {
     use std::{
         fs,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{NodeConfig, NodeHome};
+    use super::{MiningSection, NodeConfig, NodeHome};
 
     fn temp_home() -> NodeHome {
         let mut path = std::env::temp_dir();
@@ -271,6 +314,7 @@ mod tests {
             listen_addr: "127.0.0.1:9010".to_string(),
             network: "custom-net".to_string(),
             node_name: Some("alpha".to_string()),
+            mining: MiningSection::default(),
         })
         .unwrap();
 
@@ -279,6 +323,54 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:9010");
         assert_eq!(config.network, "custom-net");
         assert_eq!(config.node_name.as_deref(), Some("alpha"));
+        assert_eq!(config.mining, MiningSection::default());
+
+        fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[test]
+    fn config_parse_defaults_missing_mining_section() {
+        let config = serde_json::from_str::<NodeConfig>(
+            r#"{
+              "listen_addr": "127.0.0.1:9001",
+              "network": "wobble-local",
+              "node_name": "miner"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.mining, MiningSection::default());
+    }
+
+    #[test]
+    fn config_round_trips_custom_mining_section() {
+        let home = temp_home();
+
+        fs::create_dir_all(home.root()).unwrap();
+        home.save_config(&NodeConfig {
+            listen_addr: "127.0.0.1:9010".to_string(),
+            network: "custom-net".to_string(),
+            node_name: Some("miner".to_string()),
+            mining: MiningSection {
+                enabled: true,
+                reward_wallet: Some(PathBuf::from("miner-wallet.bin")),
+                interval_ms: 500,
+                max_transactions: 32,
+                bits: "0x1f00ffff".to_string(),
+            },
+        })
+        .unwrap();
+
+        let config = home.load_config().unwrap();
+
+        assert!(config.mining.enabled);
+        assert_eq!(
+            config.mining.reward_wallet.as_deref(),
+            Some(Path::new("miner-wallet.bin"))
+        );
+        assert_eq!(config.mining.interval_ms, 500);
+        assert_eq!(config.mining.max_transactions, 32);
+        assert_eq!(config.mining.bits, "0x1f00ffff");
 
         fs::remove_dir_all(home.root()).unwrap();
     }

@@ -17,7 +17,7 @@ use wobble::{
     client,
     consensus::BLOCK_SUBSIDY,
     crypto,
-    home::{NodeConfig, NodeHome},
+    home::{MiningSection, NodeConfig, NodeHome},
     logging, net,
     node_state::NodeState,
     peer::PeerConfig,
@@ -94,17 +94,23 @@ struct ServeCommand {
     /// Optional peer list JSON file. Defaults to the node home's peers file.
     #[arg(long)]
     peers_path: Option<PathBuf>,
+    /// Forces integrated mining on for this run.
+    #[arg(long, conflicts_with = "no_mining")]
+    mining: bool,
+    /// Forces integrated mining off for this run.
+    #[arg(long, conflicts_with = "mining")]
+    no_mining: bool,
     /// Enables integrated mining using the wallet at this path.
     #[arg(long)]
     miner_wallet: Option<PathBuf>,
     /// Integrated miner polling interval in milliseconds.
-    #[arg(long, requires = "miner_wallet")]
+    #[arg(long)]
     mining_interval_ms: Option<u64>,
     /// Maximum mempool transactions to include per mined block.
-    #[arg(long, requires = "miner_wallet")]
+    #[arg(long)]
     mining_max_transactions: Option<usize>,
     /// Compact proof-of-work difficulty target for integrated mining.
-    #[arg(long, requires = "miner_wallet")]
+    #[arg(long)]
     mining_bits: Option<String>,
 }
 
@@ -138,18 +144,24 @@ enum InspectCommand {
 
 #[derive(Debug, Args)]
 struct InfoCommand {
-    sqlite_path: PathBuf,
+    sqlite_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct BalanceCommand {
-    sqlite_path: PathBuf,
+    sqlite_path: Option<PathBuf>,
     public_key: String,
+    #[arg(long)]
+    home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct UtxosCommand {
-    sqlite_path: PathBuf,
+    sqlite_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -217,9 +229,11 @@ enum DebugCommand {
 #[derive(Debug, Args)]
 struct MineCoinbaseCommand {
     #[arg(long)]
-    state_path: PathBuf,
+    state_path: Option<PathBuf>,
     #[arg(long)]
-    wallet_path: PathBuf,
+    wallet_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
     #[arg(long)]
     reward: u64,
     #[arg(long, default_value_t = 0)]
@@ -231,9 +245,11 @@ struct MineCoinbaseCommand {
 #[derive(Debug, Args)]
 struct MinePendingCommand {
     #[arg(long)]
-    state_path: PathBuf,
+    state_path: Option<PathBuf>,
     #[arg(long)]
-    wallet_path: PathBuf,
+    wallet_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
     #[arg(long)]
     reward: u64,
     #[arg(long)]
@@ -247,9 +263,11 @@ struct MinePendingCommand {
 #[derive(Debug, Args)]
 struct LocalSubmitPaymentCommand {
     #[arg(long)]
-    state_path: PathBuf,
+    state_path: Option<PathBuf>,
     #[arg(long)]
-    wallet_path: PathBuf,
+    wallet_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
     #[arg(long)]
     recipient: String,
     #[arg(long)]
@@ -261,9 +279,11 @@ struct LocalSubmitPaymentCommand {
 #[derive(Debug, Args)]
 struct SubmitPaymentRemoteCommand {
     #[arg(long)]
-    sqlite_path: PathBuf,
+    sqlite_path: Option<PathBuf>,
     #[arg(long)]
-    sender_wallet: PathBuf,
+    sender_wallet: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
     #[arg(long)]
     recipient: String,
     #[arg(long)]
@@ -283,7 +303,9 @@ struct MinePendingRemoteCommand {
     #[arg(long)]
     reward: u64,
     #[arg(long)]
-    miner_wallet: PathBuf,
+    miner_wallet: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
     #[arg(long)]
     uniqueness: u32,
     #[arg(long)]
@@ -301,7 +323,9 @@ struct MinePendingRemoteCommand {
 #[derive(Debug, Args)]
 struct SubmitTransferCommand {
     #[arg(long)]
-    state_path: PathBuf,
+    state_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
     #[arg(long)]
     txid: String,
     #[arg(long)]
@@ -309,7 +333,7 @@ struct SubmitTransferCommand {
     #[arg(long)]
     amount: u64,
     #[arg(long)]
-    sender_wallet: PathBuf,
+    sender_wallet: Option<PathBuf>,
     #[arg(long)]
     recipient_public_key: String,
 }
@@ -358,6 +382,16 @@ fn run_init(command: HomeArg) -> Result<(), String> {
     if let Some(name) = config.node_name.as_deref() {
         println!("node name: {name}");
     }
+    println!("mining enabled: {}", config.mining.enabled);
+    println!(
+        "mining reward wallet: {}",
+        config
+            .mining
+            .reward_wallet
+            .as_deref()
+            .unwrap_or_else(|| Path::new("wallet.bin"))
+            .display()
+    );
     println!(
         "public: {}",
         encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
@@ -384,25 +418,8 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         .unwrap_or_else(|| home.peers_path());
     let peer_endpoints = peers::load_peer_endpoints(&peer_path)
         .map_err(|err| format!("peer config load failed: {err:?}"))?;
-    let mining_bits = command.mining_bits.as_deref().map(parse_bits).transpose()?;
-    let mining = match command.miner_wallet.as_ref() {
-        Some(path) => {
-            let wallet =
-                wallet::load_wallet(path).map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut mining = MiningConfig::new(wallet.verifying_key());
-            if let Some(interval_ms) = command.mining_interval_ms {
-                mining = mining.with_interval(std::time::Duration::from_millis(interval_ms));
-            }
-            if let Some(max_transactions) = command.mining_max_transactions {
-                mining = mining.with_max_transactions(max_transactions);
-            }
-            if let Some(bits) = mining_bits {
-                mining = mining.with_bits(bits);
-            }
-            Some(mining)
-        }
-        None => None,
-    };
+    let mining_runtime = resolve_mining_runtime(&home, &config_file.mining, &command)?;
+    let mining = build_mining_config(&mining_runtime)?;
     let mut server = Server::new(config, state)
         .with_peers(peer_endpoints.clone())
         .with_sqlite_path(&sqlite_path)
@@ -436,19 +453,13 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         format_hash(server.state().chain().best_tip())
     );
     println!("peers file: {}", peer_path.display());
-    if let Some(path) = command.miner_wallet {
+    if let Some(runtime) = &mining_runtime {
         println!("integrated mining: enabled");
-        println!("miner wallet: {}", path.display());
+        println!("miner wallet: {}", runtime.wallet_path.display());
         println!("mining reward: {}", BLOCK_SUBSIDY);
-        println!(
-            "mining interval ms: {}",
-            command.mining_interval_ms.unwrap_or(250)
-        );
-        println!(
-            "mining max transactions: {}",
-            command.mining_max_transactions.unwrap_or(100)
-        );
-        println!("mining bits: {:#010x}", mining_bits.unwrap_or(0x207f_ffff));
+        println!("mining interval ms: {}", runtime.interval_ms);
+        println!("mining max transactions: {}", runtime.max_transactions);
+        println!("mining bits: {:#010x}", runtime.bits);
     }
     println!("configured peers: {}", peer_endpoints.len());
     for peer in &peer_endpoints {
@@ -510,8 +521,10 @@ fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
 fn run_inspect(command: InspectCommand) -> Result<(), String> {
     match command {
         InspectCommand::Info(command) => {
-            let state = load_sqlite_state(&command.sqlite_path)?;
-            println!("sqlite: {}", command.sqlite_path.display());
+            let sqlite_path =
+                resolve_state_path(command.home.as_deref(), command.sqlite_path.as_deref())?;
+            let state = load_sqlite_state(&sqlite_path)?;
+            println!("sqlite: {}", sqlite_path.display());
             println!("indexed blocks: {}", state.chain().len());
             println!("best tip: {}", format_hash(state.chain().best_tip()));
             println!("active utxos: {}", state.active_utxos().len());
@@ -520,12 +533,16 @@ fn run_inspect(command: InspectCommand) -> Result<(), String> {
         }
         InspectCommand::Balance(command) => {
             let owner = parse_public_key(&command.public_key)?;
-            let state = load_sqlite_state(&command.sqlite_path)?;
+            let sqlite_path =
+                resolve_state_path(command.home.as_deref(), command.sqlite_path.as_deref())?;
+            let state = load_sqlite_state(&sqlite_path)?;
             println!("{}", state.balance_for_key(&owner));
             Ok(())
         }
         InspectCommand::Utxos(command) => {
-            let state = load_sqlite_state(&command.sqlite_path)?;
+            let sqlite_path =
+                resolve_state_path(command.home.as_deref(), command.sqlite_path.as_deref())?;
+            let state = load_sqlite_state(&sqlite_path)?;
             for outpoint in state.active_outpoints() {
                 if let Some(utxo) = state.active_utxos().get(&outpoint) {
                     println!(
@@ -638,9 +655,14 @@ fn run_admin(command: AdminCommand) -> Result<(), String> {
 fn run_debug(command: DebugCommand) -> Result<(), String> {
     match command {
         DebugCommand::MineCoinbase(command) => {
-            let miner_wallet = wallet::load_wallet(&command.wallet_path)
+            let (state_path, wallet_path) = resolve_state_and_wallet_paths(
+                command.home.as_deref(),
+                command.state_path.as_deref(),
+                command.wallet_path.as_deref(),
+            )?;
+            let miner_wallet = wallet::load_wallet(&wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut state = load_sqlite_state(&command.state_path)?;
+            let mut state = load_sqlite_state(&state_path)?;
             let block_hash = state
                 .mine_block(
                     command.reward,
@@ -650,7 +672,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
                     0,
                 )
                 .map_err(|err| format!("block rejected: {err:?}"))?;
-            save_sqlite_state(&command.state_path, &state)?;
+            save_sqlite_state(&state_path, &state)?;
 
             println!("mined block {}", block_hash);
             println!("new best tip: {}", format_hash(state.chain().best_tip()));
@@ -661,9 +683,14 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             Ok(())
         }
         DebugCommand::MinePending(command) => {
-            let miner_wallet = wallet::load_wallet(&command.wallet_path)
+            let (state_path, wallet_path) = resolve_state_and_wallet_paths(
+                command.home.as_deref(),
+                command.state_path.as_deref(),
+                command.wallet_path.as_deref(),
+            )?;
+            let miner_wallet = wallet::load_wallet(&wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut state = load_sqlite_state(&command.state_path)?;
+            let mut state = load_sqlite_state(&state_path)?;
             let block_hash = state
                 .mine_block(
                     command.reward,
@@ -673,7 +700,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
                     command.max_transactions,
                 )
                 .map_err(|err| format!("block rejected: {err:?}"))?;
-            save_sqlite_state(&command.state_path, &state)?;
+            save_sqlite_state(&state_path, &state)?;
 
             println!("mined block {}", block_hash);
             println!("new best tip: {}", format_hash(state.chain().best_tip()));
@@ -682,10 +709,15 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             Ok(())
         }
         DebugCommand::SubmitPayment(command) => {
+            let (state_path, wallet_path) = resolve_state_and_wallet_paths(
+                command.home.as_deref(),
+                command.state_path.as_deref(),
+                command.wallet_path.as_deref(),
+            )?;
             let recipient_verifying_key = parse_public_key_or_alias(&command.recipient)?;
-            let sender_wallet = wallet::load_wallet(&command.wallet_path)
+            let sender_wallet = wallet::load_wallet(&wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut state = load_sqlite_state(&command.state_path)?;
+            let mut state = load_sqlite_state(&state_path)?;
             let submitted = state
                 .submit_payment(
                     sender_wallet.signing_key(),
@@ -694,18 +726,23 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
                     command.uniqueness.unwrap_or_else(default_uniqueness),
                 )
                 .map_err(|err| format!("submit failed: {err:?}"))?;
-            save_sqlite_state(&command.state_path, &state)?;
+            save_sqlite_state(&state_path, &state)?;
 
             println!("queued payment {}", submitted);
             println!("mempool txs: {}", state.mempool().len());
             Ok(())
         }
         DebugCommand::SubmitPaymentRemote(command) => {
+            let (sqlite_path, sender_wallet_path) = resolve_state_and_wallet_paths(
+                command.home.as_deref(),
+                command.sqlite_path.as_deref(),
+                command.sender_wallet.as_deref(),
+            )?;
             let recipient_verifying_key = parse_public_key_or_alias(&command.recipient)?;
             let config = PeerConfig::new(command.network, command.node_name);
-            let sender_wallet = wallet::load_wallet(&command.sender_wallet)
+            let sender_wallet = wallet::load_wallet(&sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut local_state = load_sqlite_state(&command.sqlite_path)?;
+            let mut local_state = load_sqlite_state(&sqlite_path)?;
             let txid = local_state
                 .submit_payment(
                     sender_wallet.signing_key(),
@@ -728,8 +765,10 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             Ok(())
         }
         DebugCommand::MinePendingRemote(command) => {
+            let miner_wallet_path =
+                resolve_wallet_path(command.home.as_deref(), command.miner_wallet.as_deref())?;
             let config = PeerConfig::new(command.network, command.node_name);
-            let miner_wallet = wallet::load_wallet(&command.miner_wallet)
+            let miner_wallet = wallet::load_wallet(&miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let (mut stream, _) = client::connect_and_handshake(&command.peer_addr, &config)
                 .map_err(|err| format!("handshake failed: {err:?}"))?;
@@ -758,12 +797,17 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             }
         }
         DebugCommand::SubmitTransfer(command) => {
+            let (state_path, sender_wallet_path) = resolve_state_and_wallet_paths(
+                command.home.as_deref(),
+                command.state_path.as_deref(),
+                command.sender_wallet.as_deref(),
+            )?;
             let txid = parse_txid(&command.txid)?;
-            let sender_wallet = wallet::load_wallet(&command.sender_wallet)
+            let sender_wallet = wallet::load_wallet(&sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let recipient_public_key = parse_public_key(&command.recipient_public_key)?;
 
-            let mut state = load_sqlite_state(&command.state_path)?;
+            let mut state = load_sqlite_state(&state_path)?;
             let mut tx = Transaction {
                 version: 1,
                 inputs: vec![TxIn {
@@ -784,7 +828,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             let submitted = state
                 .submit_transaction(tx)
                 .map_err(|err| format!("submit failed: {err:?}"))?;
-            save_sqlite_state(&command.state_path, &state)?;
+            save_sqlite_state(&state_path, &state)?;
 
             println!("queued transaction {}", submitted);
             println!("mempool txs: {}", state.mempool().len());
@@ -806,12 +850,49 @@ fn resolve_node_home(path: Option<&Path>) -> Result<NodeHome, String> {
     }
 }
 
+/// Resolves the local sqlite state path, defaulting to the selected node home.
+fn resolve_state_path(home: Option<&Path>, state_path: Option<&Path>) -> Result<PathBuf, String> {
+    match state_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(resolve_node_home(home)?.state_path()),
+    }
+}
+
+/// Resolves the local wallet path, defaulting to the selected node home.
+fn resolve_wallet_path(home: Option<&Path>, wallet_path: Option<&Path>) -> Result<PathBuf, String> {
+    match wallet_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(resolve_node_home(home)?.wallet_path()),
+    }
+}
+
+/// Resolves both local state and wallet paths, preferring explicit overrides.
+fn resolve_state_and_wallet_paths(
+    home: Option<&Path>,
+    state_path: Option<&Path>,
+    wallet_path: Option<&Path>,
+) -> Result<(PathBuf, PathBuf), String> {
+    Ok((
+        resolve_state_path(home, state_path)?,
+        resolve_wallet_path(home, wallet_path)?,
+    ))
+}
+
 /// Effective serve settings after merging home config defaults with CLI overrides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServeRuntime {
     listen_addr: String,
     network: String,
     node_name: Option<String>,
+}
+
+/// Effective mining settings after merging home config defaults with CLI overrides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MiningRuntime {
+    wallet_path: PathBuf,
+    interval_ms: u64,
+    max_transactions: usize,
+    bits: u32,
 }
 
 /// Resolves server runtime settings from node-home config plus CLI overrides.
@@ -830,6 +911,69 @@ fn resolve_serve_runtime(config: &NodeConfig, command: &ServeCommand) -> ServeRu
             .clone()
             .or_else(|| config.node_name.clone()),
     }
+}
+
+/// Resolves integrated mining settings from node-home config plus CLI overrides.
+fn resolve_mining_runtime(
+    home: &NodeHome,
+    config: &MiningSection,
+    command: &ServeCommand,
+) -> Result<Option<MiningRuntime>, String> {
+    let enabled = if command.no_mining {
+        false
+    } else if command.mining || command.miner_wallet.is_some() {
+        true
+    } else {
+        config.enabled
+    };
+    if !enabled {
+        return Ok(None);
+    }
+
+    let wallet_path = command
+        .miner_wallet
+        .clone()
+        .or_else(|| {
+            config.reward_wallet.clone().map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    home.root().join(path)
+                }
+            })
+        })
+        .unwrap_or_else(|| home.wallet_path());
+    let interval_ms = command.mining_interval_ms.unwrap_or(config.interval_ms);
+    let max_transactions = command
+        .mining_max_transactions
+        .unwrap_or(config.max_transactions);
+    let bits = command
+        .mining_bits
+        .as_deref()
+        .map(parse_bits)
+        .transpose()?
+        .unwrap_or(parse_bits(&config.bits)?);
+
+    Ok(Some(MiningRuntime {
+        wallet_path,
+        interval_ms,
+        max_transactions,
+        bits,
+    }))
+}
+
+/// Loads the configured miner wallet and builds the server mining configuration.
+fn build_mining_config(runtime: &Option<MiningRuntime>) -> Result<Option<MiningConfig>, String> {
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    let wallet = wallet::load_wallet(&runtime.wallet_path)
+        .map_err(|err| format!("wallet load failed: {err:?}"))?;
+    let mining = MiningConfig::new(wallet.verifying_key())
+        .with_interval(std::time::Duration::from_millis(runtime.interval_ms))
+        .with_max_transactions(runtime.max_transactions)
+        .with_bits(runtime.bits);
+    Ok(Some(mining))
 }
 
 fn save_sqlite_state(path: &Path, state: &NodeState) -> Result<(), String> {
@@ -920,14 +1064,15 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use clap::Parser;
-    use wobble::home::NodeConfig;
+    use wobble::home::{MiningSection, NodeConfig, NodeHome};
 
     use super::{
         Cli, Command, DebugCommand, InspectCommand, MinePendingCommand, ServeCommand,
-        SubmitPaymentCommand, resolve_serve_runtime,
+        SubmitPaymentCommand, resolve_mining_runtime, resolve_serve_runtime,
+        resolve_state_and_wallet_paths, resolve_state_path, resolve_wallet_path,
     };
 
     #[test]
@@ -993,6 +1138,8 @@ mod tests {
                 network,
                 node_name,
                 peers_path,
+                mining,
+                no_mining,
                 miner_wallet,
                 mining_interval_ms,
                 mining_max_transactions,
@@ -1003,6 +1150,8 @@ mod tests {
                 assert_eq!(network.as_deref(), Some("wobble-local"));
                 assert_eq!(node_name.as_deref(), Some("alpha"));
                 assert_eq!(peers_path.unwrap(), PathBuf::from("/tmp/peers.json"));
+                assert!(!mining);
+                assert!(!no_mining);
                 assert_eq!(miner_wallet.unwrap(), PathBuf::from("/tmp/miner.wallet"));
                 assert_eq!(mining_interval_ms, Some(500));
                 assert_eq!(mining_max_transactions, Some(25));
@@ -1018,10 +1167,6 @@ mod tests {
             "wobble",
             "debug",
             "mine-pending",
-            "--state-path",
-            "/tmp/node.sqlite",
-            "--wallet-path",
-            "/tmp/miner.wallet",
             "--reward",
             "50",
             "--uniqueness",
@@ -1037,14 +1182,16 @@ mod tests {
                     DebugCommand::MinePending(MinePendingCommand {
                         state_path,
                         wallet_path,
+                        home,
                         reward,
                         uniqueness,
                         max_transactions,
                         bits,
                     }),
             } => {
-                assert_eq!(state_path, PathBuf::from("/tmp/node.sqlite"));
-                assert_eq!(wallet_path, PathBuf::from("/tmp/miner.wallet"));
+                assert!(state_path.is_none());
+                assert!(wallet_path.is_none());
+                assert!(home.is_none());
                 assert_eq!(reward, 50);
                 assert_eq!(uniqueness, 3);
                 assert_eq!(max_transactions, 100);
@@ -1090,6 +1237,8 @@ mod tests {
                 network,
                 node_name,
                 peers_path,
+                mining,
+                no_mining,
                 miner_wallet,
                 ..
             }) => {
@@ -1098,7 +1247,24 @@ mod tests {
                 assert!(network.is_none());
                 assert!(node_name.is_none());
                 assert!(peers_path.is_none());
+                assert!(!mining);
+                assert!(!no_mining);
                 assert!(miner_wallet.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_inspect_info_without_sqlite_path() {
+        let cli = Cli::try_parse_from(["wobble", "inspect", "info"]).unwrap();
+
+        match cli.command {
+            Command::Inspect {
+                command: InspectCommand::Info(command),
+            } => {
+                assert!(command.sqlite_path.is_none());
+                assert!(command.home.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1110,6 +1276,7 @@ mod tests {
             listen_addr: "127.0.0.1:9001".to_string(),
             network: "wobble-local".to_string(),
             node_name: Some("saved".to_string()),
+            mining: MiningSection::default(),
         };
         let command = ServeCommand {
             home: Some(PathBuf::from("/tmp/node")),
@@ -1117,6 +1284,8 @@ mod tests {
             network: None,
             node_name: Some("override".to_string()),
             peers_path: None,
+            mining: false,
+            no_mining: false,
             miner_wallet: None,
             mining_interval_ms: None,
             mining_max_transactions: None,
@@ -1128,5 +1297,129 @@ mod tests {
         assert_eq!(runtime.listen_addr, "127.0.0.1:9010");
         assert_eq!(runtime.network, "wobble-local");
         assert_eq!(runtime.node_name.as_deref(), Some("override"));
+    }
+
+    #[test]
+    fn resolve_mining_runtime_uses_home_wallet_when_config_enables_mining() {
+        let home = NodeHome::new("/tmp/node");
+        let config = MiningSection {
+            enabled: true,
+            reward_wallet: None,
+            interval_ms: 400,
+            max_transactions: 12,
+            bits: "0x1f00ffff".to_string(),
+        };
+        let command = ServeCommand {
+            home: None,
+            listen_addr: None,
+            network: None,
+            node_name: None,
+            peers_path: None,
+            mining: false,
+            no_mining: false,
+            miner_wallet: None,
+            mining_interval_ms: None,
+            mining_max_transactions: None,
+            mining_bits: None,
+        };
+
+        let runtime = resolve_mining_runtime(&home, &config, &command)
+            .unwrap()
+            .expect("mining should be enabled");
+
+        assert_eq!(runtime.wallet_path, home.wallet_path());
+        assert_eq!(runtime.interval_ms, 400);
+        assert_eq!(runtime.max_transactions, 12);
+        assert_eq!(runtime.bits, 0x1f00ffff);
+    }
+
+    #[test]
+    fn resolve_mining_runtime_applies_cli_overrides() {
+        let home = NodeHome::new("/tmp/node");
+        let config = MiningSection {
+            enabled: false,
+            reward_wallet: Some(PathBuf::from("miner-wallet.bin")),
+            interval_ms: 250,
+            max_transactions: 100,
+            bits: "0x207fffff".to_string(),
+        };
+        let command = ServeCommand {
+            home: None,
+            listen_addr: None,
+            network: None,
+            node_name: None,
+            peers_path: None,
+            mining: true,
+            no_mining: false,
+            miner_wallet: Some(PathBuf::from("/tmp/override.wallet")),
+            mining_interval_ms: Some(500),
+            mining_max_transactions: Some(21),
+            mining_bits: Some("0x1f00ffff".to_string()),
+        };
+
+        let runtime = resolve_mining_runtime(&home, &config, &command)
+            .unwrap()
+            .expect("mining should be enabled");
+
+        assert_eq!(runtime.wallet_path, PathBuf::from("/tmp/override.wallet"));
+        assert_eq!(runtime.interval_ms, 500);
+        assert_eq!(runtime.max_transactions, 21);
+        assert_eq!(runtime.bits, 0x1f00ffff);
+    }
+
+    #[test]
+    fn resolve_mining_runtime_respects_no_mining_override() {
+        let home = NodeHome::new("/tmp/node");
+        let config = MiningSection {
+            enabled: true,
+            reward_wallet: Some(PathBuf::from("miner-wallet.bin")),
+            interval_ms: 250,
+            max_transactions: 100,
+            bits: "0x207fffff".to_string(),
+        };
+        let command = ServeCommand {
+            home: None,
+            listen_addr: None,
+            network: None,
+            node_name: None,
+            peers_path: None,
+            mining: false,
+            no_mining: true,
+            miner_wallet: None,
+            mining_interval_ms: None,
+            mining_max_transactions: None,
+            mining_bits: None,
+        };
+
+        let runtime = resolve_mining_runtime(&home, &config, &command).unwrap();
+
+        assert!(runtime.is_none());
+    }
+
+    #[test]
+    fn resolve_state_path_defaults_to_home_state() {
+        let path = resolve_state_path(Some(Path::new("/tmp/node")), None).unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/node/node.sqlite"));
+    }
+
+    #[test]
+    fn resolve_wallet_path_defaults_to_home_wallet() {
+        let path = resolve_wallet_path(Some(Path::new("/tmp/node")), None).unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/node/wallet.bin"));
+    }
+
+    #[test]
+    fn resolve_state_and_wallet_paths_prefers_explicit_overrides() {
+        let (state_path, wallet_path) = resolve_state_and_wallet_paths(
+            Some(Path::new("/tmp/node")),
+            Some(Path::new("/tmp/custom.sqlite")),
+            Some(Path::new("/tmp/custom.wallet")),
+        )
+        .unwrap();
+
+        assert_eq!(state_path, PathBuf::from("/tmp/custom.sqlite"));
+        assert_eq!(wallet_path, PathBuf::from("/tmp/custom.wallet"));
     }
 }
