@@ -2,13 +2,14 @@ use std::{env, path::Path};
 
 use wobble::{
     aliases::{self, AliasBook},
-    crypto,
+    crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
     server::Server,
     store,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
+    wire::{HelloMessage, PROTOCOL_VERSION, WireMessage},
 };
 
 fn main() {
@@ -218,6 +219,65 @@ fn run() -> Result<(), String> {
                 .serve(listen_addr)
                 .map_err(|err| format!("server failed: {err}"))
         }
+        "get-tip" => {
+            if args.len() != 4 && args.len() != 5 {
+                return Err(usage());
+            }
+
+            let peer_addr = &args[2];
+            let network = args[3].clone();
+            let node_name = args.get(4).cloned();
+            let mut stream =
+                net::connect(peer_addr).map_err(|err| format!("connect failed: {err}"))?;
+
+            let hello = WireMessage::Hello(HelloMessage {
+                network,
+                version: PROTOCOL_VERSION,
+                node_name,
+                tip: None,
+                height: None,
+            });
+            net::send_message(&mut stream, &hello)
+                .map_err(|err| format!("send hello failed: {err}"))?;
+            net::send_message(&mut stream, &WireMessage::GetTip)
+                .map_err(|err| format!("send get_tip failed: {err}"))?;
+
+            let remote_hello = net::receive_message(&mut stream)
+                .map_err(|err| format!("receive hello failed: {err}"))?;
+            let remote_tip = net::receive_message(&mut stream)
+                .map_err(|err| format!("receive tip failed: {err}"))?;
+
+            match remote_hello {
+                WireMessage::Hello(message) => {
+                    println!("peer network: {}", message.network);
+                    println!("peer version: {}", message.version);
+                    if let Some(name) = message.node_name {
+                        println!("peer node name: {name}");
+                    }
+                }
+                other => {
+                    return Err(format!("unexpected first response: {other:?}"));
+                }
+            }
+
+            match remote_tip {
+                WireMessage::Tip(summary) => {
+                    println!("peer tip: {}", format_hash(summary.tip));
+                    println!(
+                        "peer height: {}",
+                        summary
+                            .height
+                            .map(|height| height.to_string())
+                            .unwrap_or_else(|| "<none>".to_string())
+                    );
+                }
+                other => {
+                    return Err(format!("unexpected second response: {other:?}"));
+                }
+            }
+
+            Ok(())
+        }
         "submit-transfer" => {
             if args.len() != 8 {
                 return Err(usage());
@@ -380,6 +440,7 @@ fn usage() -> String {
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
         "  wobble serve <snapshot> <listen_addr> <network> [node_name]",
+        "  wobble get-tip <peer_addr> <network> [node_name]",
         "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
