@@ -10,6 +10,7 @@
 //! - `chain_entries` stores per-block indexing facts used for fork choice, such
 //!   as height, cumulative work, and parent linkage
 //! - `active_utxos` stores the current active-chain unspent outputs
+//! - `mempool_transactions` stores the current pending transaction set
 //! - `metadata` stores singleton node-level values such as the current best tip
 
 use std::path::Path;
@@ -17,8 +18,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
+    mempool::Mempool,
     state::UtxoSet,
-    types::{Block, BlockHash, ChainIndexEntry, OutPoint, TxOut, Txid, Utxo},
+    types::{Block, BlockHash, ChainIndexEntry, OutPoint, Transaction, TxOut, Txid, Utxo},
 };
 
 #[derive(Debug)]
@@ -224,6 +226,44 @@ impl SqliteStore {
         Ok(utxos)
     }
 
+    /// Replaces the persisted mempool transaction set with `mempool`.
+    pub fn save_mempool(&self, mempool: &Mempool) -> Result<(), SqliteStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM mempool_transactions", [])?;
+        for (txid, transaction) in mempool.iter() {
+            let bytes = bincode::serde::encode_to_vec(transaction, bincode::config::standard())?;
+            tx.execute(
+                "INSERT INTO mempool_transactions (txid, transaction_bytes) VALUES (?1, ?2)",
+                params![txid.to_string(), bytes],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted mempool transaction set keyed by transaction id.
+    pub fn load_mempool(&self) -> Result<Mempool, SqliteStoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT txid, transaction_bytes FROM mempool_transactions")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut transactions = Vec::new();
+        for row in rows {
+            let (txid_text, transaction_bytes) = row?;
+            let parsed_txid = parse_txid(&txid_text)?;
+            let (transaction, _): (Transaction, usize) =
+                bincode::serde::decode_from_slice(&transaction_bytes, bincode::config::standard())?;
+            if transaction.txid() != parsed_txid {
+                return Err(SqliteStoreError::InvalidHashHex(txid_text));
+            }
+            transactions.push((parsed_txid, transaction));
+        }
+        Ok(Mempool::from_persisted(transactions))
+    }
+
     fn initialize_schema(&self) -> Result<(), SqliteStoreError> {
         self.connection.execute_batch(
             "BEGIN;
@@ -245,6 +285,10 @@ impl SqliteStore {
                  created_at_height INTEGER NOT NULL,
                  is_coinbase INTEGER NOT NULL,
                  PRIMARY KEY (txid, vout)
+             );
+             CREATE TABLE IF NOT EXISTS mempool_transactions (
+                 txid TEXT PRIMARY KEY,
+                 transaction_bytes BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS metadata (
                  key TEXT PRIMARY KEY,
@@ -308,10 +352,11 @@ mod tests {
     };
 
     use crate::{
+        mempool::Mempool,
         state::UtxoSet,
         types::{
-            Block, BlockHash, BlockHeader, ChainIndexEntry, OutPoint, Transaction, TxOut, Txid,
-            Utxo,
+            Block, BlockHash, BlockHeader, ChainIndexEntry, OutPoint, Transaction, TxIn, TxOut,
+            Txid, Utxo,
         },
     };
 
@@ -428,5 +473,37 @@ mod tests {
                 vout: 1,
             })
         );
+    }
+
+    #[test]
+    fn round_trips_mempool_transactions() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let transaction = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::new([0x22; 32]),
+                    vout: 0,
+                },
+                unlocking_data: vec![0x01, 0x02],
+            }],
+            outputs: vec![TxOut {
+                value: 9,
+                locking_data: vec![0xaa],
+            }],
+            lock_time: 3,
+        };
+        let txid = transaction.txid();
+        let mempool = Mempool::from_persisted(vec![(txid, transaction.clone())]);
+
+        store.save_mempool(&mempool).unwrap();
+
+        let loaded = store.load_mempool().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&txid), Some(&transaction));
     }
 }

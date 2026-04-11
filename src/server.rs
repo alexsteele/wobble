@@ -164,10 +164,14 @@ impl Server {
             return Ok(());
         };
         let Some(block_hash) = request_block_hash.or_else(|| mined_block_hash(replies)) else {
+            let store = sqlite_store::SqliteStore::open(path)?;
+            store.save_active_utxos(self.state.active_utxos())?;
+            store.save_mempool(self.state.mempool())?;
             return Ok(());
         };
         let store = sqlite_store::SqliteStore::open(path)?;
         store.save_active_utxos(self.state.active_utxos())?;
+        store.save_mempool(self.state.mempool())?;
         let Some(block) = self.state.get_block(&block_hash) else {
             return Ok(());
         };
@@ -469,6 +473,43 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert!(loaded.mempool().get(&txid).is_some());
+    }
+
+    #[test]
+    fn persists_mempool_to_sqlite_after_transaction_message() {
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
+        let txid = transaction.txid();
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let sqlite_path = temp_sqlite_path();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), state)
+            .with_sqlite_path(&sqlite_path);
+
+        server
+            .handle_message(WireMessage::AnnounceTx { transaction })
+            .unwrap();
+
+        let store = SqliteStore::open(&sqlite_path).unwrap();
+        let loaded_mempool = store.load_mempool().unwrap();
+        drop(store);
+        fs::remove_file(&sqlite_path).unwrap();
+
+        assert_eq!(
+            loaded_mempool.get(&txid),
+            server.state().mempool().get(&txid)
+        );
     }
 
     #[test]

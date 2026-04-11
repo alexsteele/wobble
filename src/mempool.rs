@@ -55,6 +55,21 @@ impl Mempool {
         self.transactions.get(txid)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&Txid, &Transaction)> {
+        self.transactions.iter()
+    }
+
+    /// Rebuilds a mempool from previously persisted transactions without
+    /// reapplying admission policy.
+    ///
+    /// This is used only for trusted local persistence restore paths. Live
+    /// network and CLI admission must continue to go through `submit`.
+    pub fn from_persisted(transactions: Vec<(Txid, Transaction)>) -> Self {
+        Self {
+            transactions: transactions.into_iter().collect(),
+        }
+    }
+
     /// Validates `tx` against the current active UTXO state before admission.
     ///
     /// Admission rejects duplicate transaction ids, transactions that fail

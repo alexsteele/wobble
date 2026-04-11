@@ -600,6 +600,17 @@ fn validate_sqlite_bootstrap(sqlite_path: &Path, snapshot_state: &NodeState) -> 
         ));
     }
 
+    let sqlite_mempool = store
+        .load_mempool()
+        .map_err(|err| format!("sqlite mempool load failed: {err:?}"))?;
+    if !mempools_match(snapshot_state.mempool(), &sqlite_mempool) {
+        return Err(format!(
+            "sqlite mempool mismatch: snapshot={} sqlite={}",
+            snapshot_state.mempool().len(),
+            sqlite_mempool.len()
+        ));
+    }
+
     Ok(())
 }
 
@@ -610,6 +621,14 @@ fn utxo_sets_match(left: &wobble::state::UtxoSet, right: &wobble::state::UtxoSet
 
     left.iter()
         .all(|(outpoint, utxo)| right.get(outpoint) == Some(utxo))
+}
+
+fn mempools_match(left: &wobble::mempool::Mempool, right: &wobble::mempool::Mempool) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter().all(|(txid, tx)| right.get(txid) == Some(tx))
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64, String> {
