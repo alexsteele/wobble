@@ -37,6 +37,8 @@
 ## Testing
 
 - Add property tests and adversarial fork/restart scenarios.
+- Add a `test-net` command that can provision wobble nodes across configured hosts over SSH, start them with generated configs, and drive random transactions and mining activity.
+- Add a `test-net --local` mode that reuses the local test harness, spins up multiple local nodes, and fuzzes actions like payments, mining, restart, and reconnect.
 
 ## Later
 
