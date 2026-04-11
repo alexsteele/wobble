@@ -20,76 +20,86 @@ Already implemented:
 - transaction announcement
 - block announcement
 - remote mining trigger
-
-Still missing for a convincing multi-node testnet:
-- configured peer set per running server
-- automatic relay of newly accepted transactions
-- automatic relay of newly accepted or mined blocks
-- an explicit multi-node integration test that exercises the whole path
-
-Implemented in the first slice:
 - configured peer set on `Server`
 - optional peer bootstrap file for `wobble serve --peers_path <path>`
 - best-effort transaction relay for newly accepted transactions
 - best-effort relay hooks for newly accepted and newly mined blocks
+- outbound client handshake helper used by remote CLI flows
 - feature-gated integration test target at `tests/testnet_e2e.rs`
+- end-to-end proposer -> miner -> proposer flow over real TCP
+
+What the current E2E test proves:
+- a proposer-facing node accepts a payment transaction
+- the miner node learns that transaction through relay
+- the miner mines the transaction into a block
+- the proposer node learns the mined block through relay
+- both nodes converge on the same tip and balances
 
 Current limitation:
 - relay is still short-lived request/response TCP rather than persistent peer sessions
 - origin suppression now prefers the advertised listener address from `hello`
   and falls back to `node_name` only when that address is unavailable
+- the scripted E2E coverage is still only the direct two-node proposer/miner path
 
 ## Implementation Plan
 
-### 1. Best-Effort Peer Relay
+### 1. Manual Testnet Flow
 
-Add a small peer list to `Server`.
+Document a concrete two-node CLI flow in the README.
 
 Behavior:
-- when a transaction is newly accepted, relay it to configured peers
-- when a block is newly accepted from a peer, relay it to configured peers
-- when a block is mined locally, relay it to configured peers
+- initialize two SQLite-backed nodes
+- start both servers with peer bootstrap files
+- submit a payment to one node
+- mine on the other node
+- inspect balances and tips from the CLI
 
 Rules:
-- relay is best effort
-- local acceptance must not fail just because a peer is unavailable
-- duplicate objects should be treated as already known, not as fatal protocol errors
+- keep the flow short and reproducible
+- prefer commands that match the current real code path
+- use it to expose rough edges in CLI ergonomics before larger networking work
 
-### 2. Separate Integration Test Target
+### 2. Restart And Persistence E2E
 
-Add a feature-gated integration test under `tests/testnet_e2e.rs`.
+Add a feature-gated scenario that covers restart behavior.
 
-Why feature-gated:
-- it uses real local TCP sockets
-- it is slower and more orchestration-heavy than unit tests
-- it should not run in the default `cargo test` unit path
+Flow:
+1. submit a payment to a node
+2. persist the node state
+3. restart the process from SQLite
+4. verify the mempool or best-tip state survives as expected
+5. complete mining and convergence after restart
 
-Expected command:
+### 3. Multi-Hop Relay E2E
 
-```text
-cargo test --features e2e --test testnet_e2e
-```
-
-### 3. First E2E Scenario
-
-Two nodes:
+Add a three-node scenario:
 - node A: proposer-facing node
-- node B: miner node
+- node B: relay node
+- node C: miner node
 
 Connections:
 - A knows peer B
-- B knows peer A
+- B knows peers A and C
+- C knows peer B
 
 Flow:
-1. initialize node A and node B state
-2. give node A spendable funds
-3. start both servers on local TCP ports
-4. submit a payment to node A
-5. assert node B learns the transaction through relay
-6. trigger mining on node B
-7. assert node A learns the mined block through relay
-8. assert both nodes share the same best tip
-9. assert the mined block contains the submitted transaction
+1. submit a payment to node A
+2. verify node B relays it onward to node C
+3. mine on node C
+4. verify the mined block returns through node B to node A
+5. assert all three nodes converge on the same tip
+
+### 4. Catch-Up After Missed Blocks
+
+Prove that a node that misses a block can reconnect and catch up with the
+existing `get_tip` / `get_block` path.
+
+Flow:
+1. take one node offline
+2. submit and mine while it is absent
+3. reconnect it
+4. fetch the missing block segment
+5. assert it reaches the same best tip as the live nodes
 
 ## Non-Goals For This Slice
 
@@ -104,7 +114,13 @@ Do not add yet:
 
 ## Exit Criteria
 
-We consider this slice complete when:
+We consider the current slice complete when:
 - a separate feature-gated integration test proves the proposer-to-miner-to-peer path
 - the path works over the real TCP protocol
 - normal unit tests stay fast and unchanged
+
+We consider the next testnet slice complete when:
+- the README shows a real manual two-node flow
+- restart/persistence is covered by an end-to-end test
+- a multi-hop relay scenario is covered by an end-to-end test
+- reconnect and catch-up after missed blocks is covered by an end-to-end test
