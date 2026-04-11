@@ -4,6 +4,8 @@ use wobble::{
     aliases::{self, AliasBook},
     crypto,
     node_state::NodeState,
+    peer::PeerConfig,
+    server::Server,
     store,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
@@ -188,6 +190,34 @@ fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        "serve" => {
+            if args.len() != 5 && args.len() != 6 {
+                return Err(usage());
+            }
+
+            let snapshot_path = Path::new(&args[2]);
+            let listen_addr = &args[3];
+            let network = args[4].clone();
+            let node_name = args.get(5).cloned();
+            let state = store::load_node_state(snapshot_path)
+                .map_err(|err| format!("load failed: {err:?}"))?;
+            let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state);
+
+            println!("serving snapshot {}", snapshot_path.display());
+            println!("listen addr: {listen_addr}");
+            println!("network: {network}");
+            if let Some(name) = server.config().node_name.as_deref() {
+                println!("node name: {name}");
+            }
+            println!(
+                "best tip: {}",
+                format_hash(server.state().chain().best_tip())
+            );
+
+            server
+                .serve(listen_addr)
+                .map_err(|err| format!("server failed: {err}"))
+        }
         "submit-transfer" => {
             if args.len() != 8 {
                 return Err(usage());
@@ -349,6 +379,7 @@ fn usage() -> String {
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
+        "  wobble serve <snapshot> <listen_addr> <network> [node_name]",
         "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
         "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
         "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
