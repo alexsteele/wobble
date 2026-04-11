@@ -3,14 +3,15 @@
 //! This module owns the small amount of logic needed to connect to a remote
 //! peer, send the local `hello`, and validate that the first response is also a
 //! `hello`. Keeping that flow here avoids repeating the same handshake code in
-//! each remote CLI command.
+//! each remote CLI command. It also provides a couple of one-shot request
+//! helpers for explicit tip and block fetches during sync tests.
 
 use std::{io, net::TcpStream};
 
 use crate::{
     net,
     peer::PeerConfig,
-    wire::{HelloMessage, PROTOCOL_VERSION, WireMessage},
+    wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
 
 /// Errors returned while opening and handshaking an outbound peer connection.
@@ -20,6 +21,15 @@ pub enum ClientError {
     SendHello(io::Error),
     ReceiveHello(io::Error),
     UnexpectedHandshake(WireMessage),
+}
+
+/// Errors returned by one-shot peer requests after handshake succeeds.
+#[derive(Debug)]
+pub enum RequestError {
+    Handshake(ClientError),
+    Send(io::Error),
+    Receive(io::Error),
+    UnexpectedResponse(WireMessage),
 }
 
 /// Opens a TCP connection to `peer_addr`, performs the protocol handshake, and
@@ -51,16 +61,67 @@ pub fn connect_and_handshake(
     Ok((stream, message))
 }
 
+/// Opens a one-shot connection, asks the peer for its current best tip, and
+/// returns the advertised summary.
+pub fn request_tip(peer_addr: &str, config: &PeerConfig) -> Result<TipSummary, RequestError> {
+    let (mut stream, _) =
+        connect_and_handshake(peer_addr, config).map_err(RequestError::Handshake)?;
+    net::send_message(&mut stream, &WireMessage::GetTip).map_err(RequestError::Send)?;
+    let reply = net::receive_message(&mut stream).map_err(RequestError::Receive)?;
+    let WireMessage::Tip(summary) = reply else {
+        return Err(RequestError::UnexpectedResponse(reply));
+    };
+    Ok(summary)
+}
+
+/// Opens a one-shot connection, requests a specific block by hash, and returns
+/// the remote response, which may be `None` when the peer does not know it.
+pub fn request_block(
+    peer_addr: &str,
+    config: &PeerConfig,
+    block_hash: crate::types::BlockHash,
+) -> Result<Option<crate::types::Block>, RequestError> {
+    let (mut stream, _) =
+        connect_and_handshake(peer_addr, config).map_err(RequestError::Handshake)?;
+    net::send_message(&mut stream, &WireMessage::GetBlock { block_hash })
+        .map_err(RequestError::Send)?;
+    let reply = net::receive_message(&mut stream).map_err(RequestError::Receive)?;
+    let WireMessage::Block { block } = reply else {
+        return Err(RequestError::UnexpectedResponse(reply));
+    };
+    Ok(block)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::TcpListener, thread};
 
     use crate::{
-        client::{ClientError, connect_and_handshake},
+        client::{ClientError, RequestError, connect_and_handshake, request_block, request_tip},
         net,
         peer::PeerConfig,
-        wire::{HelloMessage, WireMessage},
+        types::{Block, BlockHash, BlockHeader, Transaction},
+        wire::{HelloMessage, TipSummary, WireMessage},
     };
+
+    fn sample_block() -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::new([0x11; 32]),
+                merkle_root: [0x22; 32],
+                time: 123,
+                bits: 0x207f_ffff,
+                nonce: 42,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: 7,
+            }],
+        }
+    }
 
     fn connected_listener() -> (TcpListener, String) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -118,6 +179,110 @@ mod tests {
         assert!(matches!(
             err,
             ClientError::UnexpectedHandshake(WireMessage::GetTip)
+        ));
+    }
+
+    #[test]
+    fn request_tip_returns_remote_tip_summary() {
+        let (listener, addr) = connected_listener();
+
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = net::receive_message(&mut stream).unwrap();
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: 1,
+                    node_name: Some("server".to_string()),
+                    advertised_addr: None,
+                    tip: None,
+                    height: None,
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut stream).unwrap();
+            assert_eq!(request, WireMessage::GetTip);
+            net::send_message(
+                &mut stream,
+                &WireMessage::Tip(TipSummary {
+                    tip: Some(BlockHash::new([0x55; 32])),
+                    height: Some(8),
+                }),
+            )
+            .unwrap();
+        });
+
+        let summary = request_tip(&addr, &PeerConfig::new("wobble-local", None)).unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(summary.tip, Some(BlockHash::new([0x55; 32])));
+        assert_eq!(summary.height, Some(8));
+    }
+
+    #[test]
+    fn request_block_returns_optional_block_payload() {
+        let (listener, addr) = connected_listener();
+        let block = sample_block();
+        let block_hash = block.header.block_hash();
+        let expected = block.clone();
+
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = net::receive_message(&mut stream).unwrap();
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: 1,
+                    node_name: Some("server".to_string()),
+                    advertised_addr: None,
+                    tip: None,
+                    height: None,
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut stream).unwrap();
+            assert_eq!(request, WireMessage::GetBlock { block_hash });
+            net::send_message(&mut stream, &WireMessage::Block { block: Some(block) }).unwrap();
+        });
+
+        let fetched =
+            request_block(&addr, &PeerConfig::new("wobble-local", None), block_hash).unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(fetched, Some(expected));
+    }
+
+    #[test]
+    fn request_tip_rejects_wrong_response_type() {
+        let (listener, addr) = connected_listener();
+
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = net::receive_message(&mut stream).unwrap();
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: 1,
+                    node_name: Some("server".to_string()),
+                    advertised_addr: None,
+                    tip: None,
+                    height: None,
+                }),
+            )
+            .unwrap();
+            let _ = net::receive_message(&mut stream).unwrap();
+            net::send_message(&mut stream, &WireMessage::GetTip).unwrap();
+        });
+
+        let err = request_tip(&addr, &PeerConfig::new("wobble-local", None)).unwrap_err();
+        worker.join().unwrap();
+
+        assert!(matches!(
+            err,
+            RequestError::UnexpectedResponse(WireMessage::GetTip)
         ));
     }
 }

@@ -2,7 +2,9 @@
 //!
 //! This feature-gated integration test keeps the slower proposer-to-miner flow
 //! out of the default unit-test path while still exercising the live network
-//! stack.
+//! stack. Current sync coverage is still explicit and pull-based: a lagging
+//! node asks a live peer for tip and missing blocks rather than relying on an
+//! automatic background catch-up loop.
 
 #![cfg(feature = "e2e")]
 
@@ -16,13 +18,15 @@ use std::{
 };
 
 use wobble::{
-    crypto, net,
+    client, crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
     server::{PeerEndpoint, Server},
     sqlite_store::SqliteStore,
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
-    wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
+    wire::{
+        HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage,
+    },
 };
 
 fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
@@ -278,6 +282,33 @@ impl TestNet {
         };
         drop(client);
         block_hash
+    }
+
+    /// Polls a live peer for its currently advertised best tip summary.
+    fn request_tip(&self, node_name: &str) -> TipSummary {
+        client::request_tip(
+            self.addr(node_name),
+            &PeerConfig::new("wobble-local", Some("sync-client".to_string())),
+        )
+        .unwrap()
+    }
+
+    /// Fetches one concrete block from a live peer by hash during explicit sync.
+    fn request_block(&self, node_name: &str, block_hash: BlockHash) -> Option<Block> {
+        client::request_block(
+            self.addr(node_name),
+            &PeerConfig::new("wobble-local", Some("sync-client".to_string())),
+            block_hash,
+        )
+        .unwrap()
+    }
+
+    /// Pushes a fetched block into another node the same way a relayed block
+    /// announcement would arrive over the normal network path.
+    fn announce_block(&self, node_name: &str, block: Block) {
+        let mut client = connect_and_handshake(self.addr(node_name), "sync-client");
+        net::send_message(&mut client, &WireMessage::AnnounceBlock { block }).unwrap();
+        drop(client);
     }
 
     fn sync_delay(&self) {
@@ -559,4 +590,85 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
         miner_server.state().balance_for_key(&miner.verifying_key()),
         50
     );
+}
+
+#[test]
+fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
+    let sender = crypto::signing_key_from_bytes([31; 32]);
+    let recipient = crypto::signing_key_from_bytes([32; 32]);
+    let miner = crypto::signing_key_from_bytes([33; 32]);
+    let genesis = mine_block(
+        BlockHash::default(),
+        0x207f_ffff,
+        &sender.verifying_key(),
+        0,
+    );
+    let spendable = OutPoint {
+        txid: genesis.transactions[0].txid(),
+        vout: 0,
+    };
+    let payment = spend_with_change(spendable, &sender, &recipient.verifying_key(), 30, 20, 1);
+    let payment_txid = payment.txid();
+
+    let mut proposer_state = NodeState::new();
+    proposer_state.accept_block(genesis.clone()).unwrap();
+    let mut miner_state = NodeState::new();
+    miner_state.accept_block(genesis.clone()).unwrap();
+    let mut observer_state = NodeState::new();
+    observer_state.accept_block(genesis).unwrap();
+
+    let mut testnet = TestNet::new();
+    testnet.add_node("proposer", &["miner"]);
+    testnet.add_node("miner", &["proposer"]);
+    testnet.add_node("observer", &[]);
+
+    // The observer stays offline while the payment is proposed and mined, so it
+    // must later discover the new tip and pull the missing block explicitly.
+    let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
+    // The miner must stay online for the later explicit `get_tip` and
+    // `get_block` catch-up requests from the observer.
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 4);
+
+    testnet.submit_payment("proposer", payment.clone());
+    testnet.sync_delay();
+    let block_hash = testnet.mine_pending("miner", &miner);
+    testnet.sync_delay();
+
+    let observer = testnet.start("observer", NodeBootstrap::State(observer_state), 1);
+
+    let remote_tip = testnet.request_tip("miner");
+    assert_eq!(remote_tip.tip, Some(block_hash));
+    assert_eq!(remote_tip.height, Some(1));
+
+    let missing_block = testnet
+        .request_block("miner", block_hash)
+        .expect("miner should serve the new tip block");
+    assert_eq!(missing_block.transactions.len(), 2);
+    assert_eq!(missing_block.transactions[1].txid(), payment_txid);
+
+    testnet.announce_block("observer", missing_block);
+
+    let proposer = proposer.join();
+    let miner_server = miner_server.join();
+    let observer = observer.join();
+
+    assert_eq!(observer.state().chain().best_tip(), Some(block_hash));
+    assert_eq!(
+        observer.state().chain().best_tip(),
+        proposer.state().chain().best_tip()
+    );
+    assert_eq!(
+        observer.state().chain().best_tip(),
+        miner_server.state().chain().best_tip()
+    );
+    assert!(observer.state().mempool().is_empty());
+    assert_eq!(
+        observer.state().balance_for_key(&recipient.verifying_key()),
+        30
+    );
+    assert_eq!(
+        observer.state().balance_for_key(&sender.verifying_key()),
+        20
+    );
+    assert_eq!(observer.state().balance_for_key(&miner.verifying_key()), 50);
 }
