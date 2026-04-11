@@ -9,8 +9,11 @@
 
 use crate::{
     state::{UtxoSet, ValidationError},
-    types::{Block, BlockHash, BlockHeight},
+    types::{Amount, Block, BlockHash, BlockHeight, Transaction},
 };
+
+/// Fixed block reward paid to the coinbase transaction before any included fees.
+pub const BLOCK_SUBSIDY: Amount = 50;
 
 /// Expanded 256-bit proof-of-work threshold represented as a big-endian integer.
 ///
@@ -96,6 +99,7 @@ pub enum ConsensusError {
     BadMerkleRoot,
     FirstTransactionNotCoinbase,
     MultipleCoinbaseTransactions,
+    CoinbaseRewardTooLarge { allowed: Amount, actual: Amount },
     InvalidPowTarget,
     InsufficientProofOfWork,
     Transaction(ValidationError),
@@ -110,11 +114,39 @@ pub fn apply_block(
     validate_block(block)?;
 
     let mut candidate = utxos.clone();
-    for tx in &block.transactions {
+    let mut total_fees = 0_u64;
+    for tx in &block.transactions[1..] {
+        let fee = candidate
+            .transaction_fee(tx)
+            .map_err(ConsensusError::Transaction)?;
+        total_fees = total_fees
+            .checked_add(fee)
+            .ok_or(ConsensusError::Transaction(
+                ValidationError::InputValueOverflow,
+            ))?;
         candidate
             .apply_transaction(tx, height)
             .map_err(ConsensusError::Transaction)?;
     }
+
+    let allowed_reward =
+        BLOCK_SUBSIDY
+            .checked_add(total_fees)
+            .ok_or(ConsensusError::Transaction(
+                ValidationError::InputValueOverflow,
+            ))?;
+    let actual_reward =
+        sum_transaction_outputs(&block.transactions[0]).map_err(ConsensusError::Transaction)?;
+    if actual_reward > allowed_reward {
+        return Err(ConsensusError::CoinbaseRewardTooLarge {
+            allowed: allowed_reward,
+            actual: actual_reward,
+        });
+    }
+
+    candidate
+        .apply_transaction(&block.transactions[0], height)
+        .map_err(ConsensusError::Transaction)?;
 
     *utxos = candidate;
     Ok(())
@@ -168,6 +200,14 @@ fn validate_header_pow(block: &Block) -> Result<(), ConsensusError> {
     Ok(())
 }
 
+fn sum_transaction_outputs(tx: &Transaction) -> Result<Amount, ValidationError> {
+    tx.outputs.iter().try_fold(0_u64, |total, output| {
+        total
+            .checked_add(output.value)
+            .ok_or(ValidationError::OutputValueOverflow)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -176,7 +216,7 @@ mod tests {
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut, Txid},
     };
 
-    use super::{ConsensusError, PowTarget, apply_block, validate_block};
+    use super::{BLOCK_SUBSIDY, ConsensusError, PowTarget, apply_block, validate_block};
 
     // `uniqueness` perturbs the coinbase so separate test blocks do not reuse
     // the same transaction id for otherwise identical rewards.
@@ -240,7 +280,7 @@ mod tests {
 
     #[test]
     fn applies_valid_block_atomically() {
-        let genesis = mine_block(vec![coinbase(50, 0)]);
+        let genesis = mine_block(vec![coinbase(BLOCK_SUBSIDY, 0)]);
         let mut utxos = UtxoSet::new();
         apply_block(&mut utxos, &genesis, 0).unwrap();
 
@@ -248,7 +288,7 @@ mod tests {
             txid: genesis.transactions[0].txid(),
             vout: 0,
         };
-        let block = mine_block(vec![coinbase(50, 1), spend(spendable, 30)]);
+        let block = mine_block(vec![coinbase(BLOCK_SUBSIDY + 20, 1), spend(spendable, 30)]);
 
         apply_block(&mut utxos, &block, 1).unwrap();
 
@@ -313,7 +353,7 @@ mod tests {
                 bits: 0x207f_ffff,
                 nonce: 0,
             },
-            transactions: vec![coinbase(50, 0), coinbase(25, 1)],
+            transactions: vec![coinbase(BLOCK_SUBSIDY, 0), coinbase(25, 1)],
         };
         block.header.merkle_root = block.merkle_root();
         mine_header_pow(&mut block);
@@ -326,7 +366,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_merkle_root() {
-        let mut block = mine_block(vec![coinbase(50, 0)]);
+        let mut block = mine_block(vec![coinbase(BLOCK_SUBSIDY, 0)]);
         block.header.merkle_root = [0xff; 32];
         mine_header_pow(&mut block);
 
@@ -335,7 +375,7 @@ mod tests {
 
     #[test]
     fn rejects_insufficient_proof_of_work() {
-        let mut block = mine_block(vec![coinbase(50, 0)]);
+        let mut block = mine_block(vec![coinbase(BLOCK_SUBSIDY, 0)]);
         block.header.bits = 0x0100_0001;
 
         assert_eq!(
@@ -357,7 +397,7 @@ mod tests {
 
     #[test]
     fn block_application_is_atomic_on_transaction_failure() {
-        let valid = mine_block(vec![coinbase(50, 0)]);
+        let valid = mine_block(vec![coinbase(BLOCK_SUBSIDY, 0)]);
         let mut utxos = UtxoSet::new();
         apply_block(&mut utxos, &valid, 0).unwrap();
         let before = utxos.clone();
@@ -366,7 +406,7 @@ mod tests {
             txid: Txid::new([9; 32]),
             vout: 0,
         };
-        let invalid = mine_block(vec![coinbase(50, 1), spend(missing, 10)]);
+        let invalid = mine_block(vec![coinbase(BLOCK_SUBSIDY, 1), spend(missing, 10)]);
 
         assert!(matches!(
             apply_block(&mut utxos, &invalid, 1),
@@ -401,5 +441,26 @@ mod tests {
         assert_eq!(PowTarget::from_compact(0), None);
         assert_eq!(PowTarget::from_compact(0x1d800001), None);
         assert_eq!(PowTarget::from_compact(0x21010000), None);
+    }
+
+    #[test]
+    fn rejects_coinbase_reward_larger_than_subsidy_plus_fees() {
+        let genesis = mine_block(vec![coinbase(BLOCK_SUBSIDY, 0)]);
+        let mut utxos = UtxoSet::new();
+        apply_block(&mut utxos, &genesis, 0).unwrap();
+
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let block = mine_block(vec![coinbase(BLOCK_SUBSIDY + 21, 1), spend(spendable, 30)]);
+
+        assert_eq!(
+            apply_block(&mut utxos, &block, 1),
+            Err(ConsensusError::CoinbaseRewardTooLarge {
+                allowed: BLOCK_SUBSIDY + 20,
+                actual: BLOCK_SUBSIDY + 21,
+            })
+        );
     }
 }

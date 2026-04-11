@@ -65,16 +65,26 @@ impl UtxoSet {
         self.validate_transaction_inner(tx).map(|_| ())
     }
 
+    /// Returns the fee paid by `tx` after validating its inputs and outputs.
+    ///
+    /// For non-coinbase transactions, the fee is the total referenced input
+    /// value minus the total output value. Any value not assigned to outputs is
+    /// implicitly paid to the miner as a transaction fee.
+    pub fn transaction_fee(&self, tx: &Transaction) -> Result<Amount, ValidationError> {
+        let validation = self.validate_transaction_inner(tx)?;
+        Ok(validation.fee)
+    }
+
     /// Validates `tx`, removes any spent inputs, and inserts its newly created outputs.
     pub fn apply_transaction(
         &mut self,
         tx: &Transaction,
         height: BlockHeight,
     ) -> Result<(), ValidationError> {
-        let spent_inputs = self.validate_transaction_inner(tx)?;
+        let validation = self.validate_transaction_inner(tx)?;
 
         if !tx.is_coinbase() {
-            for outpoint in spent_inputs {
+            for outpoint in validation.spent_inputs {
                 self.entries.remove(&outpoint);
             }
         }
@@ -97,7 +107,7 @@ impl UtxoSet {
     fn validate_transaction_inner(
         &self,
         tx: &Transaction,
-    ) -> Result<Vec<OutPoint>, ValidationError> {
+    ) -> Result<ValidationResult, ValidationError> {
         // Reject transactions that create no new spendable outputs.
         if tx.outputs.is_empty() {
             return Err(ValidationError::EmptyOutputs);
@@ -107,7 +117,10 @@ impl UtxoSet {
 
         // Coinbase creates value directly and does not consume prior UTXOs.
         if tx.is_coinbase() {
-            return Ok(Vec::new());
+            return Ok(ValidationResult {
+                spent_inputs: Vec::new(),
+                fee: 0,
+            });
         }
 
         let mut seen_inputs = HashSet::new();
@@ -147,12 +160,20 @@ impl UtxoSet {
             });
         }
 
-        Ok(tx
-            .inputs
-            .iter()
-            .map(|input| input.previous_output)
-            .collect())
+        Ok(ValidationResult {
+            spent_inputs: tx
+                .inputs
+                .iter()
+                .map(|input| input.previous_output)
+                .collect(),
+            fee: input_value - output_value,
+        })
     }
+}
+
+struct ValidationResult {
+    spent_inputs: Vec<OutPoint>,
+    fee: Amount,
 }
 
 fn sum_outputs(outputs: &[TxOut]) -> Result<Amount, ValidationError> {
@@ -226,6 +247,7 @@ mod tests {
             ],
         );
 
+        assert_eq!(set.transaction_fee(&tx).unwrap(), 0);
         set.apply_transaction(&tx, 2).unwrap();
 
         assert!(set.get(&utxo.outpoint).is_none());
@@ -326,6 +348,94 @@ mod tests {
                 output_value: 11,
             })
         );
+    }
+
+    #[test]
+    fn reports_transaction_fee() {
+        let utxo = spendable_utxo(10);
+        let mut set = UtxoSet::new();
+        set.insert(utxo.clone());
+
+        let tx = spending_transaction(
+            utxo.outpoint,
+            vec![TxOut {
+                value: 7,
+                locking_data: crypto::verifying_key_bytes(
+                    &crypto::signing_key_from_bytes([9; 32]).verifying_key(),
+                )
+                .to_vec(),
+            }],
+        );
+
+        assert_eq!(set.transaction_fee(&tx).unwrap(), 3);
+    }
+
+    #[test]
+    fn reports_transaction_fee_for_multiple_inputs() {
+        let owner = crypto::signing_key_from_bytes([7; 32]);
+        // Two inputs contribute 10 + 15 units of spendable value.
+        let left = Utxo {
+            outpoint: OutPoint {
+                txid: Txid::new([0x10; 32]),
+                vout: 0,
+            },
+            output: TxOut {
+                value: 10,
+                locking_data: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            },
+            created_at_height: 1,
+            is_coinbase: false,
+        };
+        let right = Utxo {
+            outpoint: OutPoint {
+                txid: Txid::new([0x20; 32]),
+                vout: 0,
+            },
+            output: TxOut {
+                value: 15,
+                locking_data: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            },
+            created_at_height: 1,
+            is_coinbase: false,
+        };
+        let recipient = crypto::signing_key_from_bytes([9; 32]);
+        let change_owner = crypto::signing_key_from_bytes([11; 32]);
+        let mut set = UtxoSet::new();
+        set.insert(left.clone());
+        set.insert(right.clone());
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: left.outpoint,
+                    unlocking_data: Vec::new(),
+                },
+                TxIn {
+                    previous_output: right.outpoint,
+                    unlocking_data: Vec::new(),
+                },
+            ],
+            // Outputs assign 20 units to the recipient and 3 back as change.
+            outputs: vec![
+                TxOut {
+                    value: 20,
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                },
+                TxOut {
+                    value: 3,
+                    locking_data: crypto::verifying_key_bytes(&change_owner.verifying_key())
+                        .to_vec(),
+                },
+            ],
+            lock_time: 0,
+        };
+        let signature = crypto::sign_message(&owner, &tx.signing_digest()).to_vec();
+        tx.inputs[0].unlocking_data = signature.clone();
+        tx.inputs[1].unlocking_data = signature;
+
+        // Fee = total inputs (25) - total outputs (23) = 2.
+        assert_eq!(set.transaction_fee(&tx).unwrap(), 2);
     }
 
     #[test]

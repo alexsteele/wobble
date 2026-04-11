@@ -13,7 +13,7 @@ use crate::{
     consensus::{self, ConsensusError},
     crypto,
     mempool::{Mempool, MempoolError},
-    state::UtxoSet,
+    state::{UtxoSet, ValidationError},
     types::{
         Amount, Block, BlockHash, BlockHeader, BlockHeight, OutPoint, Transaction, TxIn, TxOut,
         Txid,
@@ -25,6 +25,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 pub enum NodeStateError {
     Chain(ChainError),
     Consensus(ConsensusError),
+    ConsensusFee(ValidationError),
     Mempool(MempoolError),
     InsufficientFunds {
         requested: Amount,
@@ -169,7 +170,7 @@ impl NodeState {
     /// valid pending transactions, then accepts it into node state.
     pub fn mine_block(
         &mut self,
-        reward: u64,
+        subsidy: u64,
         miner_verifying_key: &VerifyingKey,
         uniqueness: u32,
         bits: u32,
@@ -179,9 +180,19 @@ impl NodeState {
         let (pending, included_ids) = self
             .mempool
             .collect_valid(&self.active_utxos, max_transactions);
+        let total_fees = pending
+            .iter()
+            .try_fold(0_u64, |total, tx| {
+                self.active_utxos.transaction_fee(tx).and_then(|fee| {
+                    total
+                        .checked_add(fee)
+                        .ok_or(ValidationError::InputValueOverflow)
+                })
+            })
+            .map_err(NodeStateError::ConsensusFee)?;
         let block = mine_block_from_transactions(
             prev,
-            reward,
+            subsidy + total_fees,
             miner_verifying_key,
             uniqueness,
             bits,
@@ -302,6 +313,7 @@ fn mine_block_from_transactions(
 
 #[cfg(test)]
 mod tests {
+    use crate::consensus::BLOCK_SUBSIDY;
     use crate::{
         crypto,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
@@ -530,13 +542,14 @@ mod tests {
             .submit_transaction(spend(spendable, &sender, &recipient.verifying_key(), 30, 2))
             .unwrap();
         let block_hash = state
-            .mine_block(50, &miner.verifying_key(), 3, 0x207f_ffff, 100)
+            .mine_block(BLOCK_SUBSIDY, &miner.verifying_key(), 3, 0x207f_ffff, 100)
             .unwrap();
         let block = state
             .get_block(&block_hash)
             .expect("mined block is indexed");
 
         assert_eq!(block.transactions.len(), 2);
+        assert_eq!(block.transactions[0].outputs[0].value, BLOCK_SUBSIDY + 20);
         assert!(state.active_utxos().get(&spendable).is_none());
         assert_eq!(state.mempool().len(), 0);
     }
@@ -604,7 +617,7 @@ mod tests {
             .submit_payment(&sender, &recipient.verifying_key(), 30, 1)
             .unwrap();
         state
-            .mine_block(50, &miner.verifying_key(), 2, 0x207f_ffff, 100)
+            .mine_block(BLOCK_SUBSIDY, &miner.verifying_key(), 2, 0x207f_ffff, 100)
             .unwrap();
 
         assert_eq!(state.balance_for_key(&sender.verifying_key()), 20);
