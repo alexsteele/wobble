@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::{
     mempool::Mempool,
@@ -78,6 +78,16 @@ impl SqliteStore {
         let store = Self { connection };
         store.initialize_schema()?;
         Ok(store)
+    }
+
+    /// Opens an existing SQLite store in read-only mode for local inspection.
+    ///
+    /// This avoids taking a write-capable handle when CLI commands only need
+    /// persisted state and a running server may already own the writable
+    /// connection.
+    pub fn open_read_only(path: &Path) -> Result<Self, SqliteStoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { connection })
     }
 
     /// Persists one accepted block together with its chain index entry and current best tip.
@@ -786,5 +796,26 @@ mod tests {
         assert_eq!(reloaded.chain().best_tip(), state.chain().best_tip());
         assert_eq!(reloaded.active_utxos().len(), state.active_utxos().len());
         assert_eq!(reloaded.mempool().get(&tx.txid()), Some(&tx));
+    }
+
+    #[test]
+    fn read_only_open_loads_persisted_state() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let block = mine_block(BlockHash::default(), 0x207f_ffff, 17);
+        let block_hash = block.header.block_hash();
+        let mut state = crate::node_state::NodeState::new();
+        state.accept_block(block).unwrap();
+        store.save_node_state(&state).unwrap();
+        drop(store);
+
+        let read_only = SqliteStore::open_read_only(&path).unwrap();
+        let rebuilt = read_only.load_node_state().unwrap();
+        drop(read_only);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(rebuilt.chain().best_tip(), Some(block_hash));
+        assert_eq!(rebuilt.active_utxos().len(), state.active_utxos().len());
+        assert_eq!(rebuilt.mempool().len(), state.mempool().len());
     }
 }

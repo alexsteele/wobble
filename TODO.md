@@ -12,6 +12,7 @@
 - Keep `submit-payment-remote` as the main send path and make it easier to use end to end.
 - Improve submit errors so users can distinguish funds, signature, policy, and connectivity failures.
 - Make recipient aliases and wallet-based sending feel first-class in the remote flow.
+- Support multiple wallets per node home so users can manage separate identities and spending keys more like a real bitcoin wallet setup.
 
 ## CLI Ergonomics
 

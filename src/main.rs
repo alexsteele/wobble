@@ -51,10 +51,8 @@ enum Command {
     Bootstrap(BootstrapCommand),
     /// Starts the local node server.
     Serve(ServeCommand),
-    /// Prints the local node wallet public key.
-    WalletAddress(HomeArg),
-    /// Prints the local node wallet balance.
-    WalletBalance(HomeArg),
+    /// Prints the local node wallet public key and live balance.
+    WalletInfo(HomeArg),
     /// Prints status from the running local node server.
     Status(HomeArg),
     /// Builds and queues a local payment from the node wallet.
@@ -372,8 +370,7 @@ fn run() -> Result<(), String> {
         Command::Init(command) => run_init(command),
         Command::Bootstrap(command) => run_bootstrap(command),
         Command::Serve(command) => run_serve(command),
-        Command::WalletAddress(command) => run_wallet_address(command),
-        Command::WalletBalance(command) => run_wallet_balance(command),
+        Command::WalletInfo(command) => run_wallet_info(command),
         Command::Status(command) => run_status(command),
         Command::SubmitPayment(command) => run_submit_payment(command),
         Command::Inspect { command } => run_inspect(command),
@@ -518,32 +515,34 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         .map_err(|err| format!("server failed: {err}"))
 }
 
-/// Prints the local node wallet address from the selected home.
-fn run_wallet_address(command: HomeArg) -> Result<(), String> {
-    let home = resolve_node_home(command.home.as_deref())?;
-    let wallet = wallet::load_wallet(&home.wallet_path())
-        .map_err(|err| format!("wallet load failed: {err:?}"))?;
-    println!(
-        "{}",
-        encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
-    );
-    Ok(())
-}
-
-/// Prints the balance for the local node wallet from the selected home.
-fn run_wallet_balance(command: HomeArg) -> Result<(), String> {
+/// Loads the local wallet and related node config used by wallet-facing commands.
+fn load_wallet_context(command: &HomeArg) -> Result<(NodeHome, NodeConfig, Wallet), String> {
     let home = resolve_node_home(command.home.as_deref())?;
     let node_config = home
         .load_config()
         .map_err(|err| format!("config load failed: {err:?}"))?;
     let wallet = wallet::load_wallet(&home.wallet_path())
         .map_err(|err| format!("wallet load failed: {err:?}"))?;
-    let balance = admin::request_balance(
-        &node_config.admin_addr,
-        crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec(),
-    )
-    .map_err(|err| format_admin_error("balance query", &node_config.admin_addr, err))?;
-    println!("{}", balance.amount);
+    Ok((home, node_config, wallet))
+}
+
+/// Prints the local wallet identity plus the best live balance available.
+///
+/// The address and persisted balance are always read from local files. This
+/// keeps the command useful even when the node server is stopped.
+fn run_wallet_info(command: HomeArg) -> Result<(), String> {
+    let (home, node_config, wallet) = load_wallet_context(&command)?;
+    let public_key = crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec();
+    let public_key_hex = encode_hex(&public_key);
+    let state = load_sqlite_state_read_only(&home.state_path())?;
+    let balance = state.balance_for_key(&wallet.verifying_key());
+
+    println!("node home: {}", home.root().display());
+    println!("wallet: {}", home.wallet_path().display());
+    println!("state: {}", home.state_path().display());
+    println!("admin addr: {}", node_config.admin_addr);
+    println!("public key: {public_key_hex}");
+    println!("balance: {balance}");
     Ok(())
 }
 
@@ -553,21 +552,36 @@ fn run_status(command: HomeArg) -> Result<(), String> {
     let node_config = home
         .load_config()
         .map_err(|err| format!("config load failed: {err:?}"))?;
-    let status = admin::request_status(&node_config.admin_addr)
-        .map_err(|err| format_admin_error("status query", &node_config.admin_addr, err))?;
+    let state = load_sqlite_state_read_only(&home.state_path())?;
+    let persisted_tip = state.tip_summary();
 
     println!("listen addr: {}", node_config.listen_addr);
     println!("admin addr: {}", node_config.admin_addr);
-    println!("best tip: {}", format_hash(status.tip));
+    println!("state: {}", home.state_path().display());
+    println!("best tip: {}", format_hash(persisted_tip.tip));
     println!(
         "height: {}",
-        status
+        persisted_tip
             .height
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<none>".to_string())
     );
-    println!("mempool txs: {}", status.mempool_size);
-    println!("configured peers: {}", status.peer_count);
+    match admin::request_status(&node_config.admin_addr) {
+        Ok(status) => {
+            println!("server: running");
+            println!("mempool txs: {}", status.mempool_size);
+            println!("connected peers: {}", status.peer_count);
+        }
+        Err(admin::AdminError::Connect(_)) => {
+            println!("server: not running");
+        }
+        Err(err) => {
+            println!(
+                "server: unavailable ({})",
+                format_admin_error("status query", &node_config.admin_addr, err)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -928,6 +942,13 @@ fn load_sqlite_state(path: &Path) -> Result<NodeState, String> {
         .map_err(|err| format!("sqlite load failed: {err:?}"))
 }
 
+/// Loads persisted node state through a read-only SQLite handle for inspection.
+fn load_sqlite_state_read_only(path: &Path) -> Result<NodeState, String> {
+    SqliteStore::open_read_only(path)
+        .and_then(|store| store.load_node_state())
+        .map_err(|err| format!("sqlite load failed: {err:?}"))
+}
+
 fn resolve_node_home(path: Option<&Path>) -> Result<NodeHome, String> {
     match path {
         Some(path) => Ok(NodeHome::new(path)),
@@ -1241,6 +1262,18 @@ mod tests {
 
         match cli.command {
             Command::Status(HomeArg { home }) => {
+                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_wallet_info_with_home_override() {
+        let cli = Cli::try_parse_from(["wobble", "wallet-info", "--home", "/tmp/node"]).unwrap();
+
+        match cli.command {
+            Command::WalletInfo(HomeArg { home }) => {
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
             }
             other => panic!("unexpected command: {other:?}"),
