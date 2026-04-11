@@ -7,7 +7,6 @@ use wobble::{
     peer::PeerConfig,
     server::Server,
     sqlite_store::SqliteStore,
-    store,
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
     wire::{HelloMessage, MinePendingRequest, PROTOCOL_VERSION, WireMessage},
@@ -34,8 +33,12 @@ fn run() -> Result<(), String> {
 
             let path = Path::new(&args[2]);
             let state = NodeState::new();
-            store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
-            println!("initialized snapshot at {}", path.display());
+            let store =
+                SqliteStore::open(path).map_err(|err| format!("sqlite open failed: {err:?}"))?;
+            store
+                .save_node_state(&state)
+                .map_err(|err| format!("sqlite save failed: {err:?}"))?;
+            println!("initialized sqlite node state at {}", path.display());
             Ok(())
         }
         "info" => {
@@ -44,9 +47,8 @@ fn run() -> Result<(), String> {
             }
 
             let path = Path::new(&args[2]);
-            let state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
-            println!("snapshot: {}", path.display());
+            let state = load_sqlite_state(path)?;
+            println!("sqlite: {}", path.display());
             println!("indexed blocks: {}", state.chain().len());
             println!("best tip: {}", format_hash(state.chain().best_tip()));
             println!("active utxos: {}", state.active_utxos().len());
@@ -60,8 +62,7 @@ fn run() -> Result<(), String> {
 
             let path = Path::new(&args[2]);
             let owner = parse_public_key(&args[3])?;
-            let state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let state = load_sqlite_state(path)?;
             println!("{}", state.balance_for_key(&owner));
             Ok(())
         }
@@ -71,8 +72,7 @@ fn run() -> Result<(), String> {
             }
 
             let path = Path::new(&args[2]);
-            let state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let state = load_sqlite_state(path)?;
             for outpoint in state.active_outpoints() {
                 if let Some(utxo) = state.active_utxos().get(&outpoint) {
                     println!(
@@ -135,12 +135,11 @@ fn run() -> Result<(), String> {
                 return Err(usage());
             }
 
-            let snapshot_path = Path::new(&args[2]);
+            let sqlite_path = Path::new(&args[2]);
             let wallet_path = Path::new(&args[3]);
             let wallet = wallet::load_wallet(wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let state = store::load_node_state(snapshot_path)
-                .map_err(|err| format!("load failed: {err:?}"))?;
+            let state = load_sqlite_state(sqlite_path)?;
             println!("{}", state.balance_for_key(&wallet.verifying_key()));
             Ok(())
         }
@@ -287,7 +286,7 @@ fn run() -> Result<(), String> {
                 return Err(usage());
             }
 
-            let snapshot_path = Path::new(&args[2]);
+            let sqlite_path = Path::new(&args[2]);
             let sender_wallet_path = Path::new(&args[3]);
             let recipient_verifying_key = parse_public_key_or_alias(&args[4])?;
             let amount = parse_u64(&args[5], "amount")?;
@@ -297,8 +296,7 @@ fn run() -> Result<(), String> {
             let node_name = args.get(9).cloned();
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let mut local_state = store::load_node_state(snapshot_path)
-                .map_err(|err| format!("load failed: {err:?}"))?;
+            let mut local_state = load_sqlite_state(sqlite_path)?;
 
             let txid = local_state
                 .submit_payment(
@@ -406,8 +404,7 @@ fn run() -> Result<(), String> {
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let mut state = load_sqlite_state(path)?;
             let mut tx = Transaction {
                 version: 1,
                 inputs: vec![TxIn {
@@ -425,7 +422,7 @@ fn run() -> Result<(), String> {
             let submitted = state
                 .submit_transaction(tx)
                 .map_err(|err| format!("submit failed: {err:?}"))?;
-            store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
+            save_sqlite_state(path, &state)?;
 
             println!("queued transaction {}", submitted);
             println!("mempool txs: {}", state.mempool().len());
@@ -444,8 +441,7 @@ fn run() -> Result<(), String> {
             let sender_wallet = wallet::load_wallet(sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let mut state = load_sqlite_state(path)?;
             let submitted = state
                 .submit_payment(
                     sender_wallet.signing_key(),
@@ -454,7 +450,7 @@ fn run() -> Result<(), String> {
                     uniqueness,
                 )
                 .map_err(|err| format!("submit failed: {err:?}"))?;
-            store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
+            save_sqlite_state(path, &state)?;
 
             println!("queued payment {}", submitted);
             println!("mempool txs: {}", state.mempool().len());
@@ -481,12 +477,11 @@ fn run() -> Result<(), String> {
             let miner_wallet = wallet::load_wallet(miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let mut state = load_sqlite_state(path)?;
             let block_hash = state
                 .mine_block(reward, &miner_wallet.verifying_key(), uniqueness, bits, 0)
                 .map_err(|err| format!("block rejected: {err:?}"))?;
-            store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
+            save_sqlite_state(path, &state)?;
 
             println!("mined block {}", block_hash);
             println!("new best tip: {}", format_hash(state.chain().best_tip()));
@@ -516,8 +511,7 @@ fn run() -> Result<(), String> {
             let miner_wallet = wallet::load_wallet(miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
 
-            let mut state =
-                store::load_node_state(path).map_err(|err| format!("load failed: {err:?}"))?;
+            let mut state = load_sqlite_state(path)?;
             let block_hash = state
                 .mine_block(
                     reward,
@@ -527,7 +521,7 @@ fn run() -> Result<(), String> {
                     max_transactions,
                 )
                 .map_err(|err| format!("block rejected: {err:?}"))?;
-            store::save_node_state(path, &state).map_err(|err| format!("save failed: {err:?}"))?;
+            save_sqlite_state(path, &state)?;
 
             println!("mined block {}", block_hash);
             println!("new best tip: {}", format_hash(state.chain().best_tip()));
@@ -542,27 +536,40 @@ fn run() -> Result<(), String> {
 fn usage() -> String {
     [
         "usage:",
-        "  wobble init <snapshot>",
-        "  wobble info <snapshot>",
-        "  wobble balance <snapshot> <public_key>",
-        "  wobble utxos <snapshot>",
+        "  wobble init <sqlite_path>",
+        "  wobble info <sqlite_path>",
+        "  wobble balance <sqlite_path> <public_key>",
+        "  wobble utxos <sqlite_path>",
         "  wobble generate-key",
         "  wobble create-wallet <wallet_path>",
         "  wobble wallet-address <wallet_path>",
-        "  wobble wallet-balance <snapshot> <wallet_path>",
+        "  wobble wallet-balance <sqlite_path> <wallet_path>",
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
         "  wobble serve <sqlite_path> <listen_addr> <network> [node_name]",
         "  wobble get-tip <peer_addr> <network> [node_name]",
-        "  wobble submit-payment-remote <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
+        "  wobble submit-payment-remote <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
         "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]",
-        "  wobble submit-payment <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
-        "  wobble submit-transfer <snapshot> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
-        "  wobble mine-coinbase <snapshot> <reward> <miner_wallet> [uniqueness] [bits]",
-        "  wobble mine-pending <snapshot> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
+        "  wobble submit-payment <sqlite_path> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness>",
+        "  wobble submit-transfer <sqlite_path> <txid> <vout> <amount> <sender_wallet> <recipient_public_key>",
+        "  wobble mine-coinbase <sqlite_path> <reward> <miner_wallet> [uniqueness] [bits]",
+        "  wobble mine-pending <sqlite_path> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
     ]
     .join("\n")
+}
+
+fn load_sqlite_state(path: &Path) -> Result<NodeState, String> {
+    SqliteStore::open(path)
+        .and_then(|store| store.load_node_state())
+        .map_err(|err| format!("sqlite load failed: {err:?}"))
+}
+
+fn save_sqlite_state(path: &Path, state: &NodeState) -> Result<(), String> {
+    let store = SqliteStore::open(path).map_err(|err| format!("sqlite open failed: {err:?}"))?;
+    store
+        .save_node_state(state)
+        .map_err(|err| format!("sqlite save failed: {err:?}"))
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64, String> {

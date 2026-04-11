@@ -48,6 +48,10 @@ impl ChainIndex {
         self.entries.get(hash)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&BlockHash, &ChainIndexEntry)> {
+        self.entries.iter()
+    }
+
     /// Validates `block` in isolation, links it to its parent, and updates the
     /// best tip if the new branch has more cumulative work.
     pub fn insert_block(&mut self, block: &Block) -> Result<ChainIndexEntry, ChainError> {

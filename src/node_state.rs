@@ -1,8 +1,8 @@
 //! Integrated in-memory node state for the active chain tip.
 //!
 //! This module combines the chain index and active UTXO set so a node can
-//! accept blocks and advance the current best chain. It keeps an in-memory
-//! UTXO snapshot per indexed block so the active view can switch across forks.
+//! accept blocks and advance the current best chain. It caches one UTXO view
+//! per indexed block so the active state can switch across forks.
 
 use std::collections::HashMap;
 
@@ -53,9 +53,10 @@ impl NodeState {
 
     /// Rebuilds in-memory node state from persisted blocks and mempool contents.
     ///
-    /// Blocks must be supplied in parent-before-child order so snapshots can be
-    /// materialized incrementally. Persisted mempool contents are then attached
-    /// and revalidated against the reconstructed active UTXO view.
+    /// Blocks must be supplied in parent-before-child order so cached per-block
+    /// UTXO views can be materialized incrementally. Persisted mempool contents
+    /// are then attached and revalidated against the reconstructed active UTXO
+    /// view.
     pub fn from_persisted(blocks: Vec<Block>, mempool: Mempool) -> Result<Self, NodeStateError> {
         let mut state = Self::new();
         for block in blocks {
@@ -80,6 +81,10 @@ impl NodeState {
 
     pub fn get_block(&self, hash: &BlockHash) -> Option<&Block> {
         self.blocks.get(hash)
+    }
+
+    pub fn blocks(&self) -> impl Iterator<Item = (&BlockHash, &Block)> {
+        self.blocks.iter()
     }
 
     /// Returns the current best tip hash and height for peer handshake and sync.
@@ -235,7 +240,7 @@ impl NodeState {
         Ok(block_hash)
     }
 
-    /// Indexes `block`, derives its UTXO state from its parent snapshot, and
+    /// Indexes `block`, derives its UTXO state from its parent cached view, and
     /// updates the active view if this block becomes the best tip.
     ///
     /// If the accepted block advances or replaces the active tip, the mempool
@@ -266,7 +271,7 @@ impl NodeState {
     }
 
     /// Materializes the UTXO view for `block_hash` by cloning its parent's
-    /// snapshot and applying the block at `height`.
+    /// cached view and applying the block at `height`.
     fn ensure_snapshot(
         &mut self,
         block_hash: BlockHash,

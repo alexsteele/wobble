@@ -161,15 +161,16 @@ Persist:
 - chain metadata
 - current best tip
 - UTXO set
+- mempool contents
 
 Requirements:
 - restart without replaying from genesis in the common case
-- recover best chain and mempool safely after crash
+- recover best chain, UTXO state, and mempool safely after crash
 
 Likely shape:
-- append-friendly block store
-- indexed metadata store
-- snapshot-capable UTXO state
+- SQLite-backed block store and indexed metadata
+- SQLite-backed active UTXO state
+- SQLite-backed mempool state
 
 ## Rust Architecture
 

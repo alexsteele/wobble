@@ -1,9 +1,8 @@
-//! SQLite-backed persistence for blocks and chain metadata.
+//! SQLite-backed persistence for node state.
 //!
-//! This module is the first step away from monolithic snapshot storage. It
-//! stores accepted raw blocks, chain index entries, and the current best tip in
-//! a small relational schema. It does not yet persist the active UTXO set or
-//! mempool, so live nodes still need snapshot persistence for full restart.
+//! This module stores accepted raw blocks, chain index entries, the current
+//! best tip, the active UTXO set, and the mempool in a small relational
+//! schema. It is the primary storage backend for the node and CLI workflows.
 //!
 //! Table roles:
 //! - `blocks` stores the raw serialized block payload by block hash
@@ -283,8 +282,9 @@ impl SqliteStore {
     ///
     /// The current schema stores the authoritative block history, active UTXO
     /// view, and mempool contents. This method replays blocks in height order
-    /// to recreate per-block UTXO snapshots needed for reorg handling, then
-    /// checks the rebuilt state against the persisted best tip and active UTXOs.
+    /// to recreate the cached per-block UTXO views needed for reorg handling,
+    /// then checks the rebuilt state against the persisted best tip and active
+    /// UTXOs.
     pub fn load_node_state(&self) -> Result<NodeState, SqliteStoreError> {
         let blocks = self.load_blocks_in_height_order()?;
         let mempool = self.load_mempool()?;
@@ -307,6 +307,38 @@ impl SqliteStore {
         }
 
         Ok(state)
+    }
+
+    /// Persists a full `NodeState` into SQLite as the authoritative local store.
+    ///
+    /// This rewrites the SQLite tables from the current in-memory state. It is
+    /// simple and reliable for local use, though not yet incremental.
+    pub fn save_node_state(&self, state: &NodeState) -> Result<(), SqliteStoreError> {
+        self.clear_all()?;
+
+        let mut entries: Vec<ChainIndexEntry> = state
+            .chain()
+            .iter()
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        entries.sort_by_key(|entry| (entry.height, entry.block_hash.to_string()));
+        for entry in &entries {
+            let block = state
+                .get_block(&entry.block_hash)
+                .ok_or(SqliteStoreError::MissingBlockForEntry(entry.block_hash))?;
+            self.save_block_record(block, entry, None)?;
+        }
+        self.save_active_utxos(state.active_utxos())?;
+        self.save_mempool(state.mempool())?;
+
+        if let Some(best_tip) = state.chain().best_tip() {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('best_tip', ?1)",
+                params![best_tip.to_string()],
+            )?;
+        }
+
+        Ok(())
     }
 
     fn initialize_schema(&self) -> Result<(), SqliteStoreError> {
@@ -339,6 +371,19 @@ impl SqliteStore {
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );
+             COMMIT;",
+        )?;
+        Ok(())
+    }
+
+    fn clear_all(&self) -> Result<(), SqliteStoreError> {
+        self.connection.execute_batch(
+            "BEGIN;
+             DELETE FROM blocks;
+             DELETE FROM chain_entries;
+             DELETE FROM active_utxos;
+             DELETE FROM mempool_transactions;
+             DELETE FROM metadata;
              COMMIT;",
         )?;
         Ok(())
@@ -675,5 +720,71 @@ mod tests {
         assert_eq!(rebuilt.chain().best_tip(), Some(block_hash));
         assert_eq!(rebuilt.active_utxos().len(), 1);
         assert_eq!(rebuilt.mempool().get(&mempool_tx.txid()), Some(&mempool_tx));
+    }
+
+    #[test]
+    fn saves_and_reloads_full_node_state() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let owner = crate::crypto::signing_key_from_bytes([7; 32]);
+        let recipient = crate::crypto::signing_key_from_bytes([9; 32]);
+        let mut state = crate::node_state::NodeState::new();
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: [0; 32],
+                time: 1,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: Vec::new(),
+                outputs: vec![TxOut {
+                    value: 50,
+                    locking_data: crate::crypto::verifying_key_bytes(&owner.verifying_key())
+                        .to_vec(),
+                }],
+                lock_time: 0,
+            }],
+        };
+        block.header.merkle_root = block.merkle_root();
+        loop {
+            if crate::consensus::validate_block(&block).is_ok() {
+                break;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let spendable = OutPoint {
+            txid: block.transactions[0].txid(),
+            vout: 0,
+        };
+        state.accept_block(block).unwrap();
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: spendable,
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 25,
+                locking_data: crate::crypto::verifying_key_bytes(&recipient.verifying_key())
+                    .to_vec(),
+            }],
+            lock_time: 9,
+        };
+        tx.inputs[0].unlocking_data =
+            crate::crypto::sign_message(&owner, &tx.signing_digest()).to_vec();
+        state.submit_transaction(tx.clone()).unwrap();
+
+        store.save_node_state(&state).unwrap();
+        let reloaded = store.load_node_state().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(reloaded.chain().best_tip(), state.chain().best_tip());
+        assert_eq!(reloaded.active_utxos().len(), state.active_utxos().len());
+        assert_eq!(reloaded.mempool().get(&tx.txid()), Some(&tx));
     }
 }

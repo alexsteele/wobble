@@ -18,8 +18,8 @@ Current code size:
 - Wrote the initial design doc and bootstrapped the Rust crate.
 - Added core blockchain data types, deterministic hashing, and merkle helpers.
 - Built UTXO validation, block consensus checks, and chain indexing.
-- Added integrated node state with branch-aware UTXO snapshots and reorg handling.
-- Added snapshot persistence for node state.
+- Added integrated node state with branch-aware cached UTXO views and reorg handling.
+- Added durable node-state persistence, later migrated to SQLite-backed storage.
 - Added a local CLI for initializing state, mining blocks, inspecting UTXOs, and queuing transactions.
 - Added a mempool and block assembly from pending transactions.
 - Replaced toy lock tags with Ed25519 signing and signature verification.

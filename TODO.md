@@ -3,7 +3,6 @@
 ## Next
 
 - Add an owner-to-UTXO index so balance queries and coin selection do not scan the full active UTXO set.
-- Persist blocks and chain metadata separately from full node snapshots.
 - Add block and transaction import/export formats for easier testing.
 - Introduce basic peer-to-peer networking for block and transaction relay.
 - Replace the snapshot-per-block UTXO strategy with a more scalable reorg mechanism.
