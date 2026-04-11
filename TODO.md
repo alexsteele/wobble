@@ -10,3 +10,4 @@
 - Add property tests and adversarial fork/restart scenarios.
 - Surface mempool policy rejections in the CLI with clearer submit error messages.
 - Improve the CLI with structured subcommands and clearer output.
+- Server mining options, parallelism

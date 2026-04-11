@@ -197,29 +197,18 @@ fn run() -> Result<(), String> {
                 return Err(usage());
             }
 
-            let snapshot_path = Path::new(&args[2]);
+            let sqlite_path = Path::new(&args[2]);
             let listen_addr = &args[3];
             let network = args[4].clone();
             let node_name = args.get(5).cloned();
-            let sqlite_path = snapshot_path.with_extension("sqlite");
-            let snapshot_state = store::load_node_state(snapshot_path)
-                .map_err(|err| format!("load failed: {err:?}"))?;
-            let (state, bootstrap_source) = if sqlite_path.exists() {
-                let sqlite_state = SqliteStore::open(&sqlite_path)
-                    .and_then(|store| store.load_node_state())
-                    .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
-                validate_snapshot_against_state(&snapshot_state, &sqlite_state)?;
-                (sqlite_state, "sqlite")
-            } else {
-                (snapshot_state, "snapshot")
-            };
+            let state = SqliteStore::open(sqlite_path)
+                .and_then(|store| store.load_node_state())
+                .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
             let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
-                .with_snapshot_path(snapshot_path)
-                .with_sqlite_path(&sqlite_path);
+                .with_sqlite_path(sqlite_path);
 
-            println!("serving snapshot {}", snapshot_path.display());
-            println!("sqlite store: {}", sqlite_path.display());
-            println!("bootstrap source: {bootstrap_source}");
+            println!("serving sqlite {}", sqlite_path.display());
+            println!("bootstrap source: sqlite");
             println!("listen addr: {listen_addr}");
             println!("network: {network}");
             if let Some(name) = server.config().node_name.as_deref() {
@@ -229,9 +218,6 @@ fn run() -> Result<(), String> {
                 "best tip: {}",
                 format_hash(server.state().chain().best_tip())
             );
-            if bootstrap_source == "sqlite" {
-                println!("snapshot cross-check: validated");
-            }
 
             server
                 .serve(listen_addr)
@@ -567,7 +553,7 @@ fn usage() -> String {
         "  wobble create-alias-book <alias_book>",
         "  wobble alias-add <alias_book> <name> <public_key>",
         "  wobble alias-list <alias_book>",
-        "  wobble serve <snapshot> <listen_addr> <network> [node_name]",
+        "  wobble serve <sqlite_path> <listen_addr> <network> [node_name]",
         "  wobble get-tip <peer_addr> <network> [node_name]",
         "  wobble submit-payment-remote <snapshot> <sender_wallet> <recipient_public_key|@alias_book:name> <amount> <uniqueness> <peer_addr> <network> [node_name]",
         "  wobble mine-pending-remote <reward> <miner_wallet> <uniqueness> <max_transactions> <peer_addr> <network> [node_name]",
@@ -577,52 +563,6 @@ fn usage() -> String {
         "  wobble mine-pending <snapshot> <reward> <miner_wallet> <uniqueness> <max_transactions> [bits]",
     ]
     .join("\n")
-}
-
-fn validate_snapshot_against_state(
-    snapshot_state: &NodeState,
-    rebuilt_state: &NodeState,
-) -> Result<(), String> {
-    if snapshot_state.chain().best_tip() != rebuilt_state.chain().best_tip() {
-        return Err(format!(
-            "bootstrap best tip mismatch: snapshot={} rebuilt={}",
-            format_hash(snapshot_state.chain().best_tip()),
-            format_hash(rebuilt_state.chain().best_tip())
-        ));
-    }
-    if !utxo_sets_match(snapshot_state.active_utxos(), rebuilt_state.active_utxos()) {
-        return Err(format!(
-            "bootstrap active UTXO mismatch: snapshot={} rebuilt={}",
-            snapshot_state.active_utxos().len(),
-            rebuilt_state.active_utxos().len()
-        ));
-    }
-    if !mempools_match(snapshot_state.mempool(), rebuilt_state.mempool()) {
-        return Err(format!(
-            "bootstrap mempool mismatch: snapshot={} rebuilt={}",
-            snapshot_state.mempool().len(),
-            rebuilt_state.mempool().len()
-        ));
-    }
-
-    Ok(())
-}
-
-fn utxo_sets_match(left: &wobble::state::UtxoSet, right: &wobble::state::UtxoSet) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-
-    left.iter()
-        .all(|(outpoint, utxo)| right.get(outpoint) == Some(utxo))
-}
-
-fn mempools_match(left: &wobble::mempool::Mempool, right: &wobble::mempool::Mempool) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-
-    left.iter().all(|(txid, tx)| right.get(txid) == Some(tx))
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64, String> {

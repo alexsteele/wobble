@@ -125,7 +125,7 @@ Fields:
 Receiver behavior:
 - validate the transaction against the active chain and mempool policy
 - if accepted, store it in the mempool
-- if the serving node is snapshot-backed, persist the updated snapshot
+- persist the updated live state in SQLite
 - if newly accepted, relay it to other peers
 
 Known limitation:
@@ -142,7 +142,7 @@ Fields:
 Receiver behavior:
 - validate and index the block
 - if it becomes the best tip, update active state
-- if the serving node is snapshot-backed, persist the updated snapshot
+- persist the updated live state in SQLite
 - if newly accepted, relay it to other peers
 
 Known limitation:
@@ -181,7 +181,7 @@ Fields:
 Receiver behavior:
 - build and mine a block from the current best tip and pending mempool contents
 - accept the mined block into local chain state
-- if the serving node is snapshot-backed, persist the updated snapshot
+- persist the updated live state in SQLite
 - return the mined block hash
 
 Known limitation:
