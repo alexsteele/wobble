@@ -7,6 +7,7 @@ pub mod net;
 pub mod node_state;
 pub mod peer;
 pub mod server;
+pub mod sqlite_store;
 pub mod state;
 pub mod store;
 pub mod types;

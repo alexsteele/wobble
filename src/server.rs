@@ -16,6 +16,7 @@ use crate::{
     net,
     node_state::NodeState,
     peer::{self, PeerConfig, PeerError},
+    sqlite_store::{self, SqliteStoreError},
     store::{self, StoreError},
     wire::WireMessage,
 };
@@ -26,6 +27,7 @@ pub struct Server {
     config: PeerConfig,
     state: NodeState,
     snapshot_path: Option<PathBuf>,
+    sqlite_path: Option<PathBuf>,
 }
 
 /// Errors produced by the live server while handling protocol messages.
@@ -33,6 +35,7 @@ pub struct Server {
 pub enum ServerError {
     Peer(PeerError),
     Persist(StoreError),
+    SqlitePersist(SqliteStoreError),
 }
 
 impl Server {
@@ -41,6 +44,7 @@ impl Server {
             config,
             state,
             snapshot_path: None,
+            sqlite_path: None,
         }
     }
 
@@ -52,6 +56,15 @@ impl Server {
     /// each mutation rather than using incremental storage.
     pub fn with_snapshot_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.snapshot_path = Some(path.into());
+        self
+    }
+
+    /// Configures the server to persist accepted blocks and chain metadata to SQLite.
+    ///
+    /// This is a hybrid storage step: raw blocks and chain selection metadata
+    /// move to SQLite, while UTXOs and mempool still rely on snapshot storage.
+    pub fn with_sqlite_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.sqlite_path = Some(path.into());
         self
     }
 
@@ -81,10 +94,13 @@ impl Server {
         message: WireMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
         let should_persist = message_mutates_state(&message);
+        let sqlite_block_hash = persisted_block_hash(&message);
         let replies = peer::handle_message(&self.config, &mut self.state, message)
             .map_err(ServerError::Peer)?;
         if should_persist {
             self.persist_snapshot().map_err(ServerError::Persist)?;
+            self.persist_sqlite(sqlite_block_hash, &replies)
+                .map_err(ServerError::SqlitePersist)?;
         }
         Ok(replies)
     }
@@ -138,6 +154,28 @@ impl Server {
         };
         store::save_node_state(path, &self.state)
     }
+
+    fn persist_sqlite(
+        &self,
+        request_block_hash: Option<crate::types::BlockHash>,
+        replies: &[WireMessage],
+    ) -> Result<(), SqliteStoreError> {
+        let Some(path) = self.sqlite_path.as_deref() else {
+            return Ok(());
+        };
+        let Some(block_hash) = request_block_hash.or_else(|| mined_block_hash(replies)) else {
+            return Ok(());
+        };
+        let Some(block) = self.state.get_block(&block_hash) else {
+            return Ok(());
+        };
+        let Some(entry) = self.state.chain().get(&block_hash) else {
+            return Ok(());
+        };
+
+        let store = sqlite_store::SqliteStore::open(path)?;
+        store.save_block_record(block, entry, self.state.chain().best_tip())
+    }
 }
 
 fn message_mutates_state(message: &WireMessage) -> bool {
@@ -147,6 +185,20 @@ fn message_mutates_state(message: &WireMessage) -> bool {
             | WireMessage::AnnounceBlock { .. }
             | WireMessage::MinePending(..)
     )
+}
+
+fn persisted_block_hash(message: &WireMessage) -> Option<crate::types::BlockHash> {
+    match message {
+        WireMessage::AnnounceBlock { block } => Some(block.header.block_hash()),
+        _ => None,
+    }
+}
+
+fn mined_block_hash(replies: &[WireMessage]) -> Option<crate::types::BlockHash> {
+    replies.iter().find_map(|reply| match reply {
+        WireMessage::MinedBlock(result) => Some(result.block_hash),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

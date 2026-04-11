@@ -200,12 +200,15 @@ fn run() -> Result<(), String> {
             let listen_addr = &args[3];
             let network = args[4].clone();
             let node_name = args.get(5).cloned();
+            let sqlite_path = snapshot_path.with_extension("sqlite");
             let state = store::load_node_state(snapshot_path)
                 .map_err(|err| format!("load failed: {err:?}"))?;
             let mut server = Server::new(PeerConfig::new(network.clone(), node_name), state)
-                .with_snapshot_path(snapshot_path);
+                .with_snapshot_path(snapshot_path)
+                .with_sqlite_path(&sqlite_path);
 
             println!("serving snapshot {}", snapshot_path.display());
+            println!("sqlite store: {}", sqlite_path.display());
             println!("listen addr: {listen_addr}");
             println!("network: {network}");
             if let Some(name) = server.config().node_name.as_deref() {
