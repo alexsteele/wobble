@@ -3,14 +3,16 @@
 //! This module owns the small amount of logic needed to connect to a remote
 //! peer, send the local `hello`, and validate that the first response is also a
 //! `hello`. Keeping that flow here avoids repeating the same handshake code in
-//! each remote CLI command. It also provides a couple of one-shot request
-//! helpers for explicit tip and block fetches during sync tests.
+//! each remote CLI command. It also provides a few one-shot request helpers
+//! for explicit tip, block, and transaction submission flows during sync tests
+//! and CLI operations.
 
 use std::{io, net::TcpStream};
 
 use crate::{
     net,
     peer::PeerConfig,
+    types::Transaction,
     wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
 
@@ -92,12 +94,32 @@ pub fn request_block(
     Ok(block)
 }
 
+/// Opens a one-shot connection and announces a signed transaction to the peer.
+///
+/// The peer may accept the transaction into its mempool, treat it as a known
+/// duplicate, or reject it during validation. This helper only guarantees that
+/// the transaction was delivered over a successful protocol session.
+pub fn announce_transaction(
+    peer_addr: &str,
+    config: &PeerConfig,
+    transaction: Transaction,
+) -> Result<(), RequestError> {
+    let (mut stream, _) =
+        connect_and_handshake(peer_addr, config).map_err(RequestError::Handshake)?;
+    net::send_message(&mut stream, &WireMessage::AnnounceTx { transaction })
+        .map_err(RequestError::Send)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::TcpListener, thread};
 
     use crate::{
-        client::{ClientError, RequestError, connect_and_handshake, request_block, request_tip},
+        client::{
+            ClientError, RequestError, announce_transaction, connect_and_handshake, request_block,
+            request_tip,
+        },
         net,
         peer::PeerConfig,
         types::{Block, BlockHash, BlockHeader, Transaction},
@@ -284,5 +306,42 @@ mod tests {
             err,
             RequestError::UnexpectedResponse(WireMessage::GetTip)
         ));
+    }
+
+    #[test]
+    fn announce_transaction_sends_transaction_after_handshake() {
+        let (listener, addr) = connected_listener();
+        let expected = sample_block().transactions.into_iter().next().unwrap();
+
+        let worker = thread::spawn({
+            let expected = expected.clone();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let first = net::receive_message(&mut stream).unwrap();
+                assert!(matches!(first, WireMessage::Hello(_)));
+                net::send_message(
+                    &mut stream,
+                    &WireMessage::Hello(HelloMessage {
+                        network: "wobble-local".to_string(),
+                        version: 1,
+                        node_name: Some("server".to_string()),
+                        advertised_addr: None,
+                        tip: None,
+                        height: None,
+                    }),
+                )
+                .unwrap();
+                let message = net::receive_message(&mut stream).unwrap();
+                assert_eq!(
+                    message,
+                    WireMessage::AnnounceTx {
+                        transaction: expected
+                    }
+                );
+            }
+        });
+
+        announce_transaction(&addr, &PeerConfig::new("wobble-local", None), expected).unwrap();
+        worker.join().unwrap();
     }
 }

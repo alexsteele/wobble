@@ -114,7 +114,7 @@ struct ServeCommand {
     mining_bits: Option<String>,
 }
 
-/// Builds a payment using the local node wallet and stores it in local state.
+/// Builds a signed payment from the local wallet and submits it to the local node server.
 #[derive(Debug, Args)]
 struct SubmitPaymentCommand {
     /// Recipient public key hex or `@alias_book:name`.
@@ -496,9 +496,12 @@ fn run_wallet_balance(command: HomeArg) -> Result<(), String> {
     Ok(())
 }
 
-/// Builds a payment from the local node wallet and persists it into local state.
+/// Builds a signed payment from the local wallet and submits it to the local server.
 fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
     let home = resolve_node_home(command.home.as_deref())?;
+    let node_config = home
+        .load_config()
+        .map_err(|err| format!("config load failed: {err:?}"))?;
     let recipient_verifying_key = parse_public_key_or_alias(&command.recipient)?;
     let sender_wallet = wallet::load_wallet(&home.wallet_path())
         .map_err(|err| format!("wallet load failed: {err:?}"))?;
@@ -511,10 +514,20 @@ fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
             command.uniqueness.unwrap_or_else(default_uniqueness),
         )
         .map_err(|err| format!("submit failed: {err:?}"))?;
-    save_sqlite_state(&home.state_path(), &state)?;
+    let transaction = state
+        .mempool()
+        .get(&submitted)
+        .cloned()
+        .ok_or_else(|| format!("built transaction {submitted} missing from local mempool"))?;
+    client::announce_transaction(
+        &node_config.listen_addr,
+        &PeerConfig::new(node_config.network, None),
+        transaction,
+    )
+    .map_err(|err| format!("submit to local server failed: {err:?}"))?;
 
-    println!("queued payment {}", submitted);
-    println!("mempool txs: {}", state.mempool().len());
+    println!("submitted payment {}", submitted);
+    println!("local node: {}", node_config.listen_addr);
     Ok(())
 }
 
