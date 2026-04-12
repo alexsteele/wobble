@@ -25,7 +25,7 @@ Current code size:
 - Added a read-only SQLite open path for inspection commands so they do not contend with a running server's writable handle.
 - Fixed a server bug where one-shot admin requests could kill the serve loop after a non-blocking `WouldBlock`.
 - Added short outbound peer IO timeouts so bootstrap sync remains best effort instead of hanging server startup.
-- Added a local two-node demo harness under `scripts/` that starts two homes, bootstraps one side, waits for sync, submits a payment, and captures logs toward a future `test-net` command.
+- Added a local configurable testnet harness under `scripts/` that starts `/tmp` homes, bootstraps one side, waits for sync, optionally submits random payments, and captures logs toward a future `test-net` command.
 - Simplified wallet-facing CLI shape around `wallet-info` and removed the separate address/balance split.
 
 ## 2026-04-10 Notes

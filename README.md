@@ -112,6 +112,22 @@ Peer bootstrap file example:
   { "addr": "127.0.0.1:9003", "node_name": "observer" }
 ]
 ```
+
+## Local Testnet
+
+A configurable local harness lives at `scripts/local_testnet.py`.
+
+Example:
+
+```shell
+python3 scripts/local_testnet.py --nodes 4 --payment-count 10 --payment-rate 0.5
+```
+
+This creates one temporary home per node under `/tmp`, starts one server per
+home, wires the generated peers together, and can optionally drive random
+confirmed payments. See [testnet](docs/testnet.md) for the current scope and
+flags.
+
 ## Logging
 
 The server uses structured `tracing` logs on stderr. Use `RUST_LOG` to control it.
