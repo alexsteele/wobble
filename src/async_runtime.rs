@@ -8,7 +8,11 @@
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    admin::{AdminRequest, AdminResponse},
+    admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
+    consensus::BLOCK_SUBSIDY,
+    crypto,
+    node_state::NodeState,
+    peer::{self, PeerConfig},
     types::{Block, BlockHash, Txid},
     wire::WireMessage,
 };
@@ -207,15 +211,192 @@ impl ServerRuntime {
     }
 }
 
+/// Serialized state owner for the future async runtime.
+///
+/// This wraps the existing synchronous `NodeState` and protocol handlers behind
+/// one command-processing surface so peer and admin tasks do not mutate chain
+/// state directly.
+pub struct StateTask {
+    config: PeerConfig,
+    state: NodeState,
+    peer_count: usize,
+    mining_enabled: bool,
+}
+
+impl StateTask {
+    /// Builds a state owner around the current synchronous node model.
+    pub fn new(config: PeerConfig, state: NodeState) -> Self {
+        Self {
+            config,
+            state,
+            peer_count: 0,
+            mining_enabled: false,
+        }
+    }
+
+    /// Returns the current immutable node state snapshot.
+    pub fn state(&self) -> &NodeState {
+        &self.state
+    }
+
+    /// Records how many peers the runtime currently considers connected.
+    pub fn set_peer_count(&mut self, peer_count: usize) {
+        self.peer_count = peer_count;
+    }
+
+    /// Records whether mining is currently enabled in the runtime.
+    pub fn set_mining_enabled(&mut self, mining_enabled: bool) {
+        self.mining_enabled = mining_enabled;
+    }
+
+    /// Processes one state command, sends any direct reply, and returns
+    /// asynchronous side effects for the runtime to route.
+    pub fn handle_command(&mut self, command: StateCommand) -> Vec<StateEffect> {
+        match command {
+            StateCommand::InboundPeerMessage {
+                peer_id: _peer_id,
+                message,
+                reply,
+            } => {
+                let replies = peer::handle_message(&self.config, &mut self.state, message)
+                    .map(StateResponse::PeerReplies)
+                    .unwrap_or(StateResponse::None);
+                let _ = reply.send(replies);
+                Vec::new()
+            }
+            StateCommand::AdminRequest { request, reply } => {
+                let _ = reply.send(self.handle_admin_request(request));
+                Vec::new()
+            }
+            StateCommand::MinerFoundBlock { job_id: _, block } => {
+                let _ = self.state.accept_block(block);
+                vec![StateEffect::Persist]
+            }
+            StateCommand::PeerDisconnected { peer_id: _peer_id } => Vec::new(),
+        }
+    }
+
+    /// Handles one admin request against the serialized node state.
+    fn handle_admin_request(&mut self, request: AdminRequest) -> AdminResponse {
+        match request {
+            AdminRequest::GetStatus => {
+                let tip = self.state.tip_summary();
+                AdminResponse::Status(StatusSummary {
+                    tip: tip.tip,
+                    height: tip.height,
+                    branch_count: self.state.chain().branch_count(),
+                    mempool_size: self.state.mempool().len(),
+                    peer_count: self.peer_count,
+                    mining_enabled: self.mining_enabled,
+                })
+            }
+            AdminRequest::GetBalance { public_key } => {
+                let Some(owner) = crypto::parse_verifying_key(&public_key) else {
+                    return AdminResponse::Error {
+                        message: "invalid public key".to_string(),
+                    };
+                };
+                AdminResponse::Balance(BalanceSummary {
+                    amount: self.state.balance_for_key(&owner),
+                })
+            }
+            AdminRequest::Bootstrap { public_key, blocks } => {
+                let Some(owner) = crypto::parse_verifying_key(&public_key) else {
+                    return AdminResponse::Error {
+                        message: "invalid public key".to_string(),
+                    };
+                };
+                let start_uniqueness = self
+                    .state
+                    .tip_summary()
+                    .height
+                    .and_then(|height| u32::try_from(height.saturating_add(1)).ok())
+                    .unwrap_or(0);
+                let mut last_block_hash = None;
+                for offset in 0..blocks {
+                    let uniqueness = start_uniqueness.saturating_add(offset);
+                    match self
+                        .state
+                        .mine_block(BLOCK_SUBSIDY, &owner, uniqueness, 0x207f_ffff, 0)
+                    {
+                        Ok(block_hash) => last_block_hash = Some(block_hash),
+                        Err(err) => {
+                            return AdminResponse::Error {
+                                message: format!("{err:?}"),
+                            };
+                        }
+                    }
+                }
+                AdminResponse::Bootstrapped(BootstrapSummary {
+                    blocks_mined: blocks,
+                    last_block_hash,
+                })
+            }
+            AdminRequest::SubmitTransaction { transaction } => {
+                let txid = transaction.txid();
+                match self.state.submit_transaction(transaction) {
+                    Ok(_) => AdminResponse::Submitted { txid },
+                    Err(err) => AdminResponse::Error {
+                        message: format!("{err:?}"),
+                    },
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::oneshot;
 
     use crate::{
-        admin::AdminRequest,
-        async_runtime::{RuntimeConfig, ServerRuntime, StateCommand},
-        wire::WireMessage,
+        admin::{AdminRequest, AdminResponse},
+        async_runtime::{RuntimeConfig, ServerRuntime, StateCommand, StateResponse, StateTask},
+        crypto,
+        node_state::NodeState,
+        peer::PeerConfig,
+        types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
+        wire::{TipSummary, WireMessage},
     };
+
+    fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value,
+                locking_data: crypto::verifying_key_bytes(owner).to_vec(),
+            }],
+            lock_time: uniqueness,
+        }
+    }
+
+    fn mine_block(
+        prev_blockhash: BlockHash,
+        bits: u32,
+        owner: &ed25519_dalek::VerifyingKey,
+        uniqueness: u32,
+    ) -> Block {
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash,
+                merkle_root: [0; 32],
+                time: 1,
+                bits,
+                nonce: 0,
+            },
+            transactions: vec![coinbase(50, owner, uniqueness)],
+        };
+        block.header.merkle_root = block.merkle_root();
+
+        loop {
+            if crate::consensus::validate_block(&block).is_ok() {
+                return block;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn server_handle_stop_marks_runtime_stopped() {
@@ -273,5 +454,96 @@ mod tests {
             runtime.recv_state_command().await,
             Some(StateCommand::AdminRequest { .. })
         ));
+    }
+
+    #[test]
+    fn state_task_handles_get_tip_via_peer_command() {
+        let mut task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        let effects = task.handle_command(StateCommand::InboundPeerMessage {
+            peer_id: "peer-1".to_string(),
+            message: WireMessage::GetTip,
+            reply: reply_tx,
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            reply_rx.blocking_recv().unwrap(),
+            StateResponse::PeerReplies(vec![WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })])
+        );
+    }
+
+    #[test]
+    fn state_task_reports_status_through_admin_request() {
+        let mut task =
+            StateTask::new(PeerConfig::new("wobble-local", Some("node".to_string())), NodeState::new());
+        task.set_peer_count(3);
+        task.set_mining_enabled(true);
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        let effects = task.handle_command(StateCommand::AdminRequest {
+            request: AdminRequest::GetStatus,
+            reply: reply_tx,
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            reply_rx.blocking_recv().unwrap(),
+            AdminResponse::Status(crate::admin::StatusSummary {
+                tip: None,
+                height: None,
+                branch_count: 0,
+                mempool_size: 0,
+                peer_count: 3,
+                mining_enabled: true,
+            })
+        );
+    }
+
+    #[test]
+    fn state_task_submits_transaction_through_admin_request() {
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &sender.verifying_key(), 0);
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let mut transaction = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: spendable,
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 30,
+                locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+            }],
+            lock_time: 1,
+        };
+        transaction.inputs[0].unlocking_data =
+            crypto::sign_message(&sender, &transaction.signing_digest()).to_vec();
+
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let mut task = StateTask::new(PeerConfig::new("wobble-local", None), state);
+        let expected_txid = transaction.txid();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        let effects = task.handle_command(StateCommand::AdminRequest {
+            request: AdminRequest::SubmitTransaction { transaction },
+            reply: reply_tx,
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            reply_rx.blocking_recv().unwrap(),
+            AdminResponse::Submitted { txid: expected_txid }
+        );
+        assert!(task.state().mempool().get(&expected_txid).is_some());
     }
 }
