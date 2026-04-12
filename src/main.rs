@@ -28,6 +28,7 @@ use wobble::{
     peers,
     server::{MiningConfig, Server},
     sqlite_store::SqliteStore,
+    tx_index::{IndexedTransaction, IndexedTransactionStatus, TransactionKeyRole},
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
     wallet::{self, Wallet},
     wire::{MinePendingRequest, WireMessage},
@@ -55,6 +56,8 @@ enum Command {
     WalletInfo(HomeArg),
     /// Prints total and per-key wallet balances from local state.
     Balance(HomeArg),
+    /// Prints recent wallet transactions from the local sqlite index.
+    Transactions(HomeArg),
     /// Prints status from the running local node server.
     Status(HomeArg),
     /// Builds and queues a local payment from the node wallet.
@@ -382,6 +385,7 @@ fn run() -> Result<(), String> {
         Command::Serve(command) => run_serve(command),
         Command::WalletInfo(command) => run_wallet_info(command),
         Command::Balance(command) => run_balance(command),
+        Command::Transactions(command) => run_transactions(command),
         Command::Status(command) => run_status(command),
         Command::SubmitPayment(command) => run_submit_payment(command),
         Command::Inspect { command } => run_inspect(command),
@@ -569,18 +573,45 @@ fn run_wallet_info(command: HomeArg) -> Result<(), String> {
 /// Prints total wallet balance plus one line per named wallet key.
 fn run_balance(command: HomeArg) -> Result<(), String> {
     let (home, _, wallet) = load_wallet_context(&command)?;
-    let state = load_sqlite_state_read_only(&home.state_path())?;
+    let store = SqliteStore::open_read_only(&home.state_path())
+        .map_err(|err| format!("sqlite open failed: {err:?}"))?;
+    let utxos = store
+        .load_active_utxos()
+        .map_err(|err| format!("sqlite load failed: {err:?}"))?;
     let mut total = 0_u64;
 
     println!("wallet: {}", home.wallet_path().display());
     println!("state: {}", home.state_path().display());
     println!("default key: {}", wallet.default_key_name());
     for key in wallet.keys() {
-        let balance = state.balance_for_key(&key.verifying_key());
+        let owner_bytes = crypto::verifying_key_bytes(&key.verifying_key());
+        let balance: u64 = utxos
+            .iter()
+            .filter(|(_, utxo)| utxo.output.locking_data == owner_bytes)
+            .map(|(_, utxo)| utxo.output.value)
+            .sum();
         total = total.saturating_add(balance);
         println!("{}: {}", key.name(), balance);
     }
     println!("total: {total}");
+    Ok(())
+}
+
+/// Prints wallet-relative transaction history from the local sqlite index.
+fn run_transactions(command: HomeArg) -> Result<(), String> {
+    let (home, _, wallet) = load_wallet_context(&command)?;
+    let store = SqliteStore::open_read_only(&home.state_path())
+        .map_err(|err| format!("sqlite open failed: {err:?}"))?;
+    let lines = wallet_transaction_lines(&store, &wallet)
+        .map_err(|err| format!("sqlite query failed: {err:?}"))?;
+
+    println!("wallet: {}", home.wallet_path().display());
+    println!("state: {}", home.state_path().display());
+    println!("default key: {}", wallet.default_key_name());
+    println!("transactions: {}", lines.len());
+    for line in lines {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -1185,6 +1216,70 @@ fn format_hash(hash: Option<BlockHash>) -> String {
         .unwrap_or_else(|| "<none>".to_string())
 }
 
+/// Builds wallet-history display lines from the persisted transaction index.
+///
+/// Each line summarizes one transaction in terms of wallet-owned keys: how much
+/// value those keys spent, how much they received, and the wallet-relative net
+/// effect. Pending mempool transactions sort after confirmed history.
+fn wallet_transaction_lines(store: &SqliteStore, wallet: &Wallet) -> Result<Vec<String>, String> {
+    let wallet_keys: Vec<Vec<u8>> = wallet
+        .verifying_keys()
+        .map(|key| crypto::verifying_key_bytes(&key).to_vec())
+        .collect();
+    let transactions = store
+        .load_transactions_for_keys(&wallet_keys)
+        .map_err(|err| format!("{err:?}"))?;
+    let mut lines = Vec::with_capacity(transactions.len());
+    for transaction in transactions {
+        let edges = store
+            .load_transaction_key_edges(transaction.txid)
+            .map_err(|err| format!("{err:?}"))?;
+        lines.push(format_wallet_transaction_line(
+            &transaction,
+            &wallet_keys,
+            &edges,
+        ));
+    }
+    Ok(lines)
+}
+
+/// Formats one wallet-facing transaction summary line.
+fn format_wallet_transaction_line(
+    transaction: &IndexedTransaction,
+    wallet_keys: &[Vec<u8>],
+    edges: &[wobble::tx_index::TransactionKeyEdge],
+) -> String {
+    let mut sent = 0_u64;
+    let mut received = 0_u64;
+    for edge in edges {
+        if !wallet_keys.iter().any(|key| *key == edge.key_data) {
+            continue;
+        }
+        match edge.key_role {
+            TransactionKeyRole::Input => {
+                sent = sent.saturating_add(edge.value.unwrap_or(0));
+            }
+            TransactionKeyRole::Output => {
+                received = received.saturating_add(edge.value.unwrap_or(0));
+            }
+        }
+    }
+    let net = received as i128 - sent as i128;
+    let position = match transaction.status {
+        IndexedTransactionStatus::Confirmed => format!(
+            "confirmed height={} pos={}",
+            transaction.block_height.unwrap_or_default(),
+            transaction.position_in_block.unwrap_or_default()
+        ),
+        IndexedTransactionStatus::Mempool => "mempool".to_string(),
+    };
+
+    format!(
+        "{} txid={} sent={} received={} net={:+}",
+        position, transaction.txid, sent, received, net
+    )
+}
+
 /// Formats local admin client failures into operator-facing CLI errors.
 ///
 /// Connection failures usually mean the local node server is not running yet,
@@ -1270,22 +1365,86 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::path::{Path, PathBuf};
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use clap::Parser;
     use wobble::{
         admin::{AdminError, AdminResponse},
         home::{MiningSection, NodeConfig, NodeHome},
-        types::Txid,
+        sqlite_store::SqliteStore,
+        types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut, Txid},
+        wallet,
     };
 
     use super::{
         BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
         ServeCommand, SubmitPaymentCommand, format_admin_error, resolve_mining_runtime,
         resolve_serve_runtime, resolve_state_and_wallet_paths, resolve_state_path,
-        resolve_wallet_path,
+        resolve_wallet_path, wallet_transaction_lines,
     };
+
+    static NEXT_TEMP_HOME_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home_root() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        let unique = NEXT_TEMP_HOME_ID.fetch_add(1, Ordering::Relaxed);
+        path.push(format!(
+            "wobble-main-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            unique
+        ));
+        path
+    }
+
+    fn mine_block_with_transactions(
+        prev_blockhash: BlockHash,
+        bits: u32,
+        miner: &ed25519_dalek::VerifyingKey,
+        uniqueness: u32,
+        mut transactions: Vec<Transaction>,
+    ) -> Block {
+        let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
+        full_transactions.push(Transaction {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                locking_data: wobble::crypto::verifying_key_bytes(miner).to_vec(),
+            }],
+            lock_time: uniqueness,
+        });
+        full_transactions.append(&mut transactions);
+
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash,
+                merkle_root: [0; 32],
+                time: 1,
+                bits,
+                nonce: 0,
+            },
+            transactions: full_transactions,
+        };
+        block.header.merkle_root = block.merkle_root();
+
+        loop {
+            if wobble::consensus::validate_block(&block).is_ok() {
+                return block;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+    }
 
     #[test]
     fn parses_high_level_submit_payment_with_optional_uniqueness() {
@@ -1347,6 +1506,18 @@ mod tests {
 
         match cli.command {
             Command::Balance(HomeArg { home }) => {
+                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_transactions_with_home_override() {
+        let cli = Cli::try_parse_from(["wobble", "transactions", "--home", "/tmp/node"]).unwrap();
+
+        match cli.command {
+            Command::Transactions(HomeArg { home }) => {
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1732,5 +1903,117 @@ mod tests {
 
         assert_eq!(state_path, PathBuf::from("/tmp/custom.sqlite"));
         assert_eq!(wallet_path, PathBuf::from("/tmp/custom.wallet"));
+    }
+
+    #[test]
+    fn wallet_transaction_lines_report_wallet_relative_history() {
+        let root = temp_home_root();
+        let home = NodeHome::new(&root);
+        home.initialize().unwrap();
+
+        let mut wallet = wallet::load_wallet(&home.wallet_path()).unwrap();
+        let sender_public = wallet.generate_key("sender").unwrap();
+        wallet::save_wallet(&home.wallet_path(), &wallet).unwrap();
+        let sender = wallet
+            .keys()
+            .find(|key| key.name() == "sender")
+            .unwrap()
+            .signing_key()
+            .clone();
+        let recipient = wobble::crypto::signing_key_from_bytes([0x44; 32]);
+        let miner = wobble::crypto::signing_key_from_bytes([0x55; 32]);
+
+        let store = SqliteStore::open(&home.state_path()).unwrap();
+        let mut state = wobble::node_state::NodeState::new();
+        let genesis = mine_block_with_transactions(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender_public,
+            1,
+            Vec::new(),
+        );
+        let genesis_txid = genesis.transactions[0].txid();
+        state.accept_block(genesis).unwrap();
+
+        let mut confirmed = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: genesis_txid,
+                    vout: 0,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 30,
+                    locking_data: wobble::crypto::verifying_key_bytes(&recipient.verifying_key())
+                        .to_vec(),
+                },
+                TxOut {
+                    value: 20,
+                    locking_data: wobble::crypto::verifying_key_bytes(&wallet.verifying_key())
+                        .to_vec(),
+                },
+            ],
+            lock_time: 2,
+        };
+        confirmed.inputs[0].unlocking_data =
+            wobble::crypto::sign_message(&sender, &confirmed.signing_digest()).to_vec();
+        let confirmed_block = mine_block_with_transactions(
+            state.chain().best_tip().unwrap(),
+            0x207f_ffff,
+            &miner.verifying_key(),
+            2,
+            vec![confirmed.clone()],
+        );
+        state.accept_block(confirmed_block).unwrap();
+
+        let mut pending = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: confirmed.txid(),
+                    vout: 1,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 20,
+                locking_data: wobble::crypto::verifying_key_bytes(&recipient.verifying_key())
+                    .to_vec(),
+            }],
+            lock_time: 3,
+        };
+        pending.inputs[0].unlocking_data =
+            wobble::crypto::sign_message(wallet.signing_key(), &pending.signing_digest()).to_vec();
+        state.submit_transaction(pending.clone()).unwrap();
+        store.save_node_state(&state).unwrap();
+
+        let read_only = SqliteStore::open_read_only(&home.state_path()).unwrap();
+        let lines = wallet_transaction_lines(&read_only, &wallet).unwrap();
+        drop(read_only);
+        drop(store);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            format!(
+                "confirmed height=0 pos=0 txid={} sent=0 received=50 net=+50",
+                genesis_txid
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "confirmed height=1 pos=1 txid={} sent=50 received=20 net=-30",
+                confirmed.txid()
+            )
+        );
+        assert_eq!(
+            lines[2],
+            format!("mempool txid={} sent=20 received=0 net=-20", pending.txid())
+        );
     }
 }

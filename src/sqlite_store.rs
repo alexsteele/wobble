@@ -599,6 +599,48 @@ impl SqliteStore {
         Ok(transactions)
     }
 
+    /// Loads all persisted key-participation edges for one indexed transaction.
+    ///
+    /// Wallet-facing tools use these rows to compute how much value the local
+    /// wallet sent, received, or moved internally without rescanning the chain.
+    pub fn load_transaction_key_edges(
+        &self,
+        txid: Txid,
+    ) -> Result<Vec<TransactionKeyEdge>, SqliteStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT key_role, key_data, value, vout
+             FROM transaction_keys
+             WHERE txid = ?1
+             ORDER BY key_role ASC, vout ASC NULLS LAST",
+        )?;
+        let rows = statement.query_map(params![txid.to_string()], |row| {
+            let role_text: String = row.get(0)?;
+            let key_role = TransactionKeyRole::parse(&role_text).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid transaction key role: {role_text}"),
+                    )),
+                )
+            })?;
+            Ok(TransactionKeyEdge {
+                txid,
+                key_role,
+                key_data: row.get(1)?,
+                value: row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                vout: row.get::<_, Option<i64>>(3)?.map(|value| value as u32),
+            })
+        })?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            edges.push(row?);
+        }
+        Ok(edges)
+    }
+
     /// Rebuilds a full in-memory `NodeState` from persisted SQLite data.
     ///
     /// The current schema stores the authoritative block history, active UTXO
