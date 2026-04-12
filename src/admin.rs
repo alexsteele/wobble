@@ -22,8 +22,10 @@ use crate::{
 pub struct StatusSummary {
     pub tip: Option<BlockHash>,
     pub height: Option<u64>,
+    pub branch_count: usize,
     pub mempool_size: usize,
     pub peer_count: usize,
+    pub mining_enabled: bool,
 }
 
 /// Operator-facing balance result for one locking key.
@@ -202,8 +204,10 @@ mod tests {
             let mut line = serde_json::to_string(&AdminResponse::Status(StatusSummary {
                 tip: Some(BlockHash::new([0x11; 32])),
                 height: Some(5),
+                branch_count: 2,
                 mempool_size: 2,
                 peer_count: 3,
+                mining_enabled: true,
             }))
             .unwrap();
             line.push('\n');
@@ -215,8 +219,10 @@ mod tests {
         worker.join().unwrap();
 
         assert_eq!(status.height, Some(5));
+        assert_eq!(status.branch_count, 2);
         assert_eq!(status.mempool_size, 2);
         assert_eq!(status.peer_count, 3);
+        assert!(status.mining_enabled);
     }
 
     #[test]

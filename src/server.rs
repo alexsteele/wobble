@@ -504,8 +504,10 @@ impl Server {
                 AdminResponse::Status(StatusSummary {
                     tip: tip.tip,
                     height: tip.height,
+                    branch_count: self.state.chain().branch_count(),
                     mempool_size: self.state.mempool().len(),
                     peer_count: self.peers.len(),
+                    mining_enabled: self.mining.is_some(),
                 })
             }
             AdminRequest::GetBalance { public_key } => {

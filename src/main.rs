@@ -688,8 +688,18 @@ fn run_status(command: HomeArg) -> Result<(), String> {
     match admin::request_status(&node_config.admin_addr) {
         Ok(status) => {
             println!("server: running");
+            println!("live best tip: {}", format_hash(status.tip));
+            println!(
+                "live height: {}",
+                status
+                    .height
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            );
+            println!("live branches: {}", status.branch_count);
             println!("mempool txs: {}", status.mempool_size);
             println!("connected peers: {}", status.peer_count);
+            println!("integrated mining: {}", status.mining_enabled);
         }
         Err(admin::AdminError::Connect(_)) => {
             println!("server: not running");
