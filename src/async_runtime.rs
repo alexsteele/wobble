@@ -5,6 +5,8 @@
 //! boundary is that runtime tasks perform I/O and coordination, while a single
 //! state-owning task remains the only place that mutates `NodeState`.
 
+use std::collections::HashMap;
+
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -133,6 +135,19 @@ impl Default for RuntimeConfig {
 pub enum ServerHandleError {
     SubmitClosed,
     ResponseDropped,
+}
+
+/// Best-effort routing summary for one emitted state effect.
+///
+/// The coordinator uses this to report what happened to one effect without
+/// taking ownership of the underlying peer, miner, or persistence policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutedEffect {
+    Relay { attempted_peers: usize, delivered_peers: usize },
+    Persist { notified: bool },
+    StartMiningJob { started: bool },
+    StopMining { stopped: bool },
+    DisconnectPeer { disconnected: bool },
 }
 
 /// Cloneable control handle exposed to tests and callers.
@@ -298,6 +313,127 @@ impl SpawnedStateTask {
         self.worker
             .await
             .expect("state task should not panic during tests")
+    }
+}
+
+/// Lightweight async coordinator around the spawned state task.
+///
+/// This layer owns routing tables for peers, mining, and persistence, then
+/// drains `StateEffect` values from the state task and forwards them to the
+/// appropriate worker channel. It intentionally does not own `NodeState`.
+pub struct RuntimeCoordinator {
+    state_task: SpawnedStateTask,
+    peer_commands: HashMap<PeerId, mpsc::Sender<PeerCommand>>,
+    miner_commands: Option<mpsc::Sender<MinerCommand>>,
+    persist_notifications: Option<mpsc::Sender<()>>,
+}
+
+impl RuntimeCoordinator {
+    /// Builds a coordinator around one spawned state task.
+    pub fn new(state_task: SpawnedStateTask) -> Self {
+        Self {
+            state_task,
+            peer_commands: HashMap::new(),
+            miner_commands: None,
+            persist_notifications: None,
+        }
+    }
+
+    /// Returns a handle that can submit commands to the owned state task.
+    pub fn handle(&self) -> ServerHandle {
+        self.state_task.handle()
+    }
+
+    /// Registers one live peer command channel.
+    pub fn register_peer(&mut self, peer_id: PeerId, commands: mpsc::Sender<PeerCommand>) {
+        self.peer_commands.insert(peer_id, commands);
+    }
+
+    /// Removes one peer from the live routing table.
+    pub fn unregister_peer(&mut self, peer_id: &str) {
+        self.peer_commands.remove(peer_id);
+    }
+
+    /// Records the miner command channel used for mining effects.
+    pub fn set_miner_commands(&mut self, commands: mpsc::Sender<MinerCommand>) {
+        self.miner_commands = Some(commands);
+    }
+
+    /// Records the persistence notifier used for save effects.
+    pub fn set_persist_notifications(&mut self, notifications: mpsc::Sender<()>) {
+        self.persist_notifications = Some(notifications);
+    }
+
+    /// Requests a clean shutdown of the owned state task.
+    pub fn stop(&self) {
+        self.state_task.stop();
+    }
+
+    /// Waits for the owned state task to exit and returns its final state owner.
+    pub async fn join(self) -> StateTask {
+        self.state_task.join().await
+    }
+
+    /// Waits for the next effect emitted by the state task and routes it.
+    ///
+    /// Returns `None` once the state task closes its effect stream.
+    pub async fn route_next_effect(&mut self) -> Option<RoutedEffect> {
+        let effect = self.state_task.recv_effect().await?;
+        Some(self.route_effect(effect).await)
+    }
+
+    /// Routes one already-received state effect to peers, miner, or persistence.
+    pub async fn route_effect(&mut self, effect: StateEffect) -> RoutedEffect {
+        match effect {
+            StateEffect::Relay { peers, message } => {
+                // Relay is best-effort: missing or closed peer channels are skipped.
+                let attempted_peers = peers.len();
+                let mut delivered_peers = 0;
+                for peer_id in peers {
+                    if let Some(commands) = self.peer_commands.get(&peer_id) {
+                        if commands.send(PeerCommand::Send(message.clone())).await.is_ok() {
+                            delivered_peers += 1;
+                        }
+                    }
+                }
+                RoutedEffect::Relay {
+                    attempted_peers,
+                    delivered_peers,
+                }
+            }
+            StateEffect::Persist => {
+                let notified = if let Some(notifications) = &self.persist_notifications {
+                    notifications.send(()).await.is_ok()
+                } else {
+                    false
+                };
+                RoutedEffect::Persist { notified }
+            }
+            StateEffect::StartMiningJob { job } => {
+                let started = if let Some(commands) = &self.miner_commands {
+                    commands.send(MinerCommand::StartJob(job)).await.is_ok()
+                } else {
+                    false
+                };
+                RoutedEffect::StartMiningJob { started }
+            }
+            StateEffect::StopMining => {
+                let stopped = if let Some(commands) = &self.miner_commands {
+                    commands.send(MinerCommand::Stop).await.is_ok()
+                } else {
+                    false
+                };
+                RoutedEffect::StopMining { stopped }
+            }
+            StateEffect::DisconnectPeer { peer_id } => {
+                let disconnected = if let Some(commands) = self.peer_commands.get(&peer_id) {
+                    commands.send(PeerCommand::Disconnect).await.is_ok()
+                } else {
+                    false
+                };
+                RoutedEffect::DisconnectPeer { disconnected }
+            }
+        }
     }
 }
 
@@ -528,12 +664,13 @@ async fn run_state_task(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
 
     use crate::{
         admin::{AdminRequest, AdminResponse},
         async_runtime::{
-            RuntimeConfig, ServerRuntime, StateCommand, StateEffect, StateResponse, StateTask,
+            RoutedEffect, RuntimeConfig, RuntimeCoordinator, ServerRuntime, StateCommand,
+            StateEffect, StateResponse, StateTask,
         },
         crypto,
         node_state::NodeState,
@@ -717,6 +854,111 @@ mod tests {
         let _task = worker.join().await;
 
         assert!(matches!(response, AdminResponse::Status(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_coordinator_relays_messages_to_registered_peers() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let worker = runtime.spawn_state_task(task);
+        let mut coordinator = RuntimeCoordinator::new(worker);
+        let (peer_tx, mut peer_rx) = mpsc::channel(4);
+        coordinator.register_peer("peer-1".to_string(), peer_tx);
+
+        let routed = coordinator
+            .route_effect(StateEffect::Relay {
+                peers: vec!["peer-1".to_string(), "missing".to_string()],
+                message: WireMessage::GetTip,
+            })
+            .await;
+
+        assert_eq!(
+            routed,
+            RoutedEffect::Relay {
+                attempted_peers: 2,
+                delivered_peers: 1,
+            }
+        );
+        assert_eq!(peer_rx.recv().await, Some(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip)));
+
+        coordinator.stop();
+        let _task = coordinator.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_coordinator_notifies_persistence_listener() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let worker = runtime.spawn_state_task(task);
+        let mut coordinator = RuntimeCoordinator::new(worker);
+        let (persist_tx, mut persist_rx) = mpsc::channel(2);
+        coordinator.set_persist_notifications(persist_tx);
+
+        let routed = coordinator.route_effect(StateEffect::Persist).await;
+
+        assert_eq!(routed, RoutedEffect::Persist { notified: true });
+        assert_eq!(persist_rx.recv().await, Some(()));
+
+        coordinator.stop();
+        let _task = coordinator.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_coordinator_routes_mining_commands() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let worker = runtime.spawn_state_task(task);
+        let mut coordinator = RuntimeCoordinator::new(worker);
+        let (miner_tx, mut miner_rx) = mpsc::channel(4);
+        coordinator.set_miner_commands(miner_tx);
+        let owner = crypto::signing_key_from_bytes([5; 32]);
+        let block = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let job = crate::async_runtime::MiningJob {
+            job_id: 9,
+            parent: None,
+            txids: block.transactions.iter().map(Transaction::txid).collect(),
+            block,
+        };
+
+        let started = coordinator
+            .route_effect(StateEffect::StartMiningJob { job: job.clone() })
+            .await;
+        let stopped = coordinator.route_effect(StateEffect::StopMining).await;
+
+        assert_eq!(started, RoutedEffect::StartMiningJob { started: true });
+        assert_eq!(miner_rx.recv().await, Some(crate::async_runtime::MinerCommand::StartJob(job)));
+        assert_eq!(stopped, RoutedEffect::StopMining { stopped: true });
+        assert_eq!(miner_rx.recv().await, Some(crate::async_runtime::MinerCommand::Stop));
+
+        coordinator.stop();
+        let _task = coordinator.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_coordinator_disconnects_registered_peer() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let worker = runtime.spawn_state_task(task);
+        let mut coordinator = RuntimeCoordinator::new(worker);
+        let (peer_tx, mut peer_rx) = mpsc::channel(2);
+        coordinator.register_peer("peer-2".to_string(), peer_tx);
+
+        let routed = coordinator
+            .route_effect(StateEffect::DisconnectPeer {
+                peer_id: "peer-2".to_string(),
+            })
+            .await;
+
+        assert_eq!(
+            routed,
+            RoutedEffect::DisconnectPeer {
+                disconnected: true,
+            }
+        );
+        assert_eq!(peer_rx.recv().await, Some(crate::async_runtime::PeerCommand::Disconnect));
+
+        coordinator.stop();
+        let _task = coordinator.join().await;
     }
 
     #[test]
