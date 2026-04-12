@@ -187,6 +187,8 @@ enum InspectCommand {
     Balance(BalanceCommand),
     /// Prints the active UTXO set from a local sqlite state file.
     Utxos(UtxosCommand),
+    /// Prints configured startup peers from the local peers file.
+    Peers(PeersCommand),
     /// Connects to a peer and prints its advertised best tip.
     Tip(GetTipCommand),
 }
@@ -209,6 +211,13 @@ struct BalanceCommand {
 #[derive(Debug, Args)]
 struct UtxosCommand {
     sqlite_path: Option<PathBuf>,
+    #[arg(long)]
+    home: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PeersCommand {
+    peers_path: Option<PathBuf>,
     #[arg(long)]
     home: Option<PathBuf>,
 }
@@ -831,6 +840,20 @@ fn run_inspect(command: InspectCommand) -> Result<(), String> {
             }
             Ok(())
         }
+        InspectCommand::Peers(command) => {
+            let peers_path = resolve_peers_path(command.home.as_deref(), command.peers_path.as_deref())?;
+            let peers = peers::load_peer_endpoints(&peers_path)
+                .map_err(|err| format!("peer config load failed: {err:?}"))?;
+            println!("peers file: {}", peers_path.display());
+            println!("configured peers: {}", peers.len());
+            for peer in peers {
+                match peer.node_name {
+                    Some(node_name) => println!("{} ({node_name})", peer.addr),
+                    None => println!("{}", peer.addr),
+                }
+            }
+            Ok(())
+        }
         InspectCommand::Tip(command) => {
             let config = PeerConfig::new(command.network, command.node_name);
             let (mut stream, remote_hello) =
@@ -1146,6 +1169,14 @@ fn resolve_wallet_path(home: Option<&Path>, wallet_path: Option<&Path>) -> Resul
     match wallet_path {
         Some(path) => Ok(path.to_path_buf()),
         None => Ok(resolve_node_home(home)?.wallet_path()),
+    }
+}
+
+/// Resolves the local peers file path, defaulting to the selected node home.
+fn resolve_peers_path(home: Option<&Path>, peers_path: Option<&Path>) -> Result<PathBuf, String> {
+    match peers_path {
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(resolve_node_home(home)?.peers_path()),
     }
 }
 
@@ -1470,7 +1501,8 @@ mod tests {
         BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
         NewKeyCommand, PayCommand, ServeCommand, WalletCommand, format_admin_error,
         resolve_mining_runtime, resolve_serve_runtime, resolve_state_and_wallet_paths,
-        resolve_state_path, resolve_wallet_path, run_wallet_new_key, wallet_transaction_lines,
+        resolve_peers_path, resolve_state_path, resolve_wallet_path, run_wallet_new_key,
+        wallet_transaction_lines,
     };
 
     static NEXT_TEMP_HOME_ID: AtomicU64 = AtomicU64::new(0);
@@ -1909,6 +1941,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_inspect_peers_with_optional_path_and_home() {
+        let cli = Cli::try_parse_from([
+            "wobble",
+            "inspect",
+            "peers",
+            "/tmp/peers.json",
+            "--home",
+            "/tmp/node",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Inspect {
+                command: InspectCommand::Peers(command),
+            } => {
+                assert_eq!(command.peers_path, Some(PathBuf::from("/tmp/peers.json")));
+                assert_eq!(command.home, Some(PathBuf::from("/tmp/node")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_serve_runtime_prefers_cli_over_home_config() {
         let config = NodeConfig {
             listen_addr: "127.0.0.1:9001".to_string(),
@@ -2047,6 +2102,13 @@ mod tests {
         let path = resolve_wallet_path(Some(Path::new("/tmp/node")), None).unwrap();
 
         assert_eq!(path, PathBuf::from("/tmp/node/wallet.bin"));
+    }
+
+    #[test]
+    fn resolve_peers_path_defaults_to_home_peers() {
+        let path = resolve_peers_path(Some(Path::new("/tmp/node")), None).unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/node/peers.json"));
     }
 
     #[test]
