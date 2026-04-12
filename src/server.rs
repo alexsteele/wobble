@@ -883,15 +883,7 @@ impl Server {
             store.save_mempool(self.state.mempool())?;
             return Ok(());
         };
-        store.save_active_utxos(self.state.active_utxos())?;
-        store.save_mempool(self.state.mempool())?;
-        let Some(block) = self.state.get_block(&block_hash) else {
-            return Ok(());
-        };
-        let Some(entry) = self.state.chain().get(&block_hash) else {
-            return Ok(());
-        };
-        store.save_block_record(block, entry, self.state.chain().best_tip())
+        store.save_accepted_block(&self.state, block_hash)
     }
 
     /// Persists the full current node state when a bulk sync changed local history.
