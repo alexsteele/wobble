@@ -1209,46 +1209,12 @@ impl SqliteStore {
             self.build_confirmed_block_index(block, entry.block_hash, entry.height)?;
         let tx = self.connection.unchecked_transaction()?;
         for indexed in &transactions {
-            let transaction_bytes =
-                bincode::serde::encode_to_vec(&indexed.transaction, bincode::config::standard())?;
-            tx.execute(
-                "DELETE FROM mempool_transactions WHERE txid = ?1",
-                params![indexed.txid.to_string()],
-            )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO transactions (
-                     txid, transaction_bytes, block_hash, block_height, position_in_block,
-                     status, first_seen_at, last_updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    indexed.txid.to_string(),
-                    transaction_bytes,
-                    indexed.block_hash.map(|value| value.to_string()),
-                    indexed.block_height.map(|value| value as i64),
-                    indexed.position_in_block.map(|value| value as i64),
-                    indexed.status.as_str(),
-                    indexed.first_seen_at,
-                    indexed.last_updated_at,
-                ],
-            )?;
-            tx.execute(
-                "DELETE FROM transaction_keys WHERE txid = ?1",
-                params![indexed.txid.to_string()],
-            )?;
+            self.delete_mempool_transaction_row(&tx, indexed.txid)?;
+            self.upsert_indexed_transaction_row(&tx, indexed)?;
+            self.delete_transaction_key_rows(&tx, indexed.txid)?;
         }
         for edge in &edges {
-            tx.execute(
-                "INSERT INTO transaction_keys (
-                     txid, key_role, key_data, value, vout
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    edge.txid.to_string(),
-                    edge.key_role.as_str(),
-                    edge.key_data,
-                    edge.value.map(|value| value as i64),
-                    edge.vout.map(|value| value as i64),
-                ],
-            )?;
+            self.insert_transaction_key_row(&tx, edge)?;
         }
         tx.commit()?;
         Ok(())
@@ -1265,6 +1231,80 @@ impl SqliteStore {
             txids.push(parse_txid(&row?)?);
         }
         Ok(txids)
+    }
+
+    /// Deletes one persisted mempool row after its transaction left the mempool.
+    fn delete_mempool_transaction_row(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        txid: Txid,
+    ) -> Result<(), SqliteStoreError> {
+        tx.execute(
+            "DELETE FROM mempool_transactions WHERE txid = ?1",
+            params![txid.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Upserts one wallet-style transaction index row.
+    fn upsert_indexed_transaction_row(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        indexed: &IndexedTransaction,
+    ) -> Result<(), SqliteStoreError> {
+        let transaction_bytes =
+            bincode::serde::encode_to_vec(&indexed.transaction, bincode::config::standard())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO transactions (
+                 txid, transaction_bytes, block_hash, block_height, position_in_block,
+                 status, first_seen_at, last_updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                indexed.txid.to_string(),
+                transaction_bytes,
+                indexed.block_hash.map(|value| value.to_string()),
+                indexed.block_height.map(|value| value as i64),
+                indexed.position_in_block.map(|value| value as i64),
+                indexed.status.as_str(),
+                indexed.first_seen_at,
+                indexed.last_updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes all persisted key-edge rows for one transaction before replacement.
+    fn delete_transaction_key_rows(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        txid: Txid,
+    ) -> Result<(), SqliteStoreError> {
+        tx.execute(
+            "DELETE FROM transaction_keys WHERE txid = ?1",
+            params![txid.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Inserts one per-key transaction edge row.
+    fn insert_transaction_key_row(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        edge: &TransactionKeyEdge,
+    ) -> Result<(), SqliteStoreError> {
+        tx.execute(
+            "INSERT INTO transaction_keys (
+                 txid, key_role, key_data, value, vout
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                edge.txid.to_string(),
+                edge.key_role.as_str(),
+                edge.key_data,
+                edge.value.map(|value| value as i64),
+                edge.vout.map(|value| value as i64),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Builds one transaction's key edges using already-persisted transaction outputs.
