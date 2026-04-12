@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, split},
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
@@ -133,6 +134,42 @@ impl SpawnedPeerTask {
         self.worker
             .await
             .expect("peer task should not panic during tests");
+    }
+}
+
+/// Running transport adapter for one spawned peer task.
+///
+/// This owns the transport loop that bridges newline-delimited wire messages
+/// to a `SpawnedPeerTask`. The current implementation is generic over any
+/// async read/write stream so tests can use in-memory duplex streams while a
+/// future TCP wrapper stays thin.
+pub struct SpawnedPeerTransport {
+    peer_id: PeerId,
+    command_tx: mpsc::Sender<PeerCommand>,
+    worker: JoinHandle<()>,
+}
+
+impl SpawnedPeerTransport {
+    /// Returns the stable peer identifier served by this transport.
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    /// Returns the coordinator-facing command sender for this peer.
+    pub fn command_tx(&self) -> mpsc::Sender<PeerCommand> {
+        self.command_tx.clone()
+    }
+
+    /// Requests a clean disconnect of the underlying peer task.
+    pub async fn disconnect(&self) -> Result<(), mpsc::error::SendError<PeerCommand>> {
+        self.command_tx.send(PeerCommand::Disconnect).await
+    }
+
+    /// Waits for the transport and peer task to exit.
+    pub async fn join(self) {
+        self.worker
+            .await
+            .expect("peer transport should not panic during tests");
     }
 }
 
@@ -575,6 +612,28 @@ impl ServerRuntime {
             worker,
         }
     }
+
+    /// Spawns one line-oriented transport adapter on top of a peer task.
+    ///
+    /// This consumes the peer task because the transport owns its inbound and
+    /// outbound channels for the lifetime of the connection.
+    pub fn spawn_peer_transport<T>(
+        &self,
+        peer: SpawnedPeerTask,
+        stream: T,
+    ) -> SpawnedPeerTransport
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let peer_id = peer.peer_id.clone();
+        let command_tx = peer.command_tx();
+        let worker = tokio::spawn(run_peer_transport(peer, stream));
+        SpawnedPeerTransport {
+            peer_id,
+            command_tx,
+            worker,
+        }
+    }
 }
 
 /// Serialized state owner for the future async runtime.
@@ -790,9 +849,65 @@ async fn run_peer_task(
     let _ = handle.notify_peer_disconnected(peer_id).await;
 }
 
+/// Bridges one async line-oriented stream to a spawned peer task.
+///
+/// The transport reads newline-delimited `WireMessage` values from the stream,
+/// forwards them into the peer task, and writes any outbound peer messages
+/// back to the stream. Invalid input or stream closure ends the transport and
+/// then disconnects the peer task.
+async fn run_peer_transport<T>(mut peer: SpawnedPeerTask, stream: T)
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, mut writer) = split(stream);
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    loop {
+        tokio::select! {
+            read_result = reader.read_line(&mut line) => {
+                let Ok(bytes_read) = read_result else {
+                    break;
+                };
+                if bytes_read == 0 {
+                    break;
+                }
+                let message = match WireMessage::from_json_line(&line) {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                line.clear();
+                if peer.send_inbound(message).await.is_err() {
+                    break;
+                }
+            }
+            outbound = peer.recv_outbound() => {
+                let Some(message) = outbound else {
+                    break;
+                };
+                let Ok(line) = message.to_json_line() else {
+                    break;
+                };
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if writer.flush().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = peer.disconnect().await;
+    peer.join().await;
+}
+
 #[cfg(test)]
 mod tests {
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex},
+        sync::{mpsc, oneshot},
+    };
 
     use crate::{
         admin::{AdminRequest, AdminResponse},
@@ -1125,6 +1240,70 @@ mod tests {
 
         command_tx.send(crate::async_runtime::PeerCommand::Disconnect).await.unwrap();
         peer.join().await;
+        state.stop();
+        let _task = state.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_transport_reads_wire_messages_and_writes_replies() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let peer = runtime.spawn_peer_task("peer-transport-1".to_string(), 4);
+        let (mut client, server_stream) = duplex(1024);
+        let transport = runtime.spawn_peer_transport(peer, server_stream);
+        let state = runtime.spawn_state_task(StateTask::new(
+            PeerConfig::new("wobble-local", None),
+            NodeState::new(),
+        ));
+
+        client
+            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(
+            WireMessage::from_json_line(&line).unwrap(),
+            WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })
+        );
+
+        transport.disconnect().await.unwrap();
+        transport.join().await;
+        state.stop();
+        let _task = state.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_transport_writes_coordinator_sent_messages() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let peer = runtime.spawn_peer_task("peer-transport-2".to_string(), 4);
+        let command_tx = peer.command_tx();
+        let (client, server_stream) = duplex(1024);
+        let transport = runtime.spawn_peer_transport(peer, server_stream);
+        let state = runtime.spawn_state_task(StateTask::new(
+            PeerConfig::new("wobble-local", None),
+            NodeState::new(),
+        ));
+
+        command_tx
+            .send(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip))
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(WireMessage::from_json_line(&line).unwrap(), WireMessage::GetTip);
+
+        transport.disconnect().await.unwrap();
+        transport.join().await;
         state.stop();
         let _task = state.join().await;
     }

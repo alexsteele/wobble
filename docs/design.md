@@ -268,6 +268,12 @@ The next runtime design should separate:
 - emits outbound wire messages and coordinator-issued sends
 - does not mutate `NodeState` directly
 
+`PeerTransport`
+- bridges one newline-delimited async stream to a peer task
+- parses inbound `WireMessage` values from the stream
+- writes outbound `WireMessage` values back to the stream
+- is generic over the async stream so tests can use in-memory transports first
+
 `PeerManager`
 - tracks known peers and active peer-task channels
 - maintains outbound connections and reconnect policy
