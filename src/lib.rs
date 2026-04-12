@@ -14,6 +14,7 @@ pub mod peers;
 pub mod server;
 pub mod sqlite_store;
 pub mod state;
+pub mod tx_index;
 pub mod types;
 pub mod wallet;
 pub mod wire;

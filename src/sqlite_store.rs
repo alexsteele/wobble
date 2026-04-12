@@ -11,6 +11,9 @@
 //! - `active_utxos` stores the current active-chain unspent outputs
 //! - `mempool_transactions` stores the current pending transaction set
 //! - `peers` stores seed and learned peer metadata for future discovery work
+//! - `transactions` stores one raw confirmed or mempool record per transaction
+//! - `transaction_keys` stores the one-to-many per-key input/output edges for
+//!   each transaction so wallet-style queries can match any participating key
 //! - `metadata` stores singleton node-level values such as the current best tip
 
 use std::{io, path::Path};
@@ -22,6 +25,9 @@ use crate::{
     node_state::{NodeState, NodeStateError},
     peers::{PeerSource, StoredPeer},
     state::UtxoSet,
+    tx_index::{
+        IndexedTransaction, IndexedTransactionStatus, TransactionKeyEdge, TransactionKeyRole,
+    },
     types::{Block, BlockHash, ChainIndexEntry, OutPoint, Transaction, TxOut, Txid, Utxo},
 };
 
@@ -41,6 +47,7 @@ pub enum SqliteStoreError {
     },
     RebuiltUtxoMismatch,
     RebuiltMempoolMismatch,
+    InvalidTransactionStatus(String),
 }
 
 impl From<rusqlite::Error> for SqliteStoreError {
@@ -362,6 +369,236 @@ impl SqliteStore {
         Ok(peers)
     }
 
+    /// Replaces the persisted transaction index with `transactions` and `edges`.
+    pub fn save_transaction_index(
+        &self,
+        transactions: &[IndexedTransaction],
+        edges: &[TransactionKeyEdge],
+    ) -> Result<(), SqliteStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM transactions", [])?;
+        tx.execute("DELETE FROM transaction_keys", [])?;
+        for indexed in transactions {
+            let transaction_bytes =
+                bincode::serde::encode_to_vec(&indexed.transaction, bincode::config::standard())?;
+            tx.execute(
+                "INSERT INTO transactions (
+                     txid, transaction_bytes, block_hash, block_height, position_in_block,
+                     status, first_seen_at, last_updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    indexed.txid.to_string(),
+                    transaction_bytes,
+                    indexed.block_hash.map(|value| value.to_string()),
+                    indexed.block_height.map(|value| value as i64),
+                    indexed.position_in_block.map(|value| value as i64),
+                    indexed.status.as_str(),
+                    indexed.first_seen_at,
+                    indexed.last_updated_at,
+                ],
+            )?;
+        }
+        for edge in edges {
+            tx.execute(
+                "INSERT INTO transaction_keys (
+                     txid, key_role, key_data, value, vout
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.txid.to_string(),
+                    edge.key_role.as_str(),
+                    edge.key_data,
+                    edge.value.map(|value| value as i64),
+                    edge.vout.map(|value| value as i64),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads all indexed transactions ordered by confirmation height then txid.
+    pub fn load_indexed_transactions(&self) -> Result<Vec<IndexedTransaction>, SqliteStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                 txid, transaction_bytes, block_hash, block_height, position_in_block,
+                 status, first_seen_at, last_updated_at
+             FROM transactions
+             ORDER BY block_height ASC NULLS LAST, position_in_block ASC NULLS LAST, txid ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let txid_text: String = row.get(0)?;
+            let transaction_bytes: Vec<u8> = row.get(1)?;
+            let block_hash_text: Option<String> = row.get(2)?;
+            let status_text: String = row.get(5)?;
+            let status = IndexedTransactionStatus::parse(&status_text).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid transaction status: {status_text}"),
+                    )),
+                )
+            })?;
+            let txid = parse_txid(&txid_text).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{err:?}"),
+                    )),
+                )
+            })?;
+            let (transaction, _): (Transaction, usize) =
+                bincode::serde::decode_from_slice(&transaction_bytes, bincode::config::standard())
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            Box::new(err),
+                        )
+                    })?;
+            Ok(IndexedTransaction {
+                txid,
+                transaction,
+                block_hash: block_hash_text
+                    .map(|value| parse_block_hash(&value))
+                    .transpose()
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("{err:?}"),
+                            )),
+                        )
+                    })?,
+                block_height: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                position_in_block: row.get::<_, Option<i64>>(4)?.map(|value| value as u32),
+                status,
+                first_seen_at: row.get(6)?,
+                last_updated_at: row.get(7)?,
+            })
+        })?;
+
+        let mut transactions = Vec::new();
+        for row in rows {
+            transactions.push(row?);
+        }
+        Ok(transactions)
+    }
+
+    /// Loads indexed transactions that mention any of `keys` as inputs or outputs.
+    ///
+    /// The current query fan-outs once per key, then de-duplicates by txid in
+    /// memory so multi-key wallets can ask for "my transactions" across all of
+    /// their owned locking keys.
+    pub fn load_transactions_for_keys(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<IndexedTransaction>, SqliteStoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT
+                 transactions.txid,
+                 transactions.transaction_bytes,
+                 transactions.block_hash,
+                 transactions.block_height,
+                 transactions.position_in_block,
+                 transactions.status,
+                 transactions.first_seen_at,
+                 transactions.last_updated_at
+             FROM transactions
+             INNER JOIN transaction_keys ON transaction_keys.txid = transactions.txid
+             WHERE transaction_keys.key_data = ?1
+             ORDER BY transactions.block_height ASC NULLS LAST,
+                      transactions.position_in_block ASC NULLS LAST,
+                      transactions.txid ASC",
+        )?;
+
+        let mut by_txid = std::collections::HashMap::new();
+        for key in keys {
+            let rows = statement.query_map(params![key], |row| {
+                let txid_text: String = row.get(0)?;
+                let transaction_bytes: Vec<u8> = row.get(1)?;
+                let block_hash_text: Option<String> = row.get(2)?;
+                let status_text: String = row.get(5)?;
+                let status = IndexedTransactionStatus::parse(&status_text).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid transaction status: {status_text}"),
+                        )),
+                    )
+                })?;
+                let txid = parse_txid(&txid_text).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{err:?}"),
+                        )),
+                    )
+                })?;
+                let (transaction, _): (Transaction, usize) = bincode::serde::decode_from_slice(
+                    &transaction_bytes,
+                    bincode::config::standard(),
+                )
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Blob,
+                        Box::new(err),
+                    )
+                })?;
+                Ok(IndexedTransaction {
+                    txid,
+                    transaction,
+                    block_hash: block_hash_text
+                        .map(|value| parse_block_hash(&value))
+                        .transpose()
+                        .map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("{err:?}"),
+                                )),
+                            )
+                        })?,
+                    block_height: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                    position_in_block: row.get::<_, Option<i64>>(4)?.map(|value| value as u32),
+                    status,
+                    first_seen_at: row.get(6)?,
+                    last_updated_at: row.get(7)?,
+                })
+            })?;
+            for row in rows {
+                let indexed = row?;
+                by_txid.entry(indexed.txid).or_insert(indexed);
+            }
+        }
+
+        let mut transactions: Vec<IndexedTransaction> = by_txid.into_values().collect();
+        transactions.sort_by_key(|indexed| {
+            (
+                indexed.block_height.unwrap_or(u64::MAX),
+                indexed.position_in_block.unwrap_or(u32::MAX),
+                indexed.txid.to_string(),
+            )
+        });
+        Ok(transactions)
+    }
+
     /// Rebuilds a full in-memory `NodeState` from persisted SQLite data.
     ///
     /// The current schema stores the authoritative block history, active UTXO
@@ -414,6 +651,8 @@ impl SqliteStore {
         }
         self.save_active_utxos(state.active_utxos())?;
         self.save_mempool(state.mempool())?;
+        let (transactions, edges) = build_transaction_index(state);
+        self.save_transaction_index(&transactions, &edges)?;
 
         if let Some(best_tip) = state.chain().best_tip() {
             self.connection.execute(
@@ -464,6 +703,27 @@ impl SqliteStore {
                  behavior_score INTEGER NOT NULL DEFAULT 100,
                  banned_until TEXT NULL
              );
+             CREATE TABLE IF NOT EXISTS transactions (
+                 txid TEXT PRIMARY KEY,
+                 transaction_bytes BLOB NOT NULL,
+                 block_hash TEXT NULL,
+                 block_height INTEGER NULL,
+                 position_in_block INTEGER NULL,
+                 status TEXT NOT NULL,
+                 first_seen_at TEXT NULL,
+                 last_updated_at TEXT NULL
+             );
+             CREATE TABLE IF NOT EXISTS transaction_keys (
+                 txid TEXT NOT NULL,
+                 key_role TEXT NOT NULL,
+                 key_data BLOB NOT NULL,
+                 value INTEGER NULL,
+                 vout INTEGER NULL
+             );
+             CREATE INDEX IF NOT EXISTS transaction_keys_key_data_idx
+                 ON transaction_keys (key_data);
+             CREATE INDEX IF NOT EXISTS transactions_status_height_idx
+                 ON transactions (status, block_height, position_in_block);
              CREATE TABLE IF NOT EXISTS metadata (
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -481,6 +741,8 @@ impl SqliteStore {
              DELETE FROM active_utxos;
              DELETE FROM mempool_transactions;
              DELETE FROM peers;
+             DELETE FROM transactions;
+             DELETE FROM transaction_keys;
              DELETE FROM metadata;
              COMMIT;",
         )?;
@@ -540,6 +802,118 @@ fn parse_txid(value: &str) -> Result<Txid, SqliteStoreError> {
     Ok(Txid::new(array))
 }
 
+/// Builds the persisted transaction index view from the current chain and mempool.
+///
+/// Confirmed transactions are indexed in chain-height order with their block
+/// position, then pending mempool transactions are added as unconfirmed rows.
+/// Input edges are resolved through the outputs created by known chain and
+/// mempool transactions so wallet lookups can match both spends and receipts by
+/// locking key.
+fn build_transaction_index(
+    state: &NodeState,
+) -> (Vec<IndexedTransaction>, Vec<TransactionKeyEdge>) {
+    let mut transactions = Vec::new();
+    let mut edges = Vec::new();
+    let mut known_outputs = std::collections::HashMap::<OutPoint, TxOut>::new();
+    let mut entries: Vec<ChainIndexEntry> = state
+        .chain()
+        .iter()
+        .map(|(_, entry)| entry.clone())
+        .collect();
+    entries.sort_by_key(|entry| (entry.height, entry.block_hash.to_string()));
+
+    for entry in entries {
+        let Some(block) = state.get_block(&entry.block_hash) else {
+            continue;
+        };
+        for (position, transaction) in block.transactions.iter().enumerate() {
+            let txid = transaction.txid();
+            transactions.push(IndexedTransaction {
+                txid,
+                transaction: transaction.clone(),
+                block_hash: Some(entry.block_hash),
+                block_height: Some(entry.height),
+                position_in_block: Some(position as u32),
+                status: IndexedTransactionStatus::Confirmed,
+                first_seen_at: None,
+                last_updated_at: None,
+            });
+            append_transaction_key_edges(transaction, &known_outputs, &mut edges);
+            remember_outputs(transaction, &mut known_outputs);
+        }
+    }
+
+    let mut mempool_transactions: Vec<(Txid, Transaction)> = state
+        .mempool()
+        .iter()
+        .map(|(txid, tx)| (*txid, tx.clone()))
+        .collect();
+    mempool_transactions.sort_by_key(|(txid, _)| txid.to_string());
+    for (txid, transaction) in mempool_transactions {
+        transactions.push(IndexedTransaction {
+            txid,
+            transaction: transaction.clone(),
+            block_hash: None,
+            block_height: None,
+            position_in_block: None,
+            status: IndexedTransactionStatus::Mempool,
+            first_seen_at: None,
+            last_updated_at: None,
+        });
+        append_transaction_key_edges(&transaction, &known_outputs, &mut edges);
+        remember_outputs(&transaction, &mut known_outputs);
+    }
+
+    (transactions, edges)
+}
+
+/// Records the input and output key relationships for one transaction.
+fn append_transaction_key_edges(
+    transaction: &Transaction,
+    known_outputs: &std::collections::HashMap<OutPoint, TxOut>,
+    edges: &mut Vec<TransactionKeyEdge>,
+) {
+    let txid = transaction.txid();
+    for input in &transaction.inputs {
+        if let Some(previous_output) = known_outputs.get(&input.previous_output) {
+            edges.push(TransactionKeyEdge {
+                txid,
+                key_role: TransactionKeyRole::Input,
+                key_data: previous_output.locking_data.clone(),
+                value: Some(previous_output.value),
+                vout: Some(input.previous_output.vout),
+            });
+        }
+    }
+
+    for (vout, output) in transaction.outputs.iter().enumerate() {
+        edges.push(TransactionKeyEdge {
+            txid,
+            key_role: TransactionKeyRole::Output,
+            key_data: output.locking_data.clone(),
+            value: Some(output.value),
+            vout: Some(vout as u32),
+        });
+    }
+}
+
+/// Adds newly created outputs so later spends can resolve their locking key.
+fn remember_outputs(
+    transaction: &Transaction,
+    known_outputs: &mut std::collections::HashMap<OutPoint, TxOut>,
+) {
+    let txid = transaction.txid();
+    for (vout, output) in transaction.outputs.iter().enumerate() {
+        known_outputs.insert(
+            OutPoint {
+                txid,
+                vout: vout as u32,
+            },
+            output.clone(),
+        );
+    }
+}
+
 fn utxo_sets_match(left: &UtxoSet, right: &UtxoSet) -> bool {
     if left.len() != right.len() {
         return false;
@@ -578,13 +952,16 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::{
+        crypto,
         mempool::Mempool,
         peers::{PeerSource, StoredPeer},
         state::UtxoSet,
+        tx_index::{IndexedTransactionStatus, TransactionKeyRole},
         types::{
             Block, BlockHash, BlockHeader, ChainIndexEntry, OutPoint, Transaction, TxIn, TxOut,
             Txid, Utxo,
@@ -592,6 +969,8 @@ mod tests {
     };
 
     use super::SqliteStore;
+
+    static NEXT_TEMP_DB_ID: AtomicU64 = AtomicU64::new(0);
 
     fn coinbase(value: u64, uniqueness: u32) -> Transaction {
         Transaction {
@@ -627,16 +1006,58 @@ mod tests {
         }
     }
 
+    fn mine_block_with_transactions(
+        prev_blockhash: BlockHash,
+        bits: u32,
+        miner: &ed25519_dalek::VerifyingKey,
+        uniqueness: u32,
+        mut transactions: Vec<Transaction>,
+    ) -> Block {
+        let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
+        full_transactions.push(Transaction {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                locking_data: crypto::verifying_key_bytes(miner).to_vec(),
+            }],
+            lock_time: uniqueness,
+        });
+        full_transactions.append(&mut transactions);
+
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash,
+                merkle_root: [0; 32],
+                time: 1,
+                bits,
+                nonce: 0,
+            },
+            transactions: full_transactions,
+        };
+        block.header.merkle_root = block.merkle_root();
+
+        loop {
+            if crate::consensus::validate_block(&block).is_ok() {
+                return block;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+    }
+
     fn temp_db_path() -> PathBuf {
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time is after unix epoch")
             .as_nanos();
+        let unique = NEXT_TEMP_DB_ID.fetch_add(1, Ordering::Relaxed);
         path.push(format!(
-            "wobble-sqlite-test-{}-{}.db",
+            "wobble-sqlite-test-{}-{}-{}.db",
             std::process::id(),
-            nanos
+            nanos,
+            unique,
         ));
         path
     }
@@ -948,5 +1369,255 @@ mod tests {
         assert_eq!(rebuilt.chain().best_tip(), Some(block_hash));
         assert_eq!(rebuilt.active_utxos().len(), state.active_utxos().len());
         assert_eq!(rebuilt.mempool().len(), state.mempool().len());
+    }
+
+    #[test]
+    fn save_node_state_indexes_confirmed_and_mempool_transactions() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let sender = crypto::signing_key_from_bytes([1; 32]);
+        let recipient = crypto::signing_key_from_bytes([2; 32]);
+        let miner = crypto::signing_key_from_bytes([3; 32]);
+
+        let mut state = crate::node_state::NodeState::new();
+        let genesis = mine_block_with_transactions(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            11,
+            Vec::new(),
+        );
+        let genesis_txid = genesis.transactions[0].txid();
+        state.accept_block(genesis).unwrap();
+
+        let mut confirmed_payment = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: genesis_txid,
+                    vout: 0,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 30,
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                },
+                TxOut {
+                    value: 20,
+                    locking_data: crypto::verifying_key_bytes(&sender.verifying_key()).to_vec(),
+                },
+            ],
+            lock_time: 1,
+        };
+        confirmed_payment.inputs[0].unlocking_data =
+            crypto::sign_message(&sender, &confirmed_payment.signing_digest()).to_vec();
+
+        let confirmed_block = mine_block_with_transactions(
+            state.chain().best_tip().unwrap(),
+            0x207f_ffff,
+            &miner.verifying_key(),
+            12,
+            vec![confirmed_payment.clone()],
+        );
+        state.accept_block(confirmed_block).unwrap();
+
+        let mut pending = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: confirmed_payment.txid(),
+                    vout: 0,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 10,
+                    locking_data: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
+                },
+                TxOut {
+                    value: 20,
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                },
+            ],
+            lock_time: 2,
+        };
+        pending.inputs[0].unlocking_data =
+            crypto::sign_message(&recipient, &pending.signing_digest()).to_vec();
+        state.submit_transaction(pending.clone()).unwrap();
+
+        store.save_node_state(&state).unwrap();
+
+        let indexed = store.load_indexed_transactions().unwrap();
+        let recipient_rows = store
+            .load_transactions_for_keys(&[
+                crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec()
+            ])
+            .unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(indexed.len(), 4);
+        assert_eq!(indexed[0].status, IndexedTransactionStatus::Confirmed);
+        assert_eq!(indexed[0].block_height, Some(0));
+        assert_eq!(indexed[1].status, IndexedTransactionStatus::Confirmed);
+        assert_eq!(indexed[1].block_height, Some(1));
+        assert_eq!(indexed[2].txid, confirmed_payment.txid());
+        assert_eq!(indexed[2].status, IndexedTransactionStatus::Confirmed);
+        assert_eq!(indexed[2].block_height, Some(1));
+        assert_eq!(indexed[3].txid, pending.txid());
+        assert_eq!(indexed[3].status, IndexedTransactionStatus::Mempool);
+        assert_eq!(indexed[3].block_height, None);
+        assert_eq!(recipient_rows.len(), 2);
+        assert_eq!(recipient_rows[0].txid, confirmed_payment.txid());
+        assert_eq!(recipient_rows[1].txid, pending.txid());
+    }
+
+    #[test]
+    fn load_transactions_for_keys_deduplicates_multi_key_wallet_matches() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let left = crypto::signing_key_from_bytes([10; 32]);
+        let right = crypto::signing_key_from_bytes([11; 32]);
+        let recipient = crypto::signing_key_from_bytes([12; 32]);
+
+        let mut state = crate::node_state::NodeState::new();
+        let genesis = mine_block_with_transactions(
+            BlockHash::default(),
+            0x207f_ffff,
+            &left.verifying_key(),
+            31,
+            Vec::new(),
+        );
+        let genesis_txid = genesis.transactions[0].txid();
+        state.accept_block(genesis).unwrap();
+
+        let mut payment = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: genesis_txid,
+                    vout: 0,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 25,
+                    locking_data: crypto::verifying_key_bytes(&right.verifying_key()).to_vec(),
+                },
+                TxOut {
+                    value: 25,
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                },
+            ],
+            lock_time: 4,
+        };
+        payment.inputs[0].unlocking_data =
+            crypto::sign_message(&left, &payment.signing_digest()).to_vec();
+        state.submit_transaction(payment.clone()).unwrap();
+        store.save_node_state(&state).unwrap();
+
+        let wallet_rows = store
+            .load_transactions_for_keys(&[
+                crypto::verifying_key_bytes(&left.verifying_key()).to_vec(),
+                crypto::verifying_key_bytes(&right.verifying_key()).to_vec(),
+            ])
+            .unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(wallet_rows.len(), 2);
+        assert_eq!(wallet_rows[0].txid, genesis_txid);
+        assert_eq!(wallet_rows[1].txid, payment.txid());
+    }
+
+    #[test]
+    fn transaction_key_index_tracks_input_and_output_roles() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let owner = crypto::signing_key_from_bytes([7; 32]);
+        let recipient = crypto::signing_key_from_bytes([8; 32]);
+
+        let mut state = crate::node_state::NodeState::new();
+        let genesis = mine_block_with_transactions(
+            BlockHash::default(),
+            0x207f_ffff,
+            &owner.verifying_key(),
+            21,
+            Vec::new(),
+        );
+        let genesis_txid = genesis.transactions[0].txid();
+        state.accept_block(genesis).unwrap();
+
+        let mut spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: genesis_txid,
+                    vout: 0,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50,
+                locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+            }],
+            lock_time: 3,
+        };
+        spend.inputs[0].unlocking_data =
+            crypto::sign_message(&owner, &spend.signing_digest()).to_vec();
+        state.submit_transaction(spend.clone()).unwrap();
+        store.save_node_state(&state).unwrap();
+
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT key_role, key_data, value, vout
+                 FROM transaction_keys
+                 WHERE txid = ?1
+                 ORDER BY key_role ASC, vout ASC NULLS LAST",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([spend.txid().to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            TransactionKeyRole::parse(&rows[0].0),
+            Some(TransactionKeyRole::Input)
+        );
+        assert_eq!(
+            rows[0].1,
+            crypto::verifying_key_bytes(&owner.verifying_key()).to_vec()
+        );
+        assert_eq!(rows[0].2, Some(50));
+        assert_eq!(rows[0].3, Some(0));
+
+        assert_eq!(
+            TransactionKeyRole::parse(&rows[1].0),
+            Some(TransactionKeyRole::Output)
+        );
+        assert_eq!(
+            rows[1].1,
+            crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec()
+        );
+        assert_eq!(rows[1].2, Some(50));
+        assert_eq!(rows[1].3, Some(0));
     }
 }
