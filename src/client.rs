@@ -21,7 +21,7 @@ use crate::{
 /// Bootstrap sync and relay-style requests are best effort, so they should
 /// fail quickly when a peer is not yet accepting or replying rather than
 /// stalling server startup indefinitely.
-const OUTBOUND_PEER_IO_TIMEOUT: Duration = Duration::from_millis(500);
+const OUTBOUND_PEER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Errors returned while opening and handshaking an outbound peer connection.
 #[derive(Debug)]

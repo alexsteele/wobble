@@ -685,7 +685,19 @@ impl SqliteStore {
     /// This rewrites the SQLite tables from the current in-memory state. It is
     /// simple and reliable for local use, though not yet incremental.
     pub fn save_node_state(&self, state: &NodeState) -> Result<(), SqliteStoreError> {
-        self.clear_all()?;
+        // TODO: Replace this full snapshot rewrite with incremental updates so
+        // steady-state block acceptance does not resave the entire database.
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM blocks;
+             DELETE FROM chain_entries;
+             DELETE FROM active_utxos;
+             DELETE FROM mempool_transactions;
+             DELETE FROM peers;
+             DELETE FROM transactions;
+             DELETE FROM transaction_keys;
+             DELETE FROM metadata;",
+        )?;
 
         let mut entries: Vec<ChainIndexEntry> = state
             .chain()
@@ -697,19 +709,92 @@ impl SqliteStore {
             let block = state
                 .get_block(&entry.block_hash)
                 .ok_or(SqliteStoreError::MissingBlockForEntry(entry.block_hash))?;
-            self.save_block_record(block, entry, None)?;
+            let block_hash = entry.block_hash.to_string();
+            let parent_hash = entry.parent.map(|hash| hash.to_string());
+            let block_bytes =
+                bincode::serde::encode_to_vec(block, bincode::config::standard())?;
+            let work_bytes = entry.cumulative_work.to_be_bytes().to_vec();
+            tx.execute(
+                "INSERT OR REPLACE INTO blocks (block_hash, block_bytes) VALUES (?1, ?2)",
+                params![block_hash, block_bytes],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO chain_entries (block_hash, height, cumulative_work, parent_hash)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![block_hash, entry.height as i64, work_bytes, parent_hash],
+            )?;
         }
-        self.save_active_utxos(state.active_utxos())?;
-        self.save_mempool(state.mempool())?;
+
+        for (outpoint, utxo) in state.active_utxos().iter() {
+            tx.execute(
+                "INSERT INTO active_utxos (
+                     txid, vout, value, locking_data, created_at_height, is_coinbase
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    outpoint.txid.to_string(),
+                    outpoint.vout as i64,
+                    utxo.output.value as i64,
+                    utxo.output.locking_data,
+                    utxo.created_at_height as i64,
+                    if utxo.is_coinbase { 1_i64 } else { 0_i64 },
+                ],
+            )?;
+        }
+
+        for (txid, transaction) in state.mempool().iter() {
+            let bytes =
+                bincode::serde::encode_to_vec(transaction, bincode::config::standard())?;
+            tx.execute(
+                "INSERT INTO mempool_transactions (txid, transaction_bytes) VALUES (?1, ?2)",
+                params![txid.to_string(), bytes],
+            )?;
+        }
+
         let (transactions, edges) = build_transaction_index(state);
-        self.save_transaction_index(&transactions, &edges)?;
+        for indexed in &transactions {
+            let transaction_bytes = bincode::serde::encode_to_vec(
+                &indexed.transaction,
+                bincode::config::standard(),
+            )?;
+            tx.execute(
+                "INSERT INTO transactions (
+                     txid, transaction_bytes, block_hash, block_height, position_in_block,
+                     status, first_seen_at, last_updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    indexed.txid.to_string(),
+                    transaction_bytes,
+                    indexed.block_hash.map(|value| value.to_string()),
+                    indexed.block_height.map(|value| value as i64),
+                    indexed.position_in_block.map(|value| value as i64),
+                    indexed.status.as_str(),
+                    indexed.first_seen_at,
+                    indexed.last_updated_at,
+                ],
+            )?;
+        }
+        for edge in &edges {
+            tx.execute(
+                "INSERT INTO transaction_keys (
+                     txid, key_role, key_data, value, vout
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.txid.to_string(),
+                    edge.key_role.as_str(),
+                    edge.key_data,
+                    edge.value.map(|value| value as i64),
+                    edge.vout.map(|value| value as i64),
+                ],
+            )?;
+        }
 
         if let Some(best_tip) = state.chain().best_tip() {
-            self.connection.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES ('best_tip', ?1)",
                 params![best_tip.to_string()],
             )?;
         }
+        tx.commit()?;
 
         Ok(())
     }
@@ -783,22 +868,6 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn clear_all(&self) -> Result<(), SqliteStoreError> {
-        self.connection.execute_batch(
-            "BEGIN;
-             DELETE FROM blocks;
-             DELETE FROM chain_entries;
-             DELETE FROM active_utxos;
-             DELETE FROM mempool_transactions;
-             DELETE FROM peers;
-             DELETE FROM transactions;
-             DELETE FROM transaction_keys;
-             DELETE FROM metadata;
-             COMMIT;",
-        )?;
-        Ok(())
-    }
-
     fn load_blocks_in_height_order(&self) -> Result<Vec<Block>, SqliteStoreError> {
         let mut statement = self.connection.prepare(
             "SELECT chain_entries.block_hash, blocks.block_bytes
@@ -854,8 +923,11 @@ fn parse_txid(value: &str) -> Result<Txid, SqliteStoreError> {
 
 /// Builds the persisted transaction index view from the current chain and mempool.
 ///
-/// Confirmed transactions are indexed in chain-height order with their block
-/// position, then pending mempool transactions are added as unconfirmed rows.
+/// Confirmed transactions are indexed from the current best chain only, in
+/// chain-height order with their block position, then pending mempool
+/// transactions are added as unconfirmed rows. Side branches are intentionally
+/// excluded so wallet-style history reflects the active chain and avoids
+/// duplicate `txid` rows when the same transaction appears in competing forks.
 /// Input edges are resolved through the outputs created by known chain and
 /// mempool transactions so wallet lookups can match both spends and receipts by
 /// locking key.
@@ -865,12 +937,7 @@ fn build_transaction_index(
     let mut transactions = Vec::new();
     let mut edges = Vec::new();
     let mut known_outputs = std::collections::HashMap::<OutPoint, TxOut>::new();
-    let mut entries: Vec<ChainIndexEntry> = state
-        .chain()
-        .iter()
-        .map(|(_, entry)| entry.clone())
-        .collect();
-    entries.sort_by_key(|entry| (entry.height, entry.block_hash.to_string()));
+    let entries = best_chain_entries(state);
 
     for entry in entries {
         let Some(block) = state.get_block(&entry.block_hash) else {
@@ -915,6 +982,21 @@ fn build_transaction_index(
     }
 
     (transactions, edges)
+}
+
+/// Returns the indexed blocks on the current best chain from genesis to tip.
+fn best_chain_entries(state: &NodeState) -> Vec<ChainIndexEntry> {
+    let mut entries = Vec::new();
+    let mut cursor = state.chain().best_tip();
+    while let Some(block_hash) = cursor {
+        let Some(entry) = state.chain().get(&block_hash) else {
+            break;
+        };
+        entries.push(entry.clone());
+        cursor = entry.parent;
+    }
+    entries.reverse();
+    entries
 }
 
 /// Records the input and output key relationships for one transaction.
@@ -1564,6 +1646,85 @@ mod tests {
         assert_eq!(recipient_rows.len(), 2);
         assert_eq!(recipient_rows[0].txid, confirmed_payment.txid());
         assert_eq!(recipient_rows[1].txid, pending.txid());
+    }
+
+    #[test]
+    fn save_node_state_indexes_only_best_chain_transactions() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let sender = crypto::signing_key_from_bytes([21; 32]);
+        let recipient = crypto::signing_key_from_bytes([22; 32]);
+        let miner_a = crypto::signing_key_from_bytes([23; 32]);
+        let miner_b = crypto::signing_key_from_bytes([24; 32]);
+
+        let mut state = crate::node_state::NodeState::new();
+        let genesis = mine_block_with_transactions(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            41,
+            Vec::new(),
+        );
+        let genesis_txid = genesis.transactions[0].txid();
+        let genesis_hash = genesis.header.block_hash();
+        state.accept_block(genesis).unwrap();
+
+        let mut payment = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: genesis_txid,
+                    vout: 0,
+                },
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 30,
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                },
+                TxOut {
+                    value: 20,
+                    locking_data: crypto::verifying_key_bytes(&sender.verifying_key()).to_vec(),
+                },
+            ],
+            lock_time: 42,
+        };
+        payment.inputs[0].unlocking_data =
+            crypto::sign_message(&sender, &payment.signing_digest()).to_vec();
+
+        let branch_a = mine_block_with_transactions(
+            genesis_hash,
+            0x207f_ffff,
+            &miner_a.verifying_key(),
+            43,
+            vec![payment.clone()],
+        );
+        let branch_a_hash = branch_a.header.block_hash();
+        state.accept_block(branch_a).unwrap();
+
+        let branch_b = mine_block_with_transactions(
+            genesis_hash,
+            0x201f_ffff,
+            &miner_b.verifying_key(),
+            44,
+            vec![payment.clone()],
+        );
+        let branch_b_hash = branch_b.header.block_hash();
+        state.accept_block(branch_b).unwrap();
+
+        store.save_node_state(&state).unwrap();
+        let indexed = store.load_indexed_transactions().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(state.chain().best_tip(), Some(branch_b_hash));
+        assert_ne!(branch_a_hash, branch_b_hash);
+        assert_eq!(indexed.len(), 3);
+        assert_eq!(indexed[0].block_height, Some(0));
+        assert_eq!(indexed[1].block_hash, Some(branch_b_hash));
+        assert_eq!(indexed[2].txid, payment.txid());
+        assert_eq!(indexed[2].block_hash, Some(branch_b_hash));
     }
 
     #[test]

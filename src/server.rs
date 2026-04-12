@@ -646,8 +646,19 @@ impl Server {
         info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
         let (_, remote_hello) = client::connect_and_handshake(&peer.addr, &self.config)
             .map_err(SyncError::Handshake)?;
+        debug!(
+            peer_addr = %peer.addr,
+            remote_node = ?remote_hello.node_name,
+            remote_tip = %format_hash(remote_hello.tip),
+            remote_height = ?remote_hello.height,
+            "sync handshake completed"
+        );
         let Some(remote_tip) = remote_hello.tip else {
-            debug!(peer_addr = %peer.addr, "peer has no advertised tip");
+            warn!(
+                peer_addr = %peer.addr,
+                remote_node = ?remote_hello.node_name,
+                "peer advertised no tip during sync"
+            );
             return Ok(Vec::new());
         };
         if self.state.get_block(&remote_tip).is_some() {

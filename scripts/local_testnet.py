@@ -218,9 +218,15 @@ class LocalTestNet:
             "status",
             "--home",
             str(home),
+            check=False,
             quiet=True,
             timeout=30.0,
         )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            details = stderr or stdout or "status command returned no output"
+            raise RuntimeError(f"status probe failed for {home}: {details}")
         return self.parse_fields(result.stdout)
 
     def create_nodes(self) -> None:
@@ -373,9 +379,15 @@ class LocalTestNet:
             "status",
             "--home",
             str(node.home),
+            check=False,
             quiet=True,
             timeout=30.0,
         )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            details = stderr or stdout or "status command returned no output"
+            raise RuntimeError(f"status probe failed for {node.name}: {details}")
         return self.parse_fields(result.stdout)
 
     def seed_tip_info(self) -> dict[str, str]:
