@@ -231,13 +231,63 @@ pub struct ServerRuntime {
     state_rx: mpsc::Receiver<StateCommand>,
 }
 
-/// Running async state loop plus the effect receiver it drives.
+/// Running async state loop plus the control and effect channels it drives.
+///
+/// This is the small integration surface that tests and future runtime code
+/// can hold onto while the real peer, admin, and miner tasks are still being
+/// ported. It keeps the spawned state owner, its control handle, and emitted
+/// effects together so callers do not have to juggle those pieces separately.
 pub struct SpawnedStateTask {
+    handle: ServerHandle,
     effects_rx: mpsc::Receiver<StateEffect>,
     worker: JoinHandle<StateTask>,
 }
 
 impl SpawnedStateTask {
+    /// Returns a cloneable handle for sending commands into the state task.
+    pub fn handle(&self) -> ServerHandle {
+        self.handle.clone()
+    }
+
+    /// Requests a clean shutdown of the spawned state loop.
+    pub fn stop(&self) {
+        self.handle.stop();
+    }
+
+    /// Sends one peer message through the state task and waits for its response.
+    pub async fn request_peer_message(
+        &self,
+        peer_id: PeerId,
+        message: WireMessage,
+    ) -> Result<StateResponse, ServerHandleError> {
+        self.handle.request_peer_message(peer_id, message).await
+    }
+
+    /// Sends one admin request through the state task and waits for its response.
+    pub async fn request_admin(
+        &self,
+        request: AdminRequest,
+    ) -> Result<AdminResponse, ServerHandleError> {
+        self.handle.request_admin(request).await
+    }
+
+    /// Notifies the state task that one peer disconnected.
+    pub async fn notify_peer_disconnected(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<(), ServerHandleError> {
+        self.handle.notify_peer_disconnected(peer_id).await
+    }
+
+    /// Delivers one mined block candidate back to the state task.
+    pub async fn notify_miner_found_block(
+        &self,
+        job_id: MiningJobId,
+        block: Block,
+    ) -> Result<(), ServerHandleError> {
+        self.handle.notify_miner_found_block(job_id, block).await
+    }
+
     /// Receives the next asynchronous effect emitted by the state task.
     pub async fn recv_effect(&mut self) -> Option<StateEffect> {
         self.effects_rx.recv().await
@@ -298,13 +348,18 @@ impl ServerRuntime {
     /// Consumes this runtime shell and spawns the async state loop.
     pub fn spawn_state_task(self, task: StateTask) -> SpawnedStateTask {
         let (effects_tx, effects_rx) = mpsc::channel(self.config.effect_channel_capacity);
+        let handle = self.handle.clone();
         let worker = tokio::spawn(run_state_task(
             task,
             self.state_rx,
             self.shutdown_rx,
             effects_tx,
         ));
-        SpawnedStateTask { effects_rx, worker }
+        SpawnedStateTask {
+            handle,
+            effects_rx,
+            worker,
+        }
     }
 }
 
@@ -587,16 +642,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn server_handle_round_trips_peer_message_through_state_task() {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let handle = runtime.handle();
         let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
         let worker = runtime.spawn_state_task(task);
 
-        let response = handle
+        let response = worker
             .request_peer_message("peer-1".to_string(), WireMessage::GetTip)
             .await
             .unwrap();
 
-        handle.stop();
+        worker.stop();
         let _task = worker.join().await;
 
         assert_eq!(
@@ -611,15 +665,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn server_handle_round_trips_admin_request_through_state_task() {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let handle = runtime.handle();
         let mut task =
             StateTask::new(PeerConfig::new("wobble-local", Some("node".to_string())), NodeState::new());
         task.set_peer_count(2);
         let worker = runtime.spawn_state_task(task);
 
-        let response = handle.request_admin(AdminRequest::GetStatus).await.unwrap();
+        let response = worker.request_admin(AdminRequest::GetStatus).await.unwrap();
 
-        handle.stop();
+        worker.stop();
         let _task = worker.join().await;
 
         assert_eq!(
@@ -640,16 +693,30 @@ mod tests {
         let owner = crypto::signing_key_from_bytes([9; 32]);
         let block = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let handle = runtime.handle();
         let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
         let mut worker = runtime.spawn_state_task(task);
 
-        handle.notify_miner_found_block(7, block).await.unwrap();
+        worker.notify_miner_found_block(7, block).await.unwrap();
 
         assert_eq!(worker.recv_effect().await, Some(StateEffect::Persist));
-        handle.stop();
+        worker.stop();
         let task = worker.join().await;
         assert!(task.state().chain().best_tip().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawned_state_task_exposes_handle_for_shared_callers() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let worker = runtime.spawn_state_task(task);
+        let handle = worker.handle();
+
+        let response = handle.request_admin(AdminRequest::GetStatus).await.unwrap();
+
+        worker.stop();
+        let _task = worker.join().await;
+
+        assert!(matches!(response, AdminResponse::Status(_)));
     }
 
     #[test]
