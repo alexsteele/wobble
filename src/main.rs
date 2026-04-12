@@ -52,10 +52,11 @@ enum Command {
     Bootstrap(BootstrapCommand),
     /// Starts the local node server.
     Serve(ServeCommand),
-    /// Prints wallet identity and key metadata.
-    WalletInfo(HomeArg),
-    /// Prints total and per-key wallet balances from local state.
-    Balance(HomeArg),
+    /// Reads or updates the local wallet stored under the node home.
+    Wallet {
+        #[command(subcommand)]
+        command: WalletCommand,
+    },
     /// Prints recent wallet transactions from the local sqlite index.
     Transactions(HomeArg),
     /// Prints status from the running local node server.
@@ -151,6 +152,27 @@ struct SubmitPaymentCommand {
     home: Option<PathBuf>,
 }
 
+/// Offline wallet inspection and key-management commands.
+#[derive(Debug, Subcommand)]
+enum WalletCommand {
+    /// Prints wallet identity and key metadata.
+    Info(HomeArg),
+    /// Prints total and per-key wallet balances from local state.
+    Balance(HomeArg),
+    /// Generates a new named keypair in the local wallet.
+    NewKey(NewKeyCommand),
+}
+
+/// Adds a named keypair to the wallet in the selected node home.
+#[derive(Debug, Args)]
+struct NewKeyCommand {
+    /// Name assigned to the new wallet key.
+    name: String,
+    /// Overrides the default node home directory.
+    #[arg(long)]
+    home: Option<PathBuf>,
+}
+
 /// Read-only inspection commands for local stores and peers.
 #[derive(Debug, Subcommand)]
 enum InspectCommand {
@@ -201,8 +223,6 @@ enum AdminCommand {
     GenerateKey,
     /// Creates a wallet file at the requested path.
     CreateWallet(CreateWalletCommand),
-    /// Adds a new named keypair to an existing wallet.
-    WalletAddKey(WalletAddKeyCommand),
     /// Creates an empty alias book JSON file.
     CreateAliasBook(CreateAliasBookCommand),
     /// Adds or replaces an alias entry in an alias book.
@@ -214,12 +234,6 @@ enum AdminCommand {
 #[derive(Debug, Args)]
 struct CreateWalletCommand {
     wallet_path: PathBuf,
-}
-
-#[derive(Debug, Args)]
-struct WalletAddKeyCommand {
-    wallet_path: PathBuf,
-    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -383,14 +397,22 @@ fn run() -> Result<(), String> {
         Command::Init(command) => run_init(command),
         Command::Bootstrap(command) => run_bootstrap(command),
         Command::Serve(command) => run_serve(command),
-        Command::WalletInfo(command) => run_wallet_info(command),
-        Command::Balance(command) => run_balance(command),
+        Command::Wallet { command } => run_wallet(command),
         Command::Transactions(command) => run_transactions(command),
         Command::Status(command) => run_status(command),
         Command::SubmitPayment(command) => run_submit_payment(command),
         Command::Inspect { command } => run_inspect(command),
         Command::Admin { command } => run_admin(command),
         Command::Debug { command } => run_debug(command),
+    }
+}
+
+/// Dispatches wallet inspection and key-management commands.
+fn run_wallet(command: WalletCommand) -> Result<(), String> {
+    match command {
+        WalletCommand::Info(command) => run_wallet_info(command),
+        WalletCommand::Balance(command) => run_balance(command),
+        WalletCommand::NewKey(command) => run_wallet_new_key(command),
     }
 }
 
@@ -594,6 +616,27 @@ fn run_balance(command: HomeArg) -> Result<(), String> {
         println!("{}: {}", key.name(), balance);
     }
     println!("total: {total}");
+    Ok(())
+}
+
+/// Generates a new named keypair in the local wallet and persists it.
+fn run_wallet_new_key(command: NewKeyCommand) -> Result<(), String> {
+    let home = resolve_node_home(command.home.as_deref())?;
+    let wallet_path = home.wallet_path();
+    let mut wallet =
+        wallet::load_wallet(&wallet_path).map_err(|err| format!("wallet load failed: {err:?}"))?;
+    let public_key = wallet
+        .generate_key(command.name.clone())
+        .map_err(|err| format!("wallet new-key failed: {err:?}"))?;
+    wallet::save_wallet(&wallet_path, &wallet)
+        .map_err(|err| format!("wallet save failed: {err:?}"))?;
+
+    println!("wallet: {}", wallet_path.display());
+    println!("added key: {}", command.name);
+    println!(
+        "public: {}",
+        encode_hex(&crypto::verifying_key_bytes(&public_key))
+    );
     Ok(())
 }
 
@@ -810,25 +853,6 @@ fn run_admin(command: AdminCommand) -> Result<(), String> {
             println!(
                 "public: {}",
                 encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
-            );
-            Ok(())
-        }
-        AdminCommand::WalletAddKey(command) => {
-            let mut wallet = wallet::load_wallet(&command.wallet_path)
-                .map_err(|err| format!("wallet load failed: {err:?}"))?;
-            let public_key = wallet
-                .generate_key(command.name.clone())
-                .map_err(|err| format!("wallet add-key failed: {err:?}"))?;
-            wallet::save_wallet(&command.wallet_path, &wallet)
-                .map_err(|err| format!("wallet save failed: {err:?}"))?;
-            println!(
-                "added wallet key {} to {}",
-                command.name,
-                command.wallet_path.display()
-            );
-            println!(
-                "public: {}",
-                encode_hex(&crypto::verifying_key_bytes(&public_key))
             );
             Ok(())
         }
@@ -1413,9 +1437,9 @@ mod tests {
 
     use super::{
         BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
-        ServeCommand, SubmitPaymentCommand, format_admin_error, resolve_mining_runtime,
-        resolve_serve_runtime, resolve_state_and_wallet_paths, resolve_state_path,
-        resolve_wallet_path, wallet_transaction_lines,
+        NewKeyCommand, ServeCommand, SubmitPaymentCommand, WalletCommand, format_admin_error,
+        resolve_mining_runtime, resolve_serve_runtime, resolve_state_and_wallet_paths,
+        resolve_state_path, resolve_wallet_path, run_wallet_new_key, wallet_transaction_lines,
     };
 
     static NEXT_TEMP_HOME_ID: AtomicU64 = AtomicU64::new(0);
@@ -1520,11 +1544,13 @@ mod tests {
 
     #[test]
     fn parses_wallet_info_with_home_override() {
-        let cli = Cli::try_parse_from(["wobble", "wallet-info", "--home", "/tmp/node"]).unwrap();
+        let cli = Cli::try_parse_from(["wobble", "wallet", "info", "--home", "/tmp/node"]).unwrap();
 
         match cli.command {
-            Command::WalletInfo(HomeArg { home }) => {
-                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            Command::Wallet {
+                command: WalletCommand::Info(HomeArg { home }),
+            } => {
+                assert_eq!(home, Some(PathBuf::from("/tmp/node")));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1532,11 +1558,37 @@ mod tests {
 
     #[test]
     fn parses_balance_with_home_override() {
-        let cli = Cli::try_parse_from(["wobble", "balance", "--home", "/tmp/node"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["wobble", "wallet", "balance", "--home", "/tmp/node"]).unwrap();
 
         match cli.command {
-            Command::Balance(HomeArg { home }) => {
-                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            Command::Wallet {
+                command: WalletCommand::Balance(HomeArg { home }),
+            } => {
+                assert_eq!(home, Some(PathBuf::from("/tmp/node")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_wallet_new_key_with_home_override() {
+        let cli = Cli::try_parse_from([
+            "wobble",
+            "wallet",
+            "new-key",
+            "miner",
+            "--home",
+            "/tmp/node",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Wallet {
+                command: WalletCommand::NewKey(NewKeyCommand { name, home }),
+            } => {
+                assert_eq!(name, "miner");
+                assert_eq!(home, Some(PathBuf::from("/tmp/node")));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2073,5 +2125,26 @@ mod tests {
             lines[2],
             format!("mempool txid={} sent=20 received=0 net=-20", pending.txid())
         );
+    }
+
+    #[test]
+    fn wallet_new_key_adds_named_key_to_home_wallet() {
+        let root = temp_home_root();
+        let home = NodeHome::new(&root);
+        home.initialize().unwrap();
+
+        run_wallet_new_key(NewKeyCommand {
+            name: "miner".to_string(),
+            home: Some(root.clone()),
+        })
+        .unwrap();
+
+        let wallet = wallet::load_wallet(&home.wallet_path()).unwrap();
+        let key_names: Vec<&str> = wallet.keys().map(|key| key.name()).collect();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(wallet.key_count(), 2);
+        assert!(key_names.contains(&"default"));
+        assert!(key_names.contains(&"miner"));
     }
 }
