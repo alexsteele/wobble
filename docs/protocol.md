@@ -24,7 +24,7 @@ Non-goals for v1:
 
 ## Transport
 
-Each peer connection is a long-lived TCP stream.
+Peer communication uses plain TCP streams.
 
 Messages are framed as newline-delimited JSON:
 - each message is one JSON object
@@ -40,6 +40,26 @@ Why this shape:
 Known limitation:
 - newline-delimited JSON is not efficient for large payloads
 - a binary or length-prefixed protocol may replace it later
+
+## Connection Semantics
+
+The current protocol allows a peer session to carry multiple messages after the
+initial handshake, but the implementation does not yet treat every connection
+class the same way.
+
+Connection classes:
+- sync connections may stay open across a short request sequence such as `get_tip` followed by one or more `get_block` requests
+- relay connections are currently best-effort one-shot connections
+- admin connections are separate from public peer connections and are localhost-only
+
+Why relay is still one-shot:
+- the current server handles one inbound peer stream at a time
+- leaving a relay socket open would keep the remote node inside that one stream handler
+- that would delay later inbound connections until the relay socket closed
+
+Planned direction:
+- move to an async runtime that can manage multiple live peer sockets concurrently
+- then allow a single long-lived peer connection to carry relay, sync, and request traffic safely
 
 ## Envelope
 
@@ -80,8 +100,14 @@ Handshake rules:
 - if `network` differs, close the connection
 - if `version` is unsupported, close the connection
 - after a valid `hello`, the peer may request state or relay objects
+- `hello` must be the first message on a newly opened peer connection
 
 This is a compatibility check, not a security boundary.
+
+After handshake:
+- a peer may send multiple protocol messages on the same connection
+- the current protocol is ordered and implicit: there are no request IDs
+- request/response flows therefore assume one in-flight request at a time on a given connection
 
 ## Messages
 
@@ -131,6 +157,10 @@ Receiver behavior:
 - persist the updated live state in SQLite
 - if newly accepted, relay it to other peers
 
+Current session note:
+- outbound relay currently uses a one-shot connection for each high-level announcement
+- this is an implementation constraint, not a protocol requirement
+
 Known limitation:
 - this sends full transactions immediately instead of announcing hashes first
 
@@ -147,6 +177,10 @@ Receiver behavior:
 - if it becomes the best tip, update active state
 - persist the updated live state in SQLite
 - if newly accepted, relay it to other peers
+
+Current session note:
+- if a relayed block arrives before its parent, the receiver may fetch missing ancestors from the announcing peer
+- that ancestor sync may reuse a single sync session for `get_tip` plus one or more `get_block` requests
 
 Known limitation:
 - this sends full blocks immediately instead of inventory plus fetch
@@ -202,6 +236,11 @@ Suggested flow:
 5. if the received block has an unknown parent, request the parent
 6. repeat until the missing chain segment is filled
 
+Current implementation notes:
+- the sync walk may reuse one outbound session per selected peer
+- the node requests only one peer at a time
+- a successful sync closes that short-lived sync session when the walk completes
+
 This is deliberately naive:
 - it may fetch blocks one at a time
 - it may duplicate requests across peers
@@ -224,6 +263,19 @@ Block relay:
 - do not relay a block already indexed locally
 - do not relay a block rejected by consensus or chain rules
 - relay newly accepted blocks to connected peers except the sender
+
+Current implementation notes:
+- sender suppression prefers the `advertised_addr` learned from `hello`
+- if no advertised listener address is known, relay suppression may fall back to `node_name`
+- relay remains best-effort; a failed outbound announcement does not roll back local acceptance
+
+## Lifecycle
+
+The server now exposes two distinct lifecycle controls:
+- `disconnect()`: drop cached outbound peer sessions without stopping the node
+- `stop()`: stop the server runtime and close its active outbound sessions during shutdown
+
+These are runtime controls, not wire messages.
 
 ## Error Handling
 

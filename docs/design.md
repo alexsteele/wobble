@@ -121,25 +121,55 @@ Rules:
 
 Initial protocol is custom and minimal.
 
-Message classes:
-- `version`
-- `peers`
-- `inv`
-- `get_data`
-- `tx`
+Current message classes:
+- `hello`
+- `get_tip`
+- `tip`
+- `announce_tx`
+- `announce_block`
+- `get_block`
 - `block`
+- `mine_pending`
 
 Behavior:
 - peers connect over TCP
-- nodes announce object hashes with `inv`
-- receivers request unknown objects with `get_data`
+- peers exchange `hello` first
+- nodes currently relay full transactions and blocks, not inventories
+- receivers request unknown blocks with `get_block`
 - blocks and transactions are validated before acceptance and relay
 
 Non-goals for v1:
 - peer discovery via DNS seeds
-- compact blocks
+- compact blocks or inventory-first relay
 - header-first sync optimization
 - DoS-hardening
+
+## Runtime Semantics
+
+The current server runtime is still mostly synchronous.
+
+Important implications:
+- one inbound peer stream is handled at a time
+- inbound connections are accepted sequentially
+- this keeps mutation and reasoning simple, but it limits how aggressively the
+  node can hold open peer sockets today
+
+Current outbound session policy:
+- sync may reuse one short-lived outbound session for `get_tip` plus any needed
+  `get_block` requests in that sync pass
+- relay is still effectively one-shot per high-level announcement
+
+Why relay is not yet long-lived:
+- with the current single-stream serve loop, a long-lived inbound relay socket
+  can monopolize the remote node's stream handler
+- that blocks later inbound peer or client connections until the relay socket closes
+
+Lifecycle controls:
+- `disconnect()` drops cached outbound peer sessions without stopping the server
+- `stop()` ends the serve loop and closes outbound sessions during shutdown
+
+These controls now drive the local TCP integration harness instead of relying
+on guessed connection counts.
 
 ## Mining
 
@@ -200,6 +230,12 @@ Planned crates or modules:
 Runtime:
 - `tokio` for networking and task orchestration
 - explicit state machine boundaries over implicit shared mutation
+
+Near-term intent:
+- keep consensus and state-transition code synchronous and deterministic
+- move networking and peer-session management to an async runtime layer
+- give one runtime task explicit ownership of state mutation, rather than
+  letting many peer tasks mutate `NodeState` concurrently
 
 ## Execution Plan
 

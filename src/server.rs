@@ -681,6 +681,7 @@ impl Server {
         }
         loop {
             if self.control.is_stopped() {
+                self.disconnect();
                 return Ok(());
             }
             self.sync_configured_peers_if_due(&mut next_peer_sync_at);
@@ -903,7 +904,7 @@ impl Server {
     /// behavior reuses one session for the tip poll and any needed block
     /// requests in this sync pass, then closes that session when the sync walk
     /// completes. That keeps hello chatter low within one catch-up operation
-    /// without yet introducing long-lived outbound session shutdown policy.
+    /// without yet requiring concurrent multi-stream server handling.
     fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
         info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
         let remote_tip_summary = self.request_tip_from_peer(peer)?;
@@ -1399,9 +1400,10 @@ impl Server {
     /// Announces one object to a peer, reconnecting once if the cached stream
     /// was already closed.
     ///
-    /// The current server still closes the outbound relay session after each
-    /// high-level relay. That avoids keeping peer streams open indefinitely
-    /// until the server has an explicit outbound-session lifetime policy.
+    /// Relay still closes the outbound session after each announcement because
+    /// the current server processes one inbound stream at a time. Keeping relay
+    /// sockets open would monopolize the remote node's serve loop until the
+    /// transport was explicitly closed.
     fn announce_to_peer_best_effort(
         &mut self,
         peer: &PeerEndpoint,

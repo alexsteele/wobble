@@ -13,6 +13,7 @@ use std::{
     fs,
     net::TcpListener,
     path::PathBuf,
+    sync::Mutex,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +27,8 @@ use wobble::{
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
     wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
 };
+
+static TESTNET_LOCK: Mutex<()> = Mutex::new(());
 
 fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
     Transaction {
@@ -314,6 +317,7 @@ impl RunningNode {
 
 #[test]
 fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
+    let _guard = TESTNET_LOCK.lock().unwrap();
     let sender = crypto::signing_key_from_bytes([1; 32]);
     let recipient = crypto::signing_key_from_bytes([2; 32]);
     let miner = crypto::signing_key_from_bytes([3; 32]);
@@ -393,6 +397,7 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
 
 #[test]
 fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
+    let _guard = TESTNET_LOCK.lock().unwrap();
     let sender = crypto::signing_key_from_bytes([11; 32]);
     let recipient = crypto::signing_key_from_bytes([12; 32]);
     let miner = crypto::signing_key_from_bytes([13; 32]);
@@ -492,6 +497,7 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
 
 #[test]
 fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
+    let _guard = TESTNET_LOCK.lock().unwrap();
     let sender = crypto::signing_key_from_bytes([21; 32]);
     let recipient = crypto::signing_key_from_bytes([22; 32]);
     let miner = crypto::signing_key_from_bytes([23; 32]);
@@ -584,6 +590,7 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
 
 #[test]
 fn bootstrap_sync_follower_catches_up_to_seeded_server() {
+    let _guard = TESTNET_LOCK.lock().unwrap();
     let miner = crypto::signing_key_from_bytes([31; 32]);
     let genesis = mine_block(
         BlockHash::default(),
@@ -645,6 +652,7 @@ fn bootstrap_sync_follower_catches_up_to_seeded_server() {
 
 #[test]
 fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
+    let _guard = TESTNET_LOCK.lock().unwrap();
     let sender = crypto::signing_key_from_bytes([31; 32]);
     let recipient = crypto::signing_key_from_bytes([32; 32]);
     let miner = crypto::signing_key_from_bytes([33; 32]);
@@ -717,6 +725,7 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
 
 #[test]
 fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
+    let _guard = TESTNET_LOCK.lock().unwrap();
     let sender = crypto::signing_key_from_bytes([41; 32]);
     let recipient = crypto::signing_key_from_bytes([42; 32]);
     let miner = crypto::signing_key_from_bytes([43; 32]);
