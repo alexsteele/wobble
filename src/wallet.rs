@@ -20,6 +20,7 @@ pub enum WalletError {
     Encode(bincode::error::EncodeError),
     Decode(bincode::error::DecodeError),
     DuplicateKeyName(String),
+    UnknownKeyName(String),
     MissingDefaultKey(String),
     EmptyWallet,
 }
@@ -116,6 +117,13 @@ impl Wallet {
 
     pub fn keys(&self) -> impl Iterator<Item = &WalletKey> {
         self.keys.iter()
+    }
+
+    pub fn key(&self, name: &str) -> Result<&WalletKey, WalletError> {
+        self.keys
+            .iter()
+            .find(|key| key.name == name)
+            .ok_or_else(|| WalletError::UnknownKeyName(name.to_string()))
     }
 
     pub fn signing_key(&self) -> &SigningKey {

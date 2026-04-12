@@ -61,8 +61,8 @@ enum Command {
     Transactions(HomeArg),
     /// Prints status from the running local node server.
     Status(HomeArg),
-    /// Builds and queues a local payment from the node wallet.
-    SubmitPayment(SubmitPaymentCommand),
+    /// Builds and queues a local payment from one wallet key.
+    Pay(PayCommand),
     /// Reads chain or peer state without mutating local data.
     Inspect {
         #[command(subcommand)]
@@ -137,11 +137,14 @@ struct ServeCommand {
     mining_bits: Option<String>,
 }
 
-/// Builds a signed payment from the local wallet and submits it to the local node server.
+/// Builds a signed payment from one wallet key and submits it to the local node server.
 #[derive(Debug, Args)]
-struct SubmitPaymentCommand {
+struct PayCommand {
+    /// Wallet key name to spend from. Defaults to the wallet's default key.
+    #[arg(long = "from")]
+    from_key: Option<String>,
     /// Recipient public key hex or `@alias_book:name`.
-    recipient: String,
+    to: String,
     /// Number of coins to send.
     amount: u64,
     /// Optional transaction uniqueness override.
@@ -400,7 +403,7 @@ fn run() -> Result<(), String> {
         Command::Wallet { command } => run_wallet(command),
         Command::Transactions(command) => run_transactions(command),
         Command::Status(command) => run_status(command),
-        Command::SubmitPayment(command) => run_submit_payment(command),
+        Command::Pay(command) => run_pay(command),
         Command::Inspect { command } => run_inspect(command),
         Command::Admin { command } => run_admin(command),
         Command::Debug { command } => run_debug(command),
@@ -698,19 +701,34 @@ fn run_status(command: HomeArg) -> Result<(), String> {
     Ok(())
 }
 
-/// Builds a signed payment from the local wallet and submits it to the local server.
-fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
+/// Returns the signing key selected by `name`, or the wallet default key.
+fn payment_signing_key<'a>(
+    wallet: &'a Wallet,
+    name: Option<&str>,
+) -> Result<&'a ed25519_dalek::SigningKey, String> {
+    match name {
+        Some(name) => wallet
+            .key(name)
+            .map(|key| key.signing_key())
+            .map_err(|err| format!("wallet key lookup failed: {err:?}")),
+        None => Ok(wallet.signing_key()),
+    }
+}
+
+/// Builds a signed payment from one wallet key and submits it to the local server.
+fn run_pay(command: PayCommand) -> Result<(), String> {
     let home = resolve_node_home(command.home.as_deref())?;
     let node_config = home
         .load_config()
         .map_err(|err| format!("config load failed: {err:?}"))?;
-    let recipient_verifying_key = parse_public_key_or_alias(&command.recipient)?;
+    let recipient_verifying_key = parse_public_key_or_alias(&command.to)?;
     let sender_wallet = wallet::load_wallet(&home.wallet_path())
         .map_err(|err| format!("wallet load failed: {err:?}"))?;
+    let sender_signing_key = payment_signing_key(&sender_wallet, command.from_key.as_deref())?;
     let mut state = load_sqlite_state(&home.state_path())?;
     let submitted = state
         .submit_payment(
-            &wallet_signing_keys(&sender_wallet),
+            &[sender_signing_key],
             &sender_wallet.verifying_key(),
             &recipient_verifying_key,
             command.amount,
@@ -1437,7 +1455,7 @@ mod tests {
 
     use super::{
         BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
-        NewKeyCommand, ServeCommand, SubmitPaymentCommand, WalletCommand, format_admin_error,
+        NewKeyCommand, PayCommand, ServeCommand, WalletCommand, format_admin_error,
         resolve_mining_runtime, resolve_serve_runtime, resolve_state_and_wallet_paths,
         resolve_state_path, resolve_wallet_path, run_wallet_new_key, wallet_transaction_lines,
     };
@@ -1501,12 +1519,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_high_level_submit_payment_with_optional_uniqueness() {
+    fn parses_pay_with_optional_from_and_uniqueness() {
         let cli = Cli::try_parse_from([
             "wobble",
-            "submit-payment",
+            "pay",
             "@/tmp/book.json:alice",
             "25",
+            "--from",
+            "savings",
             "--uniqueness",
             "7",
             "--home",
@@ -1515,13 +1535,15 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Command::SubmitPayment(SubmitPaymentCommand {
-                recipient,
+            Command::Pay(PayCommand {
+                from_key,
+                to,
                 amount,
                 uniqueness,
                 home,
             }) => {
-                assert_eq!(recipient, "@/tmp/book.json:alice");
+                assert_eq!(from_key.as_deref(), Some("savings"));
+                assert_eq!(to, "@/tmp/book.json:alice");
                 assert_eq!(amount, 25);
                 assert_eq!(uniqueness, Some(7));
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
@@ -2146,5 +2168,20 @@ mod tests {
         assert_eq!(wallet.key_count(), 2);
         assert!(key_names.contains(&"default"));
         assert!(key_names.contains(&"miner"));
+    }
+
+    #[test]
+    fn payment_signing_key_uses_named_key_or_default() {
+        let mut wallet = wallet::Wallet::generate();
+        wallet.generate_key("savings").unwrap();
+
+        let default_public = wallet.verifying_key();
+        let named_public = wallet.key("savings").unwrap().verifying_key();
+
+        let selected_default = super::payment_signing_key(&wallet, None).unwrap();
+        let selected_named = super::payment_signing_key(&wallet, Some("savings")).unwrap();
+
+        assert_eq!(selected_default.verifying_key(), default_public);
+        assert_eq!(selected_named.verifying_key(), named_public);
     }
 }

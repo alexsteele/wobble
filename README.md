@@ -50,7 +50,7 @@ Commands:
   serve           Starts the local node server
   wallet          Reads or updates the local wallet stored under the node home
   transactions    Prints recent wallet transactions from the local sqlite index
-  submit-payment  Builds and queues a local payment from the node wallet
+  pay             Builds and queues a local payment from the node wallet
   inspect         Reads chain or peer state without mutating local data
   admin           Manages helper files like wallets and alias books
   debug           Runs lower-level development and test commands
@@ -69,7 +69,8 @@ wobble wallet balance                                  # show wallet balances fr
 wobble wallet new-key miner                            # add a named keypair to the local wallet
 wobble serve                                           # start the local node using ~/.wobble/config.json
 wobble serve --mining                                  # start server with mining enabled
-wobble submit-payment <recipient_public_key> 30        # queue a payment from the local wallet
+wobble pay <recipient_public_key> 30                   # queue a payment from the default wallet key
+wobble pay <recipient_public_key> 30 --from savings    # queue a payment from a named wallet key
 ```
 
 `wobble init` creates a default node home at `~/.wobble` with:
