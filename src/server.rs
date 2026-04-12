@@ -16,6 +16,7 @@
 //! `mine_pending` requests.
 
 use std::{
+    collections::HashMap,
     io,
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
@@ -74,6 +75,7 @@ pub struct Server {
     config: PeerConfig,
     state: NodeState,
     peers: Vec<PeerEndpoint>,
+    peer_state: HashMap<String, StoredPeer>,
     sqlite_store: Option<sqlite_store::SqliteStore>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
@@ -169,6 +171,7 @@ impl Server {
             config,
             state,
             peers: Vec::new(),
+            peer_state: HashMap::new(),
             sqlite_store: None,
             bootstrap_sync: false,
             mining: None,
@@ -177,6 +180,15 @@ impl Server {
 
     /// Configures the peer addresses that should receive relayed transactions and blocks.
     pub fn with_peers(mut self, peers: Vec<PeerEndpoint>) -> Self {
+        self.peer_state = peers
+            .iter()
+            .map(|peer| {
+                (
+                    peer.addr.clone(),
+                    StoredPeer::from_endpoint(peer.clone(), PeerSource::Seed),
+                )
+            })
+            .collect();
         self.peers = peers;
         self
     }
@@ -641,13 +653,41 @@ impl Server {
     /// serve local traffic even if some peers are offline or return incomplete
     /// history.
     pub fn sync_configured_peers_best_effort(&mut self) {
-        let peers = self.peers.clone();
+        let peers = self.select_sync_peers();
         for peer in &peers {
             if let Err(err) = self.sync_from_peer(peer) {
                 let _ = self.record_peer_connect_failure(peer, &err);
                 warn!(peer_addr = %peer.addr, error = ?err, "bootstrap sync from peer failed");
             }
         }
+    }
+
+    /// Selects the best currently-known sync candidates from configured peers.
+    ///
+    /// The first version is intentionally conservative: it picks at most one
+    /// peer whose advertised height is ahead of the local node, falling back to
+    /// the configured peer list order when no peer has advertised a tip yet.
+    fn select_sync_peers(&self) -> Vec<PeerEndpoint> {
+        let local_height = self.state.tip_summary().height.unwrap_or(0);
+        let mut candidates: Vec<StoredPeer> = self
+            .peers
+            .iter()
+            .filter_map(|peer| self.peer_state.get(&peer.addr).cloned())
+            .collect();
+        candidates.sort_by(|left, right| {
+            right
+                .advertised_height
+                .unwrap_or(0)
+                .cmp(&left.advertised_height.unwrap_or(0))
+                .then_with(|| left.addr.cmp(&right.addr))
+        });
+        if let Some(best) = candidates
+            .into_iter()
+            .find(|peer| peer.advertised_height.unwrap_or(0) > local_height)
+        {
+            return vec![best.endpoint()];
+        }
+        self.peers.first().cloned().into_iter().collect()
     }
 
     /// Fetches a missing remote tip segment from `peer` and applies it
@@ -887,20 +927,19 @@ impl Server {
 
     /// Records peer metadata learned from one inbound `hello`.
     fn record_inbound_hello(
-        &self,
+        &mut self,
         peer_addr: Option<std::net::SocketAddr>,
         remote_hello: &HelloMessage,
     ) -> Result<(), SqliteStoreError> {
-        let Some(store) = self.sqlite_store.as_ref() else {
+        if self.sqlite_store.is_none() {
             return Ok(());
-        };
+        }
         let addr = remote_hello
             .advertised_addr
             .clone()
             .or_else(|| peer_addr.map(|addr| addr.to_string()))
             .unwrap_or_else(|| "unknown".to_string());
         self.update_persisted_peer(
-            store,
             &PeerEndpoint::new(addr, remote_hello.node_name.clone()),
             PeerSource::Hello,
             |peer| {
@@ -913,25 +952,25 @@ impl Server {
     }
 
     /// Records the start of one outbound sync attempt to a configured peer.
-    fn record_peer_connect_attempt(&self, peer: &PeerEndpoint) -> Result<(), SqliteStoreError> {
-        let Some(store) = self.sqlite_store.as_ref() else {
+    fn record_peer_connect_attempt(&mut self, peer: &PeerEndpoint) -> Result<(), SqliteStoreError> {
+        if self.sqlite_store.is_none() {
             return Ok(());
-        };
-        self.update_persisted_peer(store, peer, PeerSource::Seed, |stored| {
+        }
+        self.update_persisted_peer(peer, PeerSource::Seed, |stored| {
             stored.last_connect_at = Some(now_timestamp_string());
         })
     }
 
     /// Records a successful outbound handshake and the peer's advertised tip.
     fn record_peer_connect_success(
-        &self,
+        &mut self,
         peer: &PeerEndpoint,
         remote_hello: &HelloMessage,
     ) -> Result<(), SqliteStoreError> {
-        let Some(store) = self.sqlite_store.as_ref() else {
+        if self.sqlite_store.is_none() {
             return Ok(());
-        };
-        self.update_persisted_peer(store, peer, PeerSource::Seed, |stored| {
+        }
+        self.update_persisted_peer(peer, PeerSource::Seed, |stored| {
             stored.node_name = remote_hello.node_name.clone().or_else(|| stored.node_name.clone());
             stored.advertised_tip_hash = remote_hello.tip;
             stored.advertised_height = remote_hello.height;
@@ -946,14 +985,14 @@ impl Server {
 
     /// Records a failed outbound sync attempt for one configured peer.
     fn record_peer_connect_failure(
-        &self,
+        &mut self,
         peer: &PeerEndpoint,
         err: &SyncError,
     ) -> Result<(), SqliteStoreError> {
-        let Some(store) = self.sqlite_store.as_ref() else {
+        if self.sqlite_store.is_none() {
             return Ok(());
-        };
-        self.update_persisted_peer(store, peer, PeerSource::Seed, |stored| {
+        }
+        self.update_persisted_peer(peer, PeerSource::Seed, |stored| {
             stored.last_connect_at = Some(now_timestamp_string());
             stored.last_error = Some(format!("{err:?}"));
             stored.failed_connections = stored.failed_connections.saturating_add(1);
@@ -962,8 +1001,7 @@ impl Server {
 
     /// Loads, updates, and rewrites the persisted peer set with one upserted peer.
     fn update_persisted_peer<F>(
-        &self,
-        store: &sqlite_store::SqliteStore,
+        &mut self,
         endpoint: &PeerEndpoint,
         source: PeerSource,
         update: F,
@@ -971,6 +1009,10 @@ impl Server {
     where
         F: FnOnce(&mut StoredPeer),
     {
+        let store = self
+            .sqlite_store
+            .as_ref()
+            .expect("peer persistence requires an open sqlite store");
         let mut peers = store.load_peers().unwrap_or_default();
         let index = peers.iter().position(|peer| peer.addr == endpoint.addr);
         let mut peer = index
@@ -980,6 +1022,7 @@ impl Server {
             peer.node_name = endpoint.node_name.clone();
         }
         update(&mut peer);
+        self.peer_state.insert(peer.addr.clone(), peer.clone());
         peers.push(peer);
         peers.sort_by(|left, right| left.addr.cmp(&right.addr));
         store.save_peers(&peers)
@@ -1193,6 +1236,7 @@ mod tests {
         chain::ChainError,
         crypto, net,
         node_state::{NodeState, NodeStateError},
+        peers::{PeerSource, StoredPeer},
         peer::PeerConfig,
         server::{MiningConfig, PeerEndpoint, Server},
         sqlite_store::SqliteStore,
@@ -1575,6 +1619,88 @@ mod tests {
         assert_eq!(peers[0].advertised_tip_hash, Some(BlockHash::new([0x22; 32])));
         assert_eq!(peers[0].advertised_height, Some(5));
         assert!(peers[0].last_hello_at.is_some());
+    }
+
+    #[test]
+    fn select_sync_peers_prefers_highest_advertised_height_ahead_of_local_tip() {
+        let mut state = NodeState::new();
+        let owner = crypto::signing_key_from_bytes([1; 32]);
+        state
+            .accept_block(mine_block(
+                BlockHash::default(),
+                0x207f_ffff,
+                &owner.verifying_key(),
+                0,
+            ))
+            .unwrap();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), state).with_peers(vec![
+            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+            PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
+        ]);
+        server.peer_state.insert(
+            "127.0.0.1:9001".to_string(),
+            StoredPeer {
+                addr: "127.0.0.1:9001".to_string(),
+                node_name: Some("alpha".to_string()),
+                source: PeerSource::Seed,
+                advertised_tip_hash: Some(BlockHash::new([0x11; 32])),
+                advertised_height: Some(1),
+                ..StoredPeer::from_endpoint(
+                    PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                    PeerSource::Seed,
+                )
+            },
+        );
+        server.peer_state.insert(
+            "127.0.0.1:9002".to_string(),
+            StoredPeer {
+                addr: "127.0.0.1:9002".to_string(),
+                node_name: Some("beta".to_string()),
+                source: PeerSource::Seed,
+                advertised_tip_hash: Some(BlockHash::new([0x22; 32])),
+                advertised_height: Some(4),
+                ..StoredPeer::from_endpoint(
+                    PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+                    PeerSource::Seed,
+                )
+            },
+        );
+        server.peer_state.insert(
+            "127.0.0.1:9003".to_string(),
+            StoredPeer {
+                addr: "127.0.0.1:9003".to_string(),
+                node_name: Some("gamma".to_string()),
+                source: PeerSource::Seed,
+                advertised_tip_hash: Some(BlockHash::new([0x33; 32])),
+                advertised_height: Some(3),
+                ..StoredPeer::from_endpoint(
+                    PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
+                    PeerSource::Seed,
+                )
+            },
+        );
+
+        let selected = server.select_sync_peers();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].addr, "127.0.0.1:9002");
+        assert_eq!(selected[0].node_name.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn select_sync_peers_falls_back_to_first_configured_peer_without_tip_metadata() {
+        let server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+            .with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+            ]);
+
+        let selected = server.select_sync_peers();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].addr, "127.0.0.1:9001");
+        assert_eq!(selected[0].node_name.as_deref(), Some("alpha"));
     }
 
     #[test]
