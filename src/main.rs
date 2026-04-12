@@ -23,7 +23,7 @@ use wobble::{
     crypto,
     home::{MiningSection, NodeConfig, NodeHome},
     logging, net,
-    node_state::NodeState,
+    node_state::{NodeState, build_payment_transaction},
     peer::PeerConfig,
     peers,
     server::{MiningConfig, Server},
@@ -725,21 +725,21 @@ fn run_pay(command: PayCommand) -> Result<(), String> {
     let sender_wallet = wallet::load_wallet(&home.wallet_path())
         .map_err(|err| format!("wallet load failed: {err:?}"))?;
     let sender_signing_key = payment_signing_key(&sender_wallet, command.from_key.as_deref())?;
-    let mut state = load_sqlite_state(&home.state_path())?;
-    let submitted = state
-        .submit_payment(
-            &[sender_signing_key],
-            &sender_wallet.verifying_key(),
-            &recipient_verifying_key,
-            command.amount,
-            command.uniqueness.unwrap_or_else(default_uniqueness),
-        )
-        .map_err(|err| format!("submit failed: {err:?}"))?;
-    let transaction = state
-        .mempool()
-        .get(&submitted)
-        .cloned()
-        .ok_or_else(|| format!("built transaction {submitted} missing from local mempool"))?;
+    let store = SqliteStore::open_read_only(&home.state_path())
+        .map_err(|err| format!("sqlite open failed: {err:?}"))?;
+    let utxos = store
+        .load_active_utxos()
+        .map_err(|err| format!("sqlite load failed: {err:?}"))?;
+    let transaction = build_payment_transaction(
+        &utxos,
+        &[sender_signing_key],
+        &sender_wallet.verifying_key(),
+        &recipient_verifying_key,
+        command.amount,
+        command.uniqueness.unwrap_or_else(default_uniqueness),
+    )
+    .map_err(|err| format!("build failed: {err:?}"))?;
+    let submitted = transaction.txid();
     admin::submit_transaction(&node_config.admin_addr, transaction).map_err(|err| {
         format_admin_error("submit to local server", &node_config.admin_addr, err)
     })?;

@@ -144,84 +144,14 @@ impl NodeState {
         amount: Amount,
         uniqueness: u32,
     ) -> Result<Txid, NodeStateError> {
-        let sender_keys: Vec<(Vec<u8>, &SigningKey)> = sender_signing_keys
-            .iter()
-            .map(|key| {
-                (
-                    crypto::verifying_key_bytes(&key.verifying_key()).to_vec(),
-                    *key,
-                )
-            })
-            .collect();
-        let change_locking_data = crypto::verifying_key_bytes(change_verifying_key).to_vec();
-        let mut selected = Vec::new();
-        let mut total = 0_u64;
-
-        // Find active UTXOs controlled by any owned key and gather enough
-        // value to fund the requested payment plus any change output.
-        for outpoint in self.active_outpoints() {
-            let Some(utxo) = self.active_utxos.get(&outpoint) else {
-                continue;
-            };
-            let Some((_, signing_key)) = sender_keys
-                .iter()
-                .find(|(locking_data, _)| *locking_data == utxo.output.locking_data)
-            else {
-                continue;
-            };
-
-            selected.push((outpoint, utxo.output.value, *signing_key));
-            total = total.saturating_add(utxo.output.value);
-            if total >= amount {
-                break;
-            }
-        }
-
-        if total < amount {
-            return Err(NodeStateError::InsufficientFunds {
-                requested: amount,
-                available: total,
-            });
-        }
-
-        let mut outputs = vec![TxOut {
-            value: amount,
-            locking_data: crypto::verifying_key_bytes(recipient_verifying_key).to_vec(),
-        }];
-        let change = total - amount;
-        if change > 0 {
-            outputs.push(TxOut {
-                value: change,
-                locking_data: change_locking_data.clone(),
-            });
-        }
-
-        let selected_inputs: Vec<(TxIn, &SigningKey)> = selected
-            .into_iter()
-            .map(|(previous_output, _, signing_key)| {
-                (
-                    TxIn {
-                        previous_output,
-                        unlocking_data: Vec::new(),
-                    },
-                    signing_key,
-                )
-            })
-            .collect();
-
-        let mut tx = Transaction {
-            version: 1,
-            inputs: selected_inputs
-                .iter()
-                .map(|(input, _)| input.clone())
-                .collect(),
-            outputs,
-            lock_time: uniqueness,
-        };
-        let signing_digest = tx.signing_digest();
-        for (input, (_, signing_key)) in tx.inputs.iter_mut().zip(selected_inputs.iter()) {
-            input.unlocking_data = crypto::sign_message(signing_key, &signing_digest).to_vec();
-        }
+        let tx = build_payment_transaction(
+            &self.active_utxos,
+            sender_signing_keys,
+            change_verifying_key,
+            recipient_verifying_key,
+            amount,
+            uniqueness,
+        )?;
         self.submit_transaction(tx)
     }
 
@@ -325,6 +255,106 @@ impl NodeState {
     }
 }
 
+/// Builds a signed payment transaction from the current active UTXO view.
+///
+/// This selects spendable outputs controlled by any of `sender_signing_keys`
+/// until the requested `amount` is covered. If the selected inputs exceed the
+/// payment amount, the remainder is returned to `change_verifying_key` as a
+/// change output. The returned transaction is fully signed but not inserted
+/// into any mempool.
+pub fn build_payment_transaction(
+    utxos: &UtxoSet,
+    sender_signing_keys: &[&SigningKey],
+    change_verifying_key: &VerifyingKey,
+    recipient_verifying_key: &VerifyingKey,
+    amount: Amount,
+    uniqueness: u32,
+) -> Result<Transaction, NodeStateError> {
+    let sender_keys: Vec<(Vec<u8>, &SigningKey)> = sender_signing_keys
+        .iter()
+        .map(|key| {
+            (
+                crypto::verifying_key_bytes(&key.verifying_key()).to_vec(),
+                *key,
+            )
+        })
+        .collect();
+    let change_locking_data = crypto::verifying_key_bytes(change_verifying_key).to_vec();
+    let mut outpoints: Vec<OutPoint> = utxos.iter().map(|(outpoint, _)| *outpoint).collect();
+    outpoints.sort_by_key(|outpoint| (outpoint.txid.to_string(), outpoint.vout));
+
+    let mut selected = Vec::new();
+    let mut total = 0_u64;
+
+    // Find active UTXOs controlled by any selected sender key and gather
+    // enough value to fund the requested payment plus any change output.
+    for outpoint in outpoints {
+        let Some(utxo) = utxos.get(&outpoint) else {
+            continue;
+        };
+        let Some((_, signing_key)) = sender_keys
+            .iter()
+            .find(|(locking_data, _)| *locking_data == utxo.output.locking_data)
+        else {
+            continue;
+        };
+
+        selected.push((outpoint, utxo.output.value, *signing_key));
+        total = total.saturating_add(utxo.output.value);
+        if total >= amount {
+            break;
+        }
+    }
+
+    if total < amount {
+        return Err(NodeStateError::InsufficientFunds {
+            requested: amount,
+            available: total,
+        });
+    }
+
+    let mut outputs = vec![TxOut {
+        value: amount,
+        locking_data: crypto::verifying_key_bytes(recipient_verifying_key).to_vec(),
+    }];
+    let change = total - amount;
+    if change > 0 {
+        outputs.push(TxOut {
+            value: change,
+            locking_data: change_locking_data,
+        });
+    }
+
+    let selected_inputs: Vec<(TxIn, &SigningKey)> = selected
+        .into_iter()
+        .map(|(previous_output, _, signing_key)| {
+            (
+                TxIn {
+                    previous_output,
+                    unlocking_data: Vec::new(),
+                },
+                signing_key,
+            )
+        })
+        .collect();
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: selected_inputs
+            .iter()
+            .map(|(input, _)| input.clone())
+            .collect(),
+        outputs,
+        lock_time: uniqueness,
+    };
+    let signing_digest = tx.signing_digest();
+    for (input, (_, signing_key)) in tx.inputs.iter_mut().zip(selected_inputs.iter()) {
+        input.unlocking_data = crypto::sign_message(signing_key, &signing_digest).to_vec();
+    }
+
+    Ok(tx)
+}
+
 fn coinbase_transaction(
     reward: u64,
     miner_verifying_key: &VerifyingKey,
@@ -383,11 +413,12 @@ mod tests {
     use crate::consensus::BLOCK_SUBSIDY;
     use crate::{
         crypto,
+        state::UtxoSet,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
     };
     use ed25519_dalek::{SigningKey, VerifyingKey};
 
-    use super::{NodeState, NodeStateError};
+    use super::{NodeState, NodeStateError, build_payment_transaction};
 
     fn signing_key(seed: u8) -> SigningKey {
         crypto::signing_key_from_bytes([seed; 32])
@@ -426,6 +457,19 @@ mod tests {
         };
         tx.inputs[0].unlocking_data = crypto::sign_message(signer, &tx.signing_digest()).to_vec();
         tx
+    }
+
+    fn spendable_output(value: u64, owner: &VerifyingKey, uniqueness: u32) -> crate::types::Utxo {
+        let txid = coinbase(value, owner, uniqueness).txid();
+        crate::types::Utxo {
+            outpoint: OutPoint { txid, vout: 0 },
+            output: TxOut {
+                value,
+                locking_data: crypto::verifying_key_bytes(owner).to_vec(),
+            },
+            created_at_height: 0,
+            is_coinbase: true,
+        }
     }
 
     fn mine_block(prev_blockhash: BlockHash, bits: u32, transactions: Vec<Transaction>) -> Block {
@@ -841,5 +885,38 @@ mod tests {
             crypto::verifying_key_bytes(&first.verifying_key()).to_vec()
         );
         assert_ne!(tx.inputs[0].unlocking_data, tx.inputs[1].unlocking_data);
+    }
+
+    #[test]
+    fn builds_payment_transaction_from_utxos_without_node_state() {
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let mut utxos = UtxoSet::new();
+        let funding = spendable_output(40, &sender.verifying_key(), 0);
+        utxos.insert(funding);
+
+        let tx = build_payment_transaction(
+            &utxos,
+            &[&sender],
+            &sender.verifying_key(),
+            &recipient.verifying_key(),
+            25,
+            9,
+        )
+        .unwrap();
+
+        assert_eq!(tx.inputs.len(), 1);
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].value, 25);
+        assert_eq!(
+            tx.outputs[0].locking_data,
+            crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec()
+        );
+        assert_eq!(tx.outputs[1].value, 15);
+        assert_eq!(
+            tx.outputs[1].locking_data,
+            crypto::verifying_key_bytes(&sender.verifying_key()).to_vec()
+        );
+        assert!(utxos.validate_transaction(&tx).is_ok());
     }
 }
