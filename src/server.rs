@@ -262,14 +262,15 @@ impl Server {
             return Ok(recovered);
         }
         log_inbound_message(&message, &self.state);
-        let should_persist = message_mutates_state(&message);
+        let should_save = message_mutates_state(&message);
         let relay = self.relay_message_before_handle(&message);
-        let sqlite_block_hash = persisted_block_hash(&message);
+        let save_block_hash = saved_block_hash(&message);
+        let save_message = message.clone();
         let replies = peer::handle_message(&self.config, &mut self.state, message)
             .map_err(ServerError::Peer)?;
         log_post_handle_state(&replies, &self.state);
-        if should_persist {
-            self.persist_sqlite(sqlite_block_hash, &replies)
+        if should_save {
+            self.save_sqlite(&save_message, save_block_hash, &replies)
                 .map_err(ServerError::SqlitePersist)?;
         }
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
@@ -307,7 +308,7 @@ impl Server {
         match peer::handle_message(&self.config, &mut self.state, message.clone()) {
             Ok(replies) => {
                 log_post_handle_state(&replies, &self.state);
-                self.persist_sqlite(Some(block_hash), &replies)
+                self.save_sqlite(message, Some(block_hash), &replies)
                     .map_err(ServerError::SqlitePersist)?;
                 if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
                     self.relay_best_effort(&relay, origin);
@@ -349,7 +350,7 @@ impl Server {
         let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
             .map_err(ServerError::Peer)?;
         log_post_handle_state(&replies, &self.state);
-        self.persist_sqlite(Some(block_hash), &replies)
+        self.save_sqlite(message, Some(block_hash), &replies)
             .map_err(ServerError::SqlitePersist)?;
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
@@ -802,7 +803,7 @@ impl Server {
         }
 
         if !accepted_blocks.is_empty() {
-            self.persist_full_state()
+            self.save_full_state()
                 .map_err(SyncError::SqlitePersist)?;
         }
 
@@ -865,14 +866,18 @@ impl Server {
         Ok(Some(block))
     }
 
-    fn persist_sqlite(
+    fn save_sqlite(
         &self,
+        message: &WireMessage,
         request_block_hash: Option<BlockHash>,
         replies: &[WireMessage],
     ) -> Result<(), SqliteStoreError> {
         let Some(store) = self.sqlite_store.as_ref() else {
             return Ok(());
         };
+        if let WireMessage::AnnounceTx { transaction } = message {
+            return store.save_mempool_transaction(transaction);
+        }
         let Some(block_hash) = request_block_hash.or_else(|| mined_block_hash(replies)) else {
             store.save_active_utxos(self.state.active_utxos())?;
             store.save_mempool(self.state.mempool())?;
@@ -890,7 +895,7 @@ impl Server {
     }
 
     /// Persists the full current node state when a bulk sync changed local history.
-    fn persist_full_state(&self) -> Result<(), SqliteStoreError> {
+    fn save_full_state(&self) -> Result<(), SqliteStoreError> {
         let Some(store) = self.sqlite_store.as_ref() else {
             return Ok(());
         };
@@ -1139,7 +1144,7 @@ fn message_mutates_state(message: &WireMessage) -> bool {
     )
 }
 
-fn persisted_block_hash(message: &WireMessage) -> Option<BlockHash> {
+fn saved_block_hash(message: &WireMessage) -> Option<BlockHash> {
     match message {
         WireMessage::AnnounceBlock { block } => Some(block.header.block_hash()),
         _ => None,
