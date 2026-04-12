@@ -8,14 +8,14 @@ Derived from local git history.
 
 | Date       | # Commits | Hours | Line Changes     |
 | ---------- | --------: | ----: | ---------------- |
-| 2026-04-11 |        53 |   8.5 | +11,038 / -2,462 |
-| 2026-04-10 |        19 |   1.9 | +4,008 / -355    |
+| 2026-04-11 |        56 |   9.3 | +11,667 / -3,252 |
+| 2026-04-10 |        44 |   4.2 | +7,924 / -487    |
 
 Current code size:
 
-- `src/`: `9,552` lines
-- `tests/`: `765` lines
-- `scripts/`: `403` lines
+- `src/`: `12,547` lines
+- `tests/`: `828` lines
+- `scripts/`: `688` lines
 
 ## 2026-04-11 Notes
 
@@ -27,6 +27,9 @@ Current code size:
 - Added short outbound peer IO timeouts so bootstrap sync remains best effort instead of hanging server startup.
 - Added a local configurable testnet harness under `scripts/` that starts `/tmp` homes, bootstraps one side, waits for sync, optionally submits random payments, and captures logs toward a future `test-net` command.
 - Simplified wallet-facing CLI shape around `wallet-info` and removed the separate address/balance split.
+- Persisted peer metadata in SQLite, including advertised tip hash, advertised height, and hello timing, to support better sync decisions across restarts.
+- Added an in-memory peer-state cache in the server so sync selection can use recently learned peer tip/height data without rereading SQLite on each pass.
+- Tightened sync selection to prefer the highest advertised configured peer ahead of the local tip, with focused regression tests for both that path and the no-metadata fallback.
 
 ## 2026-04-10 Notes
 
