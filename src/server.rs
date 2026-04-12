@@ -545,8 +545,15 @@ impl Server {
                         message: "invalid public key".to_string(),
                     };
                 }
+                let start_uniqueness = self
+                    .state
+                    .tip_summary()
+                    .height
+                    .and_then(|height| u32::try_from(height.saturating_add(1)).ok())
+                    .unwrap_or(0);
                 let mut last_block_hash = None;
-                for uniqueness in 0..blocks {
+                for offset in 0..blocks {
+                    let uniqueness = start_uniqueness.saturating_add(offset);
                     match self.handle_message(WireMessage::MinePending(
                         crate::wire::MinePendingRequest {
                             reward: BLOCK_SUBSIDY,
@@ -677,6 +684,11 @@ impl Server {
                 break;
             }
 
+            debug!(
+                peer_addr = %peer.addr,
+                block_hash = %format_hash(Some(next_hash)),
+                "requesting block during sync"
+            );
             let block = client::request_block(&peer.addr, &self.config, next_hash)
                 .map_err(SyncError::Request)?
                 .ok_or(SyncError::MissingRemoteBlock(next_hash))?;
@@ -1246,6 +1258,30 @@ mod tests {
         drop(reader);
         let server = worker.join().unwrap().unwrap();
         assert_eq!(server.state().balance_for_key(&owner.verifying_key()), 100);
+    }
+
+    #[test]
+    fn bootstrap_uniqueness_advances_with_existing_height() {
+        let owner = crypto::signing_key_from_bytes([8; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        server.state_mut().accept_block(genesis).unwrap();
+
+        let response = server.handle_admin_request(AdminRequest::Bootstrap {
+            public_key: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            blocks: 1,
+        });
+
+        let AdminResponse::Bootstrapped(summary) = response else {
+            panic!("expected bootstrapped response");
+        };
+        let block_hash = summary.last_block_hash.expect("bootstrap should mine one block");
+        let block = server
+            .state()
+            .get_block(&block_hash)
+            .expect("mined block should be indexed");
+
+        assert_eq!(block.transactions[0].lock_time, 1);
     }
 
     #[test]

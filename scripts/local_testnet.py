@@ -253,6 +253,10 @@ class LocalTestNet:
 
     def peer_specs_for(self, index: int) -> list[dict[str, str | None]]:
         """Returns the configured peers for one managed node."""
+        if self.seed_peer:
+            if index == 0:
+                return [{"addr": self.seed_peer, "node_name": None}]
+            return [{"addr": self.nodes[0].ports.listen, "node_name": self.nodes[0].name}]
         peers: list[dict[str, str | None]] = []
         for peer_index, peer in enumerate(self.nodes):
             if peer_index == index:
@@ -320,10 +324,46 @@ class LocalTestNet:
 
     def start_servers(self) -> None:
         """Starts all managed node servers and waits for them to report live."""
+        if self.seed_peer:
+            self.start_seeded_servers()
+            return
         for index, node in enumerate(self.nodes):
             self.start_node(node, mining=index == self.args.mining_node)
         for node in self.nodes:
             self.wait_for_running_server(node)
+
+    def start_seeded_servers(self) -> None:
+        """Starts a seeded cluster by syncing node0 first, then local followers."""
+        seed_follower = self.nodes[0]
+        self.start_node(seed_follower, mining=self.args.mining_node == 0)
+        self.wait_for_running_server(seed_follower)
+        self.wait_for_first_tip(seed_follower, self.seed_peer)
+
+        for index, node in enumerate(self.nodes[1:], start=1):
+            self.start_node(node, mining=index == self.args.mining_node)
+        for node in self.nodes[1:]:
+            self.wait_for_running_server(node)
+
+    def wait_for_first_tip(self, node: NodeHandle, source: str | None) -> None:
+        """Polls until one node persists its first tip from bootstrap or seed sync."""
+        deadline = time.time() + 30
+        next_progress_log = time.time()
+        while time.time() < deadline:
+            self.ensure_nodes_running()
+            status = self.status_info(node)
+            if status.get("best tip") != "<none>":
+                self.log(
+                    f"{node.name} synced first tip from {source or 'bootstrap'} "
+                    f"height={status.get('height')} tip={status.get('best tip')}"
+                )
+                return
+            if time.time() >= next_progress_log:
+                self.log(f"waiting for {node.name} to persist its first tip")
+                next_progress_log = time.time() + 10
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"{node.name} did not persist a tip while syncing from {source or 'bootstrap'}"
+        )
 
     def wait_for_running_server(self, node: NodeHandle) -> None:
         """Polls `wobble status` until the local admin server reports itself live."""

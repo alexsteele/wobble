@@ -603,6 +603,69 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
 }
 
 #[test]
+fn bootstrap_sync_follower_catches_up_to_seeded_server() {
+    let miner = crypto::signing_key_from_bytes([31; 32]);
+    let genesis = mine_block(
+        BlockHash::default(),
+        0x207f_ffff,
+        &miner.verifying_key(),
+        0,
+    );
+    let child = mine_block(
+        genesis.header.block_hash(),
+        0x207f_ffff,
+        &miner.verifying_key(),
+        1,
+    );
+    let grandchild = mine_block(
+        child.header.block_hash(),
+        0x207f_ffff,
+        &miner.verifying_key(),
+        2,
+    );
+    let best_tip = grandchild.header.block_hash();
+
+    let mut seeded_state = NodeState::new();
+    seeded_state.accept_block(genesis).unwrap();
+    seeded_state.accept_block(child).unwrap();
+    seeded_state.accept_block(grandchild).unwrap();
+
+    let seed_sqlite = temp_sqlite_path("seed");
+    let follower_sqlite = temp_sqlite_path("follower");
+    SqliteStore::open(&seed_sqlite)
+        .unwrap()
+        .save_node_state(&seeded_state)
+        .unwrap();
+    SqliteStore::open(&follower_sqlite)
+        .unwrap()
+        .save_node_state(&NodeState::new())
+        .unwrap();
+
+    let mut testnet = TestNet::new();
+    testnet.add_node_with_sqlite("seed", &[], Some(seed_sqlite.clone()));
+    testnet.add_node_with_sqlite("follower", &["seed"], Some(follower_sqlite.clone()));
+
+    // Follower sync performs one handshake plus one block fetch per missing block.
+    let seed = testnet.start("seed", NodeBootstrap::Persisted, 4);
+    let follower = testnet.start_with_sync("follower", NodeBootstrap::Persisted, 0, true);
+
+    let follower = follower.join();
+    let seed = seed.join();
+
+    assert_eq!(follower.state().chain().best_tip(), Some(best_tip));
+    assert_eq!(seed.state().chain().best_tip(), Some(best_tip));
+
+    let persisted_follower = SqliteStore::open(&follower_sqlite)
+        .unwrap()
+        .load_node_state()
+        .unwrap();
+    assert_eq!(persisted_follower.chain().best_tip(), Some(best_tip));
+
+    fs::remove_file(&seed_sqlite).unwrap();
+    fs::remove_file(&follower_sqlite).unwrap();
+}
+
+#[test]
 fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
     let sender = crypto::signing_key_from_bytes([31; 32]);
     let recipient = crypto::signing_key_from_bytes([32; 32]);

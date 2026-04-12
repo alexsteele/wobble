@@ -936,6 +936,7 @@ fn build_transaction_index(
 ) -> (Vec<IndexedTransaction>, Vec<TransactionKeyEdge>) {
     let mut transactions = Vec::new();
     let mut edges = Vec::new();
+    let mut seen_txids = std::collections::HashSet::<Txid>::new();
     let mut known_outputs = std::collections::HashMap::<OutPoint, TxOut>::new();
     let entries = best_chain_entries(state);
 
@@ -945,6 +946,13 @@ fn build_transaction_index(
         };
         for (position, transaction) in block.transactions.iter().enumerate() {
             let txid = transaction.txid();
+            // TODO: Model duplicate txids explicitly in the wallet index.
+            // Bitcoin-style coinbase transactions can repeat the same txid
+            // across blocks, but the current wallet tables still key rows by
+            // txid alone.
+            if !seen_txids.insert(txid) {
+                continue;
+            }
             transactions.push(IndexedTransaction {
                 txid,
                 transaction: transaction.clone(),
@@ -967,6 +975,9 @@ fn build_transaction_index(
         .collect();
     mempool_transactions.sort_by_key(|(txid, _)| txid.to_string());
     for (txid, transaction) in mempool_transactions {
+        if !seen_txids.insert(txid) {
+            continue;
+        }
         transactions.push(IndexedTransaction {
             txid,
             transaction: transaction.clone(),
@@ -1725,6 +1736,67 @@ mod tests {
         assert_eq!(indexed[1].block_hash, Some(branch_b_hash));
         assert_eq!(indexed[2].txid, payment.txid());
         assert_eq!(indexed[2].block_hash, Some(branch_b_hash));
+    }
+
+    #[test]
+    fn save_node_state_tolerates_duplicate_coinbase_txids_on_best_chain() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let miner = crypto::signing_key_from_bytes([41; 32]);
+        let repeated_coinbase = Transaction {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                locking_data: crypto::verifying_key_bytes(&miner.verifying_key()).to_vec(),
+            }],
+            lock_time: 7,
+        };
+
+        let mut genesis = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: [0; 32],
+                time: 1,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![repeated_coinbase.clone()],
+        };
+        genesis.header.merkle_root = genesis.merkle_root();
+        while crate::consensus::validate_block(&genesis).is_err() {
+            genesis.header.nonce = genesis.header.nonce.wrapping_add(1);
+        }
+
+        let mut child = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: genesis.header.block_hash(),
+                merkle_root: [0; 32],
+                time: 2,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![repeated_coinbase],
+        };
+        child.header.merkle_root = child.merkle_root();
+        while crate::consensus::validate_block(&child).is_err() {
+            child.header.nonce = child.header.nonce.wrapping_add(1);
+        }
+
+        let duplicate_txid = genesis.transactions[0].txid();
+        let mut state = crate::node_state::NodeState::new();
+        state.accept_block(genesis).unwrap();
+        state.accept_block(child).unwrap();
+
+        store.save_node_state(&state).unwrap();
+        let indexed = store.load_indexed_transactions().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].txid, duplicate_txid);
     }
 
     #[test]
