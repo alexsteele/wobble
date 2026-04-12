@@ -16,7 +16,7 @@
 //! `mine_pending` requests.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
@@ -37,7 +37,7 @@ use crate::{
     peer::{self, PeerConfig, PeerError},
     peers::{PeerSource, StoredPeer},
     sqlite_store::{self, SqliteStoreError},
-    types::{Block, BlockHash},
+    types::{Block, BlockHash, Txid},
     wire::{HelloMessage, WireMessage},
 };
 use ed25519_dalek::VerifyingKey;
@@ -263,6 +263,7 @@ impl Server {
         }
         log_inbound_message(&message, &self.state);
         let previous_best_tip = self.state.chain().best_tip();
+        let previous_mempool_txids = mempool_txids(self.state.mempool());
         let should_save = message_mutates_state(&message);
         let relay = self.relay_message_before_handle(&message);
         let save_block_hash = saved_block_hash(&message);
@@ -271,7 +272,13 @@ impl Server {
             .map_err(ServerError::Peer)?;
         log_post_handle_state(&replies, &self.state);
         if should_save {
-            self.save_sqlite(&save_message, save_block_hash, previous_best_tip, &replies)
+            self.save_sqlite(
+                &save_message,
+                save_block_hash,
+                previous_best_tip,
+                &previous_mempool_txids,
+                &replies,
+            )
                 .map_err(ServerError::SqlitePersist)?;
         }
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
@@ -306,11 +313,18 @@ impl Server {
         let relay = self.relay_message_before_handle(message);
         log_inbound_message(message, &self.state);
         let previous_best_tip = self.state.chain().best_tip();
+        let previous_mempool_txids = mempool_txids(self.state.mempool());
 
         match peer::handle_message(&self.config, &mut self.state, message.clone()) {
             Ok(replies) => {
                 log_post_handle_state(&replies, &self.state);
-                self.save_sqlite(message, Some(block_hash), previous_best_tip, &replies)
+                self.save_sqlite(
+                    message,
+                    Some(block_hash),
+                    previous_best_tip,
+                    &previous_mempool_txids,
+                    &replies,
+                )
                     .map_err(ServerError::SqlitePersist)?;
                 if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
                     self.relay_best_effort(&relay, origin);
@@ -352,7 +366,13 @@ impl Server {
         let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
             .map_err(ServerError::Peer)?;
         log_post_handle_state(&replies, &self.state);
-        self.save_sqlite(message, Some(block_hash), previous_best_tip, &replies)
+        self.save_sqlite(
+            message,
+            Some(block_hash),
+            previous_best_tip,
+            &previous_mempool_txids,
+            &replies,
+        )
             .map_err(ServerError::SqlitePersist)?;
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
@@ -873,6 +893,7 @@ impl Server {
         message: &WireMessage,
         request_block_hash: Option<BlockHash>,
         previous_best_tip: Option<BlockHash>,
+        previous_mempool_txids: &HashSet<Txid>,
         replies: &[WireMessage],
     ) -> Result<(), SqliteStoreError> {
         let Some(store) = self.sqlite_store.as_ref() else {
@@ -882,13 +903,23 @@ impl Server {
             return store.save_mempool_transaction(transaction);
         }
         let Some(block_hash) = request_block_hash.or_else(|| mined_block_hash(replies)) else {
+            // Non-block mutations that still changed local state keep using the
+            // broader table-level saves until they get narrower helpers too.
             store.save_active_utxos(self.state.active_utxos())?;
             store.save_mempool(self.state.mempool())?;
             return Ok(());
         };
-        if block_save_requires_full_snapshot(&self.state, block_hash, previous_best_tip) {
+        if block_save_requires_full_snapshot(
+            &self.state,
+            block_hash,
+            previous_best_tip,
+            previous_mempool_txids,
+        ) {
+            // Reorgs and tip changes that prune unrelated mempool entries are
+            // still subtle enough that we prefer the authoritative full save.
             return self.save_full_state();
         }
+        // Simple best-tip extension: save just the accepted block effects.
         store.save_accepted_block(&self.state, block_hash)
     }
 
@@ -1154,6 +1185,7 @@ fn block_save_requires_full_snapshot(
     state: &NodeState,
     block_hash: BlockHash,
     previous_best_tip: Option<BlockHash>,
+    previous_mempool_txids: &HashSet<Txid>,
 ) -> bool {
     let Some(entry) = state.chain().get(&block_hash) else {
         return true;
@@ -1161,11 +1193,37 @@ fn block_save_requires_full_snapshot(
     if state.chain().best_tip() != Some(block_hash) {
         return false;
     }
-    match (previous_best_tip, entry.parent) {
-        (None, None) => false,
-        (Some(previous), Some(parent)) => parent != previous,
-        _ => true,
+    let extends_previous_tip = match (previous_best_tip, entry.parent) {
+        (None, None) => true,
+        (Some(previous), Some(parent)) => parent == previous,
+        _ => false,
+    };
+    if !extends_previous_tip {
+        // Switching to a different branch is still handled by the full snapshot path.
+        return true;
     }
+    let Some(block) = state.get_block(&block_hash) else {
+        return true;
+    };
+    let current_mempool_txids = mempool_txids(state.mempool());
+    let removed_txids: HashSet<Txid> = previous_mempool_txids
+        .difference(&current_mempool_txids)
+        .copied()
+        .collect();
+    let included_txids: HashSet<Txid> = block
+        .transactions
+        .iter()
+        .skip(1)
+        .map(|transaction| transaction.txid())
+        .collect();
+    // If the tip change pruned anything beyond the block's own confirmed
+    // transactions, fall back to the broader save path.
+    removed_txids != included_txids
+}
+
+/// Returns the current mempool transaction ids as a set for save-path decisions.
+fn mempool_txids(mempool: &crate::mempool::Mempool) -> HashSet<Txid> {
+    mempool.iter().map(|(txid, _)| *txid).collect()
 }
 
 fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
@@ -1415,6 +1473,38 @@ mod tests {
                 nonce: 0,
             },
             transactions: vec![coinbase(50, owner, uniqueness)],
+        };
+        block.header.merkle_root = block.merkle_root();
+
+        loop {
+            if crate::consensus::validate_block(&block).is_ok() {
+                return block;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+    }
+
+    fn mine_block_with_transactions(
+        prev_blockhash: BlockHash,
+        bits: u32,
+        miner: &ed25519_dalek::VerifyingKey,
+        uniqueness: u32,
+        mut transactions: Vec<Transaction>,
+    ) -> Block {
+        let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
+        full_transactions.push(coinbase(50, miner, uniqueness));
+        full_transactions.append(&mut transactions);
+
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash,
+                merkle_root: [0; 32],
+                time: 1,
+                bits,
+                nonce: 0,
+            },
+            transactions: full_transactions,
         };
         block.header.merkle_root = block.merkle_root();
 
@@ -1739,6 +1829,65 @@ mod tests {
         );
         assert_eq!(reloaded.active_outpoints(), server.state().active_outpoints());
         assert_eq!(reloaded.mempool().len(), server.state().mempool().len());
+    }
+
+    #[test]
+    fn block_that_prunes_unrelated_mempool_tx_falls_back_to_full_snapshot_save() {
+        let sender = crypto::signing_key_from_bytes([21; 32]);
+        let recipient_a = crypto::signing_key_from_bytes([22; 32]);
+        let recipient_b = crypto::signing_key_from_bytes([23; 32]);
+        let miner = crypto::signing_key_from_bytes([24; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
+        );
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let pending = spend(spendable, &sender, &recipient_a.verifying_key(), 30, 1);
+        let confirmed = spend(spendable, &sender, &recipient_b.verifying_key(), 30, 2);
+        let confirmed_txid = confirmed.txid();
+        let child = mine_block_with_transactions(
+            genesis.header.block_hash(),
+            0x207f_ffff,
+            &miner.verifying_key(),
+            3,
+            vec![confirmed.clone()],
+        );
+        let child_hash = child.header.block_hash();
+        let sqlite_path = temp_sqlite_path();
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        state.submit_transaction(pending.clone()).unwrap();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), state)
+            .with_sqlite_path(&sqlite_path);
+        server.save_full_state().unwrap();
+
+        server
+            .handle_message(WireMessage::AnnounceBlock { block: child })
+            .unwrap();
+
+        let store = SqliteStore::open(&sqlite_path).unwrap();
+        let reloaded = store.load_node_state().unwrap();
+        let persisted_tip = store.load_best_tip().unwrap();
+        let persisted_pending = store.load_mempool_transaction(pending.txid()).unwrap();
+        let persisted_confirmed = store.load_indexed_transaction(confirmed_txid).unwrap();
+        drop(store);
+        fs::remove_file(&sqlite_path).unwrap();
+
+        assert_eq!(server.state().chain().best_tip(), Some(child_hash));
+        assert_eq!(persisted_tip, Some(child_hash));
+        assert!(server.state().mempool().get(&pending.txid()).is_none());
+        assert!(persisted_pending.is_none());
+        assert_eq!(reloaded.chain().best_tip(), Some(child_hash));
+        assert_eq!(reloaded.mempool().len(), 0);
+        assert_eq!(
+            persisted_confirmed.as_ref().map(|row| row.block_hash),
+            Some(Some(child_hash))
+        );
     }
 
     #[test]
