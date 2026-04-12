@@ -351,17 +351,17 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     testnet.add_node("miner", &["proposer"]);
 
     let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
-    // The miner handles the relayed payment, the local mine request, and the
-    // proposer's immediate sync-back when the mined-block relay hello advertises
-    // the new tip.
-    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 4);
+    // The miner handles the relayed payment and the local mine request on this
+    // path.
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 2);
 
     testnet.submit_payment("proposer", payment.clone());
     testnet.sync_delay();
     let block_hash = testnet.mine_pending("miner", &miner);
     testnet.sync_delay();
 
-    let proposer = proposer.join();
+    let mut proposer = proposer.join();
+    proposer.close_outbound_peer_sessions();
     let miner_server = miner_server.join();
 
     assert_eq!(
@@ -444,9 +444,8 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
     testnet.add_node_with_sqlite("miner", &["proposer"], Some(miner_sqlite.clone()));
 
     let proposer = testnet.start("proposer", NodeBootstrap::Persisted, 1);
-    // After restart, the proposer syncs back to the miner when the relayed
-    // block hello advertises a newer tip.
-    let miner_server = testnet.start("miner", NodeBootstrap::Persisted, 4);
+    // The miner handles the initial payment relay and the later mine request.
+    let miner_server = testnet.start("miner", NodeBootstrap::Persisted, 2);
 
     testnet.submit_payment("proposer", payment.clone());
 
@@ -471,7 +470,8 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
     let block_hash = testnet.mine_pending("miner", &miner);
     testnet.sync_delay();
 
-    let restarted_proposer = restarted_proposer.join();
+    let mut restarted_proposer = restarted_proposer.join();
+    restarted_proposer.close_outbound_peer_sessions();
     let miner_server = miner_server.join();
 
     assert_eq!(
@@ -537,20 +537,21 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
     testnet.add_node("miner", &["relay"]);
 
     let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
-    // The relay serves the proposer's payment relay, the miner's block relay,
-    // and the proposer's sync-back handshake plus block fetch.
-    let relay_server = testnet.start("relay", NodeBootstrap::State(relay_state), 4);
-    // The miner serves the relay's payment relay, the local mine request, and
-    // the relay's sync-back handshake plus block fetch.
-    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 4);
+    // The relay serves the proposer's payment relay and the miner's block
+    // relay on this path.
+    let relay_server = testnet.start("relay", NodeBootstrap::State(relay_state), 2);
+    // The miner serves the relay's payment relay and the local mine request.
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 2);
 
     testnet.submit_payment("proposer", payment.clone());
     testnet.sync_delay();
     let block_hash = testnet.mine_pending("miner", &miner);
     testnet.sync_delay();
 
-    let proposer = proposer.join();
-    let relay_server = relay_server.join();
+    let mut proposer = proposer.join();
+    proposer.close_outbound_peer_sessions();
+    let mut relay_server = relay_server.join();
+    relay_server.close_outbound_peer_sessions();
     let miner_server = miner_server.join();
 
     assert_eq!(
@@ -645,14 +646,16 @@ fn bootstrap_sync_follower_catches_up_to_seeded_server() {
     testnet.add_node_with_sqlite("seed", &[], Some(seed_sqlite.clone()));
     testnet.add_node_with_sqlite("follower", &["seed"], Some(follower_sqlite.clone()));
 
-    // Follower sync performs one handshake plus one block fetch per missing block.
-    let seed = testnet.start("seed", NodeBootstrap::Persisted, 4);
+    // Follower sync now reuses one outbound session for tip polling and block fetches.
+    let seed = testnet.start("seed", NodeBootstrap::Persisted, 1);
     let follower = testnet.start_with_sync("follower", NodeBootstrap::Persisted, 0, true);
 
-    let follower = follower.join();
-    let seed = seed.join();
-
+    let mut follower = follower.join();
     assert_eq!(follower.state().chain().best_tip(), Some(best_tip));
+    follower.close_outbound_peer_sessions();
+    drop(follower);
+
+    let seed = seed.join();
     assert_eq!(seed.state().chain().best_tip(), Some(best_tip));
 
     let persisted_follower = SqliteStore::open(&follower_sqlite)
@@ -699,10 +702,9 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
     // must catch up from its configured peer during bootstrap before it begins
     // serving new inbound connections.
     let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
-    // The miner must stay online for the observer bootstrap handshake plus the
-    // one-shot tip block fetch that follows, plus the proposer's sync-back when
-    // the mined-block relay hello advertises the new tip.
-    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 6);
+    // The miner handles the relayed payment, the local mine request, and the
+    // observer bootstrap sync.
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 3);
 
     testnet.submit_payment("proposer", payment.clone());
     testnet.sync_delay();
@@ -712,9 +714,11 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
     let observer =
         testnet.start_with_sync("observer", NodeBootstrap::State(observer_state), 0, true);
 
-    let proposer = proposer.join();
+    let mut proposer = proposer.join();
+    proposer.close_outbound_peer_sessions();
+    let mut observer = observer.join();
+    observer.close_outbound_peer_sessions();
     let miner_server = miner_server.join();
-    let observer = observer.join();
 
     assert_eq!(observer.state().chain().best_tip(), Some(block_hash));
     assert_eq!(
@@ -772,10 +776,9 @@ fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
     testnet.add_node("observer", &[]);
 
     let proposer = testnet.start("proposer", NodeBootstrap::State(proposer_state), 2);
-    // The miner must stay online for the later hello-triggered sync handshake
-    // and one-shot block fetch from the observer, plus the proposer's sync-back
-    // when the mined-block relay hello advertises the new tip.
-    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 6);
+    // The miner handles the relayed payment, the local mine request, and the
+    // observer's later hello-triggered sync.
+    let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state), 3);
     let observer = testnet.start("observer", NodeBootstrap::State(observer_state), 1);
 
     testnet.submit_payment("proposer", payment.clone());
@@ -794,10 +797,11 @@ fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
             height: Some(1),
         },
     );
-
-    let proposer = proposer.join();
+    let mut proposer = proposer.join();
+    proposer.close_outbound_peer_sessions();
+    let mut observer = observer.join();
+    observer.close_outbound_peer_sessions();
     let miner_server = miner_server.join();
-    let observer = observer.join();
 
     // The handshake reply is sent before the best-effort sync runs, so it
     // still reflects the observer's pre-sync local tip.
