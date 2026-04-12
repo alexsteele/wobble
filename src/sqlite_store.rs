@@ -325,7 +325,8 @@ impl SqliteStore {
     ///
     /// The caller identifies which block triggered the save, and the store
     /// derives the associated block record, chain entry, best tip, active UTXO
-    /// view, mempool view, and transaction index from the current `NodeState`.
+    /// view, mempool removals, and confirmed transaction index updates from
+    /// the current `NodeState`.
     ///
     /// Caller requirements:
     /// - `state` must already include `block_hash` in its block store and chain
@@ -346,11 +347,13 @@ impl SqliteStore {
             .chain()
             .get(&block_hash)
             .ok_or(SqliteStoreError::MissingBlockForEntry(block_hash))?;
-        let (transactions, edges) = build_transaction_index(state);
         self.save_block_record(block, entry, state.chain().best_tip())?;
+        if !best_chain_contains(state, block_hash) {
+            return Ok(());
+        }
         self.save_active_utxos(state.active_utxos())?;
-        self.save_mempool(state.mempool())?;
-        self.save_transaction_index(&transactions, &edges)
+        self.delete_stale_mempool_transactions(state.mempool())?;
+        self.save_confirmed_block_transactions(block, entry)
     }
 
     /// Replaces the persisted active-chain UTXO view with `utxos`.
@@ -1157,6 +1160,104 @@ impl SqliteStore {
         Ok(blocks)
     }
 
+    /// Deletes persisted mempool rows that are no longer present in the current mempool.
+    fn delete_stale_mempool_transactions(
+        &self,
+        mempool: &Mempool,
+    ) -> Result<(), SqliteStoreError> {
+        let desired: std::collections::HashSet<Txid> =
+            mempool.iter().map(|(txid, _)| *txid).collect();
+        let persisted = self.load_persisted_mempool_txids()?;
+        let tx = self.connection.unchecked_transaction()?;
+        for txid in persisted {
+            if desired.contains(&txid) {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM mempool_transactions WHERE txid = ?1",
+                params![txid.to_string()],
+            )?;
+            tx.execute(
+                "DELETE FROM transactions WHERE txid = ?1 AND status = 'mempool'",
+                params![txid.to_string()],
+            )?;
+            tx.execute(
+                "DELETE FROM transaction_keys WHERE txid = ?1",
+                params![txid.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Saves the confirmed transaction rows and key edges for one accepted block.
+    fn save_confirmed_block_transactions(
+        &self,
+        block: &Block,
+        entry: &ChainIndexEntry,
+    ) -> Result<(), SqliteStoreError> {
+        let (transactions, edges) =
+            self.build_confirmed_block_index(block, entry.block_hash, entry.height)?;
+        let tx = self.connection.unchecked_transaction()?;
+        for indexed in &transactions {
+            let transaction_bytes =
+                bincode::serde::encode_to_vec(&indexed.transaction, bincode::config::standard())?;
+            tx.execute(
+                "DELETE FROM mempool_transactions WHERE txid = ?1",
+                params![indexed.txid.to_string()],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO transactions (
+                     txid, transaction_bytes, block_hash, block_height, position_in_block,
+                     status, first_seen_at, last_updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    indexed.txid.to_string(),
+                    transaction_bytes,
+                    indexed.block_hash.map(|value| value.to_string()),
+                    indexed.block_height.map(|value| value as i64),
+                    indexed.position_in_block.map(|value| value as i64),
+                    indexed.status.as_str(),
+                    indexed.first_seen_at,
+                    indexed.last_updated_at,
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM transaction_keys WHERE txid = ?1",
+                params![indexed.txid.to_string()],
+            )?;
+        }
+        for edge in &edges {
+            tx.execute(
+                "INSERT INTO transaction_keys (
+                     txid, key_role, key_data, value, vout
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.txid.to_string(),
+                    edge.key_role.as_str(),
+                    edge.key_data,
+                    edge.value.map(|value| value as i64),
+                    edge.vout.map(|value| value as i64),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads the set of transaction ids currently persisted in the mempool table.
+    fn load_persisted_mempool_txids(&self) -> Result<Vec<Txid>, SqliteStoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT txid FROM mempool_transactions ORDER BY txid ASC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut txids = Vec::new();
+        for row in rows {
+            txids.push(parse_txid(&row?)?);
+        }
+        Ok(txids)
+    }
+
     /// Builds one transaction's key edges using already-persisted transaction outputs.
     fn build_transaction_key_edges_for_persisted_context(
         &self,
@@ -1203,6 +1304,39 @@ impl SqliteStore {
         let (transaction, _): (Transaction, usize) =
             bincode::serde::decode_from_slice(&transaction_bytes, bincode::config::standard())?;
         Ok(transaction.outputs.get(outpoint.vout as usize).cloned())
+    }
+
+    /// Builds confirmed transaction rows and key edges for one persisted block.
+    fn build_confirmed_block_index(
+        &self,
+        block: &Block,
+        block_hash: BlockHash,
+        block_height: u64,
+    ) -> Result<(Vec<IndexedTransaction>, Vec<TransactionKeyEdge>), SqliteStoreError> {
+        let mut transactions = Vec::new();
+        let mut edges = Vec::new();
+        let mut known_outputs = std::collections::HashMap::<OutPoint, TxOut>::new();
+        for (position, transaction) in block.transactions.iter().enumerate() {
+            let txid = transaction.txid();
+            transactions.push(IndexedTransaction {
+                txid,
+                transaction: transaction.clone(),
+                block_hash: Some(block_hash),
+                block_height: Some(block_height),
+                position_in_block: Some(position as u32),
+                status: IndexedTransactionStatus::Confirmed,
+                first_seen_at: None,
+                last_updated_at: None,
+            });
+            append_transaction_key_edges_with_fallback(
+                self,
+                transaction,
+                &known_outputs,
+                &mut edges,
+            )?;
+            remember_outputs(transaction, &mut known_outputs);
+        }
+        Ok((transactions, edges))
     }
 }
 
@@ -1307,6 +1441,13 @@ fn build_transaction_index(
     (transactions, edges)
 }
 
+/// Returns whether `block_hash` currently lies on the active best chain.
+fn best_chain_contains(state: &NodeState, block_hash: BlockHash) -> bool {
+    best_chain_entries(state)
+        .iter()
+        .any(|entry| entry.block_hash == block_hash)
+}
+
 /// Returns the indexed blocks on the current best chain from genesis to tip.
 fn best_chain_entries(state: &NodeState) -> Vec<ChainIndexEntry> {
     let mut entries = Vec::new();
@@ -1350,6 +1491,43 @@ fn append_transaction_key_edges(
             vout: Some(vout as u32),
         });
     }
+}
+
+/// Records input and output key relationships, resolving inputs from block-local
+/// outputs first and persisted transaction outputs second.
+fn append_transaction_key_edges_with_fallback(
+    store: &SqliteStore,
+    transaction: &Transaction,
+    known_outputs: &std::collections::HashMap<OutPoint, TxOut>,
+    edges: &mut Vec<TransactionKeyEdge>,
+) -> Result<(), SqliteStoreError> {
+    let txid = transaction.txid();
+    for input in &transaction.inputs {
+        let previous_output = match known_outputs.get(&input.previous_output) {
+            Some(output) => Some(output.clone()),
+            None => store.load_output(input.previous_output)?,
+        };
+        if let Some(previous_output) = previous_output {
+            edges.push(TransactionKeyEdge {
+                txid,
+                key_role: TransactionKeyRole::Input,
+                key_data: previous_output.locking_data,
+                value: Some(previous_output.value),
+                vout: Some(input.previous_output.vout),
+            });
+        }
+    }
+
+    for (vout, output) in transaction.outputs.iter().enumerate() {
+        edges.push(TransactionKeyEdge {
+            txid,
+            key_role: TransactionKeyRole::Output,
+            key_data: output.locking_data.clone(),
+            value: Some(output.value),
+            vout: Some(vout as u32),
+        });
+    }
+    Ok(())
 }
 
 /// Adds newly created outputs so later spends can resolve their locking key.

@@ -262,6 +262,7 @@ impl Server {
             return Ok(recovered);
         }
         log_inbound_message(&message, &self.state);
+        let previous_best_tip = self.state.chain().best_tip();
         let should_save = message_mutates_state(&message);
         let relay = self.relay_message_before_handle(&message);
         let save_block_hash = saved_block_hash(&message);
@@ -270,7 +271,7 @@ impl Server {
             .map_err(ServerError::Peer)?;
         log_post_handle_state(&replies, &self.state);
         if should_save {
-            self.save_sqlite(&save_message, save_block_hash, &replies)
+            self.save_sqlite(&save_message, save_block_hash, previous_best_tip, &replies)
                 .map_err(ServerError::SqlitePersist)?;
         }
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
@@ -304,11 +305,12 @@ impl Server {
 
         let relay = self.relay_message_before_handle(message);
         log_inbound_message(message, &self.state);
+        let previous_best_tip = self.state.chain().best_tip();
 
         match peer::handle_message(&self.config, &mut self.state, message.clone()) {
             Ok(replies) => {
                 log_post_handle_state(&replies, &self.state);
-                self.save_sqlite(message, Some(block_hash), &replies)
+                self.save_sqlite(message, Some(block_hash), previous_best_tip, &replies)
                     .map_err(ServerError::SqlitePersist)?;
                 if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
                     self.relay_best_effort(&relay, origin);
@@ -350,7 +352,7 @@ impl Server {
         let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
             .map_err(ServerError::Peer)?;
         log_post_handle_state(&replies, &self.state);
-        self.save_sqlite(message, Some(block_hash), &replies)
+        self.save_sqlite(message, Some(block_hash), previous_best_tip, &replies)
             .map_err(ServerError::SqlitePersist)?;
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
@@ -870,6 +872,7 @@ impl Server {
         &self,
         message: &WireMessage,
         request_block_hash: Option<BlockHash>,
+        previous_best_tip: Option<BlockHash>,
         replies: &[WireMessage],
     ) -> Result<(), SqliteStoreError> {
         let Some(store) = self.sqlite_store.as_ref() else {
@@ -883,6 +886,9 @@ impl Server {
             store.save_mempool(self.state.mempool())?;
             return Ok(());
         };
+        if block_save_requires_full_snapshot(&self.state, block_hash, previous_best_tip) {
+            return self.save_full_state();
+        }
         store.save_accepted_block(&self.state, block_hash)
     }
 
@@ -1140,6 +1146,25 @@ fn saved_block_hash(message: &WireMessage) -> Option<BlockHash> {
     match message {
         WireMessage::AnnounceBlock { block } => Some(block.header.block_hash()),
         _ => None,
+    }
+}
+
+/// Returns whether one accepted block should fall back to a full-state save.
+fn block_save_requires_full_snapshot(
+    state: &NodeState,
+    block_hash: BlockHash,
+    previous_best_tip: Option<BlockHash>,
+) -> bool {
+    let Some(entry) = state.chain().get(&block_hash) else {
+        return true;
+    };
+    if state.chain().best_tip() != Some(block_hash) {
+        return false;
+    }
+    match (previous_best_tip, entry.parent) {
+        (None, None) => false,
+        (Some(previous), Some(parent)) => parent != previous,
+        _ => true,
     }
 }
 
