@@ -1207,8 +1207,12 @@ impl SqliteStore {
     ) -> Result<(), SqliteStoreError> {
         let (transactions, edges) =
             self.build_confirmed_block_index(block, entry.block_hash, entry.height)?;
+        let mut merged_transactions = Vec::with_capacity(transactions.len());
+        for indexed in transactions {
+            merged_transactions.push(self.merge_confirmed_transaction_metadata(indexed)?);
+        }
         let tx = self.connection.unchecked_transaction()?;
-        for indexed in &transactions {
+        for indexed in &merged_transactions {
             self.delete_mempool_transaction_row(&tx, indexed.txid)?;
             self.upsert_indexed_transaction_row(&tx, indexed)?;
             self.delete_transaction_key_rows(&tx, indexed.txid)?;
@@ -1231,6 +1235,20 @@ impl SqliteStore {
             txids.push(parse_txid(&row?)?);
         }
         Ok(txids)
+    }
+
+    /// Merges any previously indexed metadata into a newly confirmed transaction row.
+    ///
+    /// This keeps fields like `first_seen_at` stable when a transaction moves
+    /// from mempool indexing to confirmed indexing.
+    fn merge_confirmed_transaction_metadata(
+        &self,
+        mut indexed: IndexedTransaction,
+    ) -> Result<IndexedTransaction, SqliteStoreError> {
+        if let Some(existing) = self.load_indexed_transaction(indexed.txid)? {
+            indexed.first_seen_at = existing.first_seen_at;
+        }
+        Ok(indexed)
     }
 
     /// Deletes one persisted mempool row after its transaction left the mempool.
@@ -1643,7 +1661,7 @@ mod tests {
         mempool::Mempool,
         peers::{PeerSource, StoredPeer},
         state::UtxoSet,
-        tx_index::{IndexedTransactionStatus, TransactionKeyRole},
+        tx_index::{IndexedTransaction, IndexedTransactionStatus, TransactionKeyRole},
         types::{
             Block, BlockHash, BlockHeader, ChainIndexEntry, OutPoint, Transaction, TxIn, TxOut,
             Txid, Utxo,
@@ -2584,6 +2602,89 @@ mod tests {
         assert_eq!(indexed[2].txid, payment.txid());
         assert_eq!(indexed[2].block_hash, Some(child_hash));
         assert_eq!(indexed[2].status, IndexedTransactionStatus::Confirmed);
+    }
+
+    #[test]
+    fn save_accepted_block_preserves_first_seen_at_for_confirmed_mempool_tx() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let sender = crypto::signing_key_from_bytes([81; 32]);
+        let recipient = crypto::signing_key_from_bytes([82; 32]);
+        let miner = crypto::signing_key_from_bytes([83; 32]);
+        let mut state = crate::node_state::NodeState::new();
+
+        let genesis = mine_block_with_transactions(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            91,
+            Vec::new(),
+        );
+        let genesis_hash = genesis.header.block_hash();
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        state.accept_block(genesis).unwrap();
+        store.save_accepted_block(&state, genesis_hash).unwrap();
+
+        let mut payment = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: spendable,
+                unlocking_data: Vec::new(),
+            }],
+            outputs: vec![
+                TxOut {
+                    value: 20,
+                    locking_data: crypto::verifying_key_bytes(&recipient.verifying_key()).to_vec(),
+                },
+                TxOut {
+                    value: 30,
+                    locking_data: crypto::verifying_key_bytes(&sender.verifying_key()).to_vec(),
+                },
+            ],
+            lock_time: 92,
+        };
+        payment.inputs[0].unlocking_data =
+            crypto::sign_message(&sender, &payment.signing_digest()).to_vec();
+        let payment_txid = payment.txid();
+
+        store
+            .save_transaction_index(
+                &[IndexedTransaction {
+                    txid: payment_txid,
+                    transaction: payment.clone(),
+                    block_hash: None,
+                    block_height: None,
+                    position_in_block: None,
+                    status: IndexedTransactionStatus::Mempool,
+                    first_seen_at: Some("unix:123".to_string()),
+                    last_updated_at: Some("unix:124".to_string()),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        let child = mine_block_with_transactions(
+            genesis_hash,
+            0x207f_ffff,
+            &miner.verifying_key(),
+            93,
+            vec![payment],
+        );
+        let child_hash = child.header.block_hash();
+        state.accept_block(child).unwrap();
+
+        store.save_accepted_block(&state, child_hash).unwrap();
+
+        let indexed = store.load_indexed_transaction(payment_txid).unwrap().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(indexed.block_hash, Some(child_hash));
+        assert_eq!(indexed.status, IndexedTransactionStatus::Confirmed);
+        assert_eq!(indexed.first_seen_at.as_deref(), Some("unix:123"));
     }
 
     #[test]
