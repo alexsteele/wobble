@@ -20,7 +20,7 @@ use std::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -159,6 +159,8 @@ const RELAY_CONNECT_ATTEMPTS: usize = 3;
 /// Small pause between relay dial attempts so listeners finishing a prior
 /// request can accept the next inbound connection.
 const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// Periodic retry interval for configured-peer catch-up while serving.
+const CONFIGURED_PEER_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Server {
     pub fn new(config: PeerConfig, state: NodeState) -> Self {
@@ -186,11 +188,12 @@ impl Server {
         self
     }
 
-    /// Enables a one-time sync attempt from configured peers before serving.
+    /// Enables configured-peer sync attempts while serving.
     ///
     /// This is intended for cold start or restart of a node that may have
-    /// missed blocks while offline. Sync is still best effort and currently
-    /// runs only once at startup rather than as a background loop.
+    /// missed blocks while offline. Sync remains best effort: the server tries
+    /// once at startup and then retries periodically while the serve loop is
+    /// running.
     pub fn with_bootstrap_sync(mut self, enabled: bool) -> Self {
         self.bootstrap_sync = enabled;
         self
@@ -454,9 +457,11 @@ impl Server {
         listener: TcpListener,
         admin_listener: Option<TcpListener>,
     ) -> io::Result<()> {
+        let mut next_peer_sync_at = Instant::now();
         if self.bootstrap_sync {
             info!(peer_count = self.peers.len(), "starting bootstrap sync");
             self.sync_configured_peers_best_effort();
+            next_peer_sync_at = Instant::now() + CONFIGURED_PEER_SYNC_INTERVAL;
         }
         info!(listen_addr = ?listener.local_addr().ok(), "server listening");
         if let Some(admin_listener) = admin_listener.as_ref() {
@@ -468,6 +473,7 @@ impl Server {
             admin_listener.set_nonblocking(true)?;
         }
         loop {
+            self.sync_configured_peers_if_due(&mut next_peer_sync_at);
             if let Some(admin_listener) = admin_listener.as_ref() {
                 match admin_listener.accept() {
                     Ok((stream, _)) => {
@@ -494,6 +500,19 @@ impl Server {
                 .unwrap_or(Duration::from_millis(50));
             thread::sleep(interval);
         }
+    }
+
+    /// Retries configured-peer sync on a fixed cadence while serving.
+    ///
+    /// This lets cold-start nodes recover from a missed initial sync attempt
+    /// without waiting for a fresh inbound announcement from the same peer.
+    fn sync_configured_peers_if_due(&mut self, next_sync_at: &mut Instant) {
+        if !self.bootstrap_sync || Instant::now() < *next_sync_at {
+            return;
+        }
+        debug!(peer_count = self.peers.len(), "running periodic configured-peer sync");
+        self.sync_configured_peers_best_effort();
+        *next_sync_at = Instant::now() + CONFIGURED_PEER_SYNC_INTERVAL;
     }
 
     /// Handles one localhost admin request against the live node state.

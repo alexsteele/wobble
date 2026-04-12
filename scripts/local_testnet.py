@@ -211,6 +211,18 @@ class LocalTestNet:
         listen_addr = config.get("listen_addr")
         return listen_addr if isinstance(listen_addr, str) else None
 
+    def status_info_for_home(self, home: Path) -> dict[str, str]:
+        """Returns parsed `status` fields for an arbitrary node home."""
+        result = self.run_command(
+            str(BIN),
+            "status",
+            "--home",
+            str(home),
+            quiet=True,
+            timeout=30.0,
+        )
+        return self.parse_fields(result.stdout)
+
     def create_nodes(self) -> None:
         """Allocates one temporary home, ports, and log file per local node."""
         for index in range(self.args.nodes):
@@ -366,6 +378,34 @@ class LocalTestNet:
         )
         return self.parse_fields(result.stdout)
 
+    def seed_tip_info(self) -> dict[str, str]:
+        """Returns the seeded peer's advertised tip summary."""
+        assert self.seed_peer is not None
+        result = self.run_command(
+            str(BIN),
+            "inspect",
+            "tip",
+            self.seed_peer,
+            self.args.network,
+            quiet=True,
+            timeout=30.0,
+        )
+        return self.parse_fields(result.stdout)
+
+    def ensure_seed_running(self) -> None:
+        """Validates that the default local seed server is live before waiting on it."""
+        if self.seed_peer != self.default_seed_peer():
+            return
+        status = self.status_info_for_home(DEFAULT_HOME)
+        if status.get("server") != "running":
+            raise RuntimeError(
+                f"seed home {DEFAULT_HOME} is not running; start `wobble serve` first or disable seeding"
+            )
+        if status.get("live best tip") == "<none>":
+            raise RuntimeError(
+                f"seed home {DEFAULT_HOME} is running but has no live best tip; bootstrap that node first or disable seeding"
+            )
+
     def ensure_nodes_running(self) -> None:
         """Raises if any managed server process has exited unexpectedly."""
         for node in self.nodes:
@@ -377,7 +417,16 @@ class LocalTestNet:
     def bootstrap(self) -> None:
         """Either bootstraps a fresh local chain or joins the configured seed chain."""
         if self.seed_peer:
-            self.log(f"joining seeded chain from {self.seed_peer}")
+            self.ensure_seed_running()
+            seed_tip = self.seed_tip_info()
+            if seed_tip.get("peer tip") == "<none>":
+                raise RuntimeError(
+                    f"seed peer {self.seed_peer} has no best tip; bootstrap that node first or disable seeding"
+                )
+            self.log(
+                f"joining seeded chain from {self.seed_peer} "
+                f"tip={seed_tip.get('peer tip')} height={seed_tip.get('peer height')}"
+            )
             self.wait_for_cluster_sync(self.nodes[0])
             return
 
@@ -396,12 +445,17 @@ class LocalTestNet:
     def wait_for_cluster_sync(self, reference: NodeHandle) -> None:
         """Polls until every node reports the same persisted tip and height."""
         next_progress_log = time.time()
+        missing_tip_deadline = time.time() + 30 if self.seed_peer else None
         while True:
             self.ensure_nodes_running()
             reference_status = self.status_info(reference)
             reference_tip = reference_status["best tip"]
             reference_height = reference_status["height"]
             if reference_tip == "<none>":
+                if missing_tip_deadline is not None and time.time() >= missing_tip_deadline:
+                    raise RuntimeError(
+                        f"{reference.name} did not persist a tip while syncing from seed {self.seed_peer}"
+                    )
                 if time.time() >= next_progress_log:
                     self.log("waiting for reference node to report a persisted tip")
                     next_progress_log = time.time() + 10
