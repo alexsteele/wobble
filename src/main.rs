@@ -107,6 +107,9 @@ struct ServeCommand {
     /// Overrides the default node home directory.
     #[arg(long)]
     home: Option<PathBuf>,
+    /// Mirrors server logs to stderr in addition to the home log file.
+    #[arg(long)]
+    log_stderr: bool,
     /// Socket address to bind, for example `127.0.0.1:9001`.
     #[arg(long)]
     listen_addr: Option<String>,
@@ -397,16 +400,16 @@ struct SubmitTransferCommand {
 }
 
 fn main() {
-    logging::init();
-    if let Err(message) = run() {
+    let cli = Cli::parse();
+    init_logging_for_cli(&cli);
+    if let Err(message) = run(cli) {
         eprintln!("{message}");
         std::process::exit(1);
     }
 }
 
 /// Parses the CLI and executes the selected command.
-fn run() -> Result<(), String> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Init(command) => run_init(command),
         Command::Bootstrap(command) => run_bootstrap(command),
@@ -419,6 +422,23 @@ fn run() -> Result<(), String> {
         Command::Inspect { command } => run_inspect(command),
         Command::Admin { command } => run_admin(command),
         Command::Debug { command } => run_debug(command),
+    }
+}
+
+/// Initializes process-wide logging with a file sink for long-running servers.
+fn init_logging_for_cli(cli: &Cli) {
+    match &cli.command {
+        Command::Serve(command) => {
+            let log_dir = resolve_node_home(command.home.as_deref())
+                .ok()
+                .map(|home| home.logs_dir());
+            if let Some(log_dir) = log_dir.as_deref() {
+                logging::init_server_tracing(log_dir, command.log_stderr);
+            } else {
+                logging::init_cli_tracing();
+            }
+        }
+        _ => logging::init_cli_tracing(),
     }
 }
 
@@ -535,6 +555,7 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     println!("node home: {}", home.root().display());
     println!("bootstrap source: sqlite");
     println!("config: {}", home.config_path().display());
+    println!("logs dir: {}", home.logs_dir().display());
     println!("listen addr: {}", runtime.listen_addr);
     println!("admin addr: {}", config_file.admin_addr);
     println!("network: {}", runtime.network);
@@ -1735,6 +1756,7 @@ mod tests {
         match cli.command {
             Command::Serve(ServeCommand {
                 home,
+                log_stderr,
                 listen_addr,
                 network,
                 node_name,
@@ -1747,6 +1769,7 @@ mod tests {
                 mining_bits,
             }) => {
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/proposer"));
+                assert!(!log_stderr);
                 assert_eq!(listen_addr.as_deref(), Some("127.0.0.1:9001"));
                 assert_eq!(network.as_deref(), Some("wobble-local"));
                 assert_eq!(node_name.as_deref(), Some("alpha"));
@@ -1974,6 +1997,7 @@ mod tests {
         };
         let command = ServeCommand {
             home: Some(PathBuf::from("/tmp/node")),
+            log_stderr: false,
             listen_addr: Some("127.0.0.1:9010".to_string()),
             network: None,
             node_name: Some("override".to_string()),
@@ -2005,6 +2029,7 @@ mod tests {
         };
         let command = ServeCommand {
             home: None,
+            log_stderr: false,
             listen_addr: None,
             network: None,
             node_name: None,
@@ -2039,6 +2064,7 @@ mod tests {
         };
         let command = ServeCommand {
             home: None,
+            log_stderr: false,
             listen_addr: None,
             network: None,
             node_name: None,
@@ -2073,6 +2099,7 @@ mod tests {
         };
         let command = ServeCommand {
             home: None,
+            log_stderr: false,
             listen_addr: None,
             network: None,
             node_name: None,

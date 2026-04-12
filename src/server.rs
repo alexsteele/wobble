@@ -164,6 +164,8 @@ const RELAY_CONNECT_ATTEMPTS: usize = 3;
 const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// Periodic retry interval for configured-peer catch-up while serving.
 const CONFIGURED_PEER_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+/// Cooldown between configured-peer sync attempts to the same peer.
+const CONFIGURED_PEER_SYNC_COOLDOWN: Duration = Duration::from_secs(5);
 
 impl Server {
     pub fn new(config: PeerConfig, state: NodeState) -> Self {
@@ -381,14 +383,28 @@ impl Server {
             };
 
             if let WireMessage::Hello(remote_hello) = &message {
-                info!(
-                    peer_addr = ?peer_addr,
-                    remote_node = remote_hello.node_name.as_deref().unwrap_or("unknown"),
-                    advertised_addr = remote_hello.advertised_addr.as_deref().unwrap_or("none"),
-                    remote_tip = %format_hash(remote_hello.tip),
-                    remote_height = ?remote_hello.height,
-                    "received peer hello"
-                );
+                let should_log_info = self.hello_advances_local_state(remote_hello);
+                let remote_node = remote_hello.node_name.as_deref().unwrap_or("unknown");
+                let advertised_addr = remote_hello.advertised_addr.as_deref().unwrap_or("none");
+                if should_log_info {
+                    info!(
+                        peer_addr = ?peer_addr,
+                        remote_node,
+                        advertised_addr,
+                        remote_tip = %format_hash(remote_hello.tip),
+                        remote_height = ?remote_hello.height,
+                        "received peer hello with potentially useful tip"
+                    );
+                } else {
+                    debug!(
+                        peer_addr = ?peer_addr,
+                        remote_node,
+                        advertised_addr,
+                        remote_tip = %format_hash(remote_hello.tip),
+                        remote_height = ?remote_hello.height,
+                        "received peer hello"
+                    );
+                }
                 origin = RelayOrigin {
                     advertised_addr: remote_hello.advertised_addr.clone(),
                     node_name: remote_hello.node_name.clone(),
@@ -402,7 +418,11 @@ impl Server {
                 for reply in replies {
                     net::send_message(&mut stream, &reply)?;
                 }
-                let synced_blocks = self.sync_from_hello_best_effort(remote_hello);
+                let synced_blocks = if should_log_info {
+                    self.sync_from_hello_best_effort(remote_hello)
+                } else {
+                    Vec::new()
+                };
                 for block in synced_blocks {
                     info!(
                         block_hash = %format_hash(Some(block.header.block_hash())),
@@ -651,7 +671,8 @@ impl Server {
     ///
     /// Failures are intentionally swallowed so a node can still come up and
     /// serve local traffic even if some peers are offline or return incomplete
-    /// history.
+    /// history. This also avoids reconnecting to peers that were contacted very
+    /// recently or already advertised that they are not ahead of the local tip.
     pub fn sync_configured_peers_best_effort(&mut self) {
         let peers = self.select_sync_peers();
         for peer in &peers {
@@ -665,8 +686,10 @@ impl Server {
     /// Selects the best currently-known sync candidates from configured peers.
     ///
     /// The first version is intentionally conservative: it picks at most one
-    /// peer whose advertised height is ahead of the local node, falling back to
-    /// the configured peer list order when no peer has advertised a tip yet.
+    /// peer whose advertised height is ahead of the local node, and it falls
+    /// back to one unknown peer only when the node has no useful tip metadata
+    /// yet. Recently contacted peers stay on a short cooldown to avoid noisy
+    /// reconnect loops.
     fn select_sync_peers(&self) -> Vec<PeerEndpoint> {
         let local_height = self.state.tip_summary().height.unwrap_or(0);
         let mut candidates: Vec<StoredPeer> = self
@@ -683,11 +706,25 @@ impl Server {
         });
         if let Some(best) = candidates
             .into_iter()
-            .find(|peer| peer.advertised_height.unwrap_or(0) > local_height)
+            .find(|peer| {
+                peer.advertised_height.unwrap_or(0) > local_height
+                    && self.peer_is_ready_for_sync(peer)
+            })
         {
             return vec![best.endpoint()];
         }
-        self.peers.first().cloned().into_iter().collect()
+        self.peers
+            .iter()
+            .find(|peer| {
+                self.peer_state
+                    .get(&peer.addr)
+                    .map(|stored| stored.advertised_height.is_none())
+                    .unwrap_or(true)
+                    && self.peer_endpoint_is_ready_for_sync(peer)
+            })
+            .cloned()
+            .into_iter()
+            .collect()
     }
 
     /// Fetches a missing remote tip segment from `peer` and applies it
@@ -804,6 +841,16 @@ impl Server {
         );
         let peer = PeerEndpoint::new(peer_addr.to_string(), remote_hello.node_name.clone());
         self.sync_from_peer(&peer).unwrap_or_default()
+    }
+
+    /// Returns whether one inbound hello advertises chain data this node does
+    /// not already know, which makes it worth logging at info level and trying
+    /// a follow-up sync.
+    fn hello_advances_local_state(&self, remote_hello: &HelloMessage) -> bool {
+        remote_hello
+            .tip
+            .is_some_and(|tip| self.state.get_block(&tip).is_none())
+            || remote_hello.height.unwrap_or(0) > self.state.tip_summary().height.unwrap_or(0)
     }
 
     /// Applies one fetched block if it is not already indexed locally.
@@ -1027,15 +1074,50 @@ impl Server {
         peers.sort_by(|left, right| left.addr.cmp(&right.addr));
         store.save_peers(&peers)
     }
+
+    /// Returns whether the local server should spend one periodic sync attempt
+    /// on this peer now, rather than immediately retrying a recent connection.
+    fn peer_is_ready_for_sync(&self, peer: &StoredPeer) -> bool {
+        peer.last_connect_at
+            .as_deref()
+            .and_then(parse_timestamp_string)
+            .map(|seconds| {
+                current_unix_seconds().saturating_sub(seconds)
+                    >= CONFIGURED_PEER_SYNC_COOLDOWN.as_secs()
+            })
+            .unwrap_or(true)
+    }
+
+    /// Applies the same sync cooldown check starting from a configured endpoint.
+    fn peer_endpoint_is_ready_for_sync(&self, peer: &PeerEndpoint) -> bool {
+        self.peer_state
+            .get(&peer.addr)
+            .map(|stored| self.peer_is_ready_for_sync(stored))
+            .unwrap_or(true)
+    }
 }
 
 /// Returns a small stable timestamp string for persisted peer metadata.
 fn now_timestamp_string() -> String {
-    let seconds = SystemTime::now()
+    format_timestamp_string(current_unix_seconds())
+}
+
+/// Returns the current unix timestamp as seconds for peer metadata bookkeeping.
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
-        .as_secs();
+        .as_secs()
+}
+
+/// Formats one unix-seconds timestamp in the compact persisted peer format.
+fn format_timestamp_string(seconds: u64) -> String {
     format!("unix:{seconds}")
+}
+
+/// Parses one compact persisted peer timestamp string.
+fn parse_timestamp_string(value: &str) -> Option<u64> {
+    value.strip_prefix("unix:")?.parse().ok()
 }
 
 fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&RelayOrigin>) -> bool {
@@ -1244,7 +1326,10 @@ mod tests {
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
-    use super::{RelayOrigin, peer_matches_origin, relay_to_peer};
+    use super::{
+        RelayOrigin, current_unix_seconds, format_timestamp_string, peer_matches_origin,
+        relay_to_peer,
+    };
 
     fn connected_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1701,6 +1786,29 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].addr, "127.0.0.1:9001");
         assert_eq!(selected[0].node_name.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn select_sync_peers_skips_recently_contacted_unknown_peer() {
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+            .with_peers(vec![PeerEndpoint::new(
+                "127.0.0.1:9001",
+                Some("alpha".to_string()),
+            )]);
+        server.peer_state.insert(
+            "127.0.0.1:9001".to_string(),
+            StoredPeer {
+                last_connect_at: Some(format_timestamp_string(current_unix_seconds())),
+                ..StoredPeer::from_endpoint(
+                    PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                    PeerSource::Seed,
+                )
+            },
+        );
+
+        let selected = server.select_sync_peers();
+
+        assert!(selected.is_empty());
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! A node home groups the files a single node typically needs under one
 //! directory so CLI commands do not have to pass each path separately. The
 //! current layout includes the chain state SQLite file, one default wallet, an
-//! alias book, a bootstrap peer file, and a small human-readable node config.
+//! alias book, a bootstrap peer file, a structured log directory, and a small
+//! human-readable node config.
 
 use std::{
     env, fs, io,
@@ -28,6 +29,8 @@ const WALLET_FILENAME: &str = "wallet.bin";
 const ALIASES_FILENAME: &str = "aliases.json";
 const PEERS_FILENAME: &str = "peers.json";
 const CONFIG_FILENAME: &str = "config.json";
+const LOGS_DIRNAME: &str = "logs";
+const SERVER_LOG_FILENAME: &str = "server.log";
 
 /// Default runtime configuration stored in a node home.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +193,14 @@ impl NodeHome {
         self.root.join(CONFIG_FILENAME)
     }
 
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join(LOGS_DIRNAME)
+    }
+
+    pub fn server_log_path(&self) -> PathBuf {
+        self.logs_dir().join(SERVER_LOG_FILENAME)
+    }
+
     /// Loads the node runtime config from disk.
     pub fn load_config(&self) -> Result<NodeConfig, NodeHomeError> {
         let contents = fs::read_to_string(self.config_path())?;
@@ -235,6 +246,8 @@ impl NodeHome {
         if !config_path.exists() {
             self.save_config(&NodeConfig::default())?;
         }
+
+        fs::create_dir_all(self.logs_dir())?;
 
         Ok(())
     }
@@ -291,6 +304,14 @@ mod tests {
             home.config_path(),
             std::path::PathBuf::from("/tmp/wobble-node/config.json")
         );
+        assert_eq!(
+            home.logs_dir(),
+            std::path::PathBuf::from("/tmp/wobble-node/logs")
+        );
+        assert_eq!(
+            home.server_log_path(),
+            std::path::PathBuf::from("/tmp/wobble-node/logs/server.log")
+        );
     }
 
     #[test]
@@ -305,6 +326,7 @@ mod tests {
         assert!(home.aliases_path().exists());
         assert!(home.peers_path().exists());
         assert!(home.config_path().exists());
+        assert!(home.logs_dir().exists());
 
         fs::remove_dir_all(home.root()).unwrap();
     }

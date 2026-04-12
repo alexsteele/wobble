@@ -130,20 +130,24 @@ flags.
 
 ## Logging
 
-The server uses structured `tracing` logs on stderr. Use `RUST_LOG` to control it.
+The server uses structured `tracing` logs and writes them to daily log files
+under `<home>/logs`. Pass `--log-stderr` to mirror them to stderr too. Use
+`RUST_LOG` to control both sinks.
 
 Examples:
 
 ```shell
 cargo run -- serve
+cargo run -- serve --log-stderr
 RUST_LOG=wobble=debug cargo run -- serve
-RUST_LOG=info cargo run -- serve
+RUST_LOG=info cargo run -- serve --log-stderr
 ```
 
 Notes:
 - default logging falls back to `info` if `RUST_LOG` is not set
 - `RUST_LOG=wobble=debug` is useful when following handshakes, relay, and sync decisions
-- logs are emitted on stderr so normal CLI output stays readable on stdout
+- `serve` writes daily log files under `~/.wobble/logs`
+- `--log-stderr` mirrors server logs to stderr so normal CLI output stays readable on stdout
 
 ## Build And Test
 

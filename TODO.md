@@ -1,35 +1,33 @@
 # TODO
 
-## Node Operation
-
-- Add simple mining controls for testnet use: reward wallet, max transactions, difficulty bits, and mining cadence.
-- Keep improving local operator flows around `serve`, `status`, `wallet-info`, and `bootstrap`.
-
-## Remote Wallet Flow
-
-- Keep `submit-payment-remote` as the main send path and make it easier to use end to end.
-- Improve submit errors so users can distinguish funds, signature, policy, and connectivity failures.
-- Make recipient aliases and wallet-based sending feel first-class in the remote flow.
-- Support multiple wallets per node home so users can manage separate identities and spending keys more like a real bitcoin wallet setup.
-
 ## CLI Ergonomics
 
+- Improve serve, status, pay, wallet flows.
+- Easy recipient aliases
 - Document the local two-node demo flow in the README and explain the generated logs/artifacts.
 - Reduce rough edges between local and remote command shapes where practical.
 
-## Networking And Sync
+## Mining
 
+- Mining controls: max txns, difficulty bits, cadence, fees?
+- Parallel mining
+
+## Protocol
+
+- Reduce hello chatter
+- Persistent peer connections
 - Move from one-shot sync triggers toward a more continuous background sync loop.
 - Add block and transaction import/export formats for easier testing.
-m 
-## State And Performance
 
-- Add an owner-to-UTXO index so balance queries and coin selection do not scan the full active UTXO set.
-- Replace the snapshot-per-block UTXO strategy with a more scalable reorg mechanism.
+## State
+
+- Owner-to-UTXO index for balance operations
+- Incremental saves. No huge snapshots.
 
 ## Observability
 
-- Expand structured logging so accepted tx/block events consistently include post-transition state such as best tip and mempool size.
+- Post-transition state logging (tip/mempool size)
+- Log file rotation
 
 ## Testing
 
