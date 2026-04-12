@@ -85,6 +85,57 @@ pub enum PeerCommand {
     Disconnect,
 }
 
+/// Spawned async peer loop wired to state and coordinator channels.
+///
+/// This transport-agnostic scaffold models one live peer task without tying
+/// the async runtime to `TcpStream` yet. A future socket adapter can feed
+/// inbound wire messages into `inbound_tx`, read outbound messages from
+/// `recv_outbound`, and register `command_tx` with the runtime coordinator.
+pub struct SpawnedPeerTask {
+    peer_id: PeerId,
+    inbound_tx: mpsc::Sender<WireMessage>,
+    command_tx: mpsc::Sender<PeerCommand>,
+    outbound_rx: mpsc::Receiver<WireMessage>,
+    worker: JoinHandle<()>,
+}
+
+impl SpawnedPeerTask {
+    /// Returns the stable peer identifier owned by this task.
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    /// Returns the coordinator-facing command sender for this peer.
+    pub fn command_tx(&self) -> mpsc::Sender<PeerCommand> {
+        self.command_tx.clone()
+    }
+
+    /// Sends one inbound wire message into the peer task.
+    pub async fn send_inbound(
+        &self,
+        message: WireMessage,
+    ) -> Result<(), mpsc::error::SendError<WireMessage>> {
+        self.inbound_tx.send(message).await
+    }
+
+    /// Requests a clean peer-task disconnect through the command channel.
+    pub async fn disconnect(&self) -> Result<(), mpsc::error::SendError<PeerCommand>> {
+        self.command_tx.send(PeerCommand::Disconnect).await
+    }
+
+    /// Receives one outbound wire message produced by the peer task.
+    pub async fn recv_outbound(&mut self) -> Option<WireMessage> {
+        self.outbound_rx.recv().await
+    }
+
+    /// Waits for the peer task to exit.
+    pub async fn join(self) {
+        self.worker
+            .await
+            .expect("peer task should not panic during tests");
+    }
+}
+
 /// Mining work item prepared by the state task.
 ///
 /// The miner thread receives a fully-assembled candidate block and searches
@@ -497,6 +548,33 @@ impl ServerRuntime {
             worker,
         }
     }
+
+    /// Spawns one transport-agnostic peer task wired to this runtime handle.
+    pub fn spawn_peer_task(
+        &self,
+        peer_id: PeerId,
+        channel_capacity: usize,
+    ) -> SpawnedPeerTask {
+        let (inbound_tx, inbound_rx) = mpsc::channel(channel_capacity);
+        let (command_tx, command_rx) = mpsc::channel(channel_capacity);
+        let (outbound_tx, outbound_rx) = mpsc::channel(channel_capacity);
+        let handle = self.handle();
+        let task_peer_id = peer_id.clone();
+        let worker = tokio::spawn(run_peer_task(
+            task_peer_id,
+            handle,
+            inbound_rx,
+            command_rx,
+            outbound_tx,
+        ));
+        SpawnedPeerTask {
+            peer_id,
+            inbound_tx,
+            command_tx,
+            outbound_rx,
+            worker,
+        }
+    }
 }
 
 /// Serialized state owner for the future async runtime.
@@ -660,6 +738,56 @@ async fn run_state_task(
         }
     }
     task
+}
+
+/// Drives one peer task between the runtime and a transport adapter.
+///
+/// Inbound wire messages are forwarded through the state task, and any direct
+/// peer replies are emitted on `outbound_tx`. Coordinator-issued `PeerCommand`
+/// values are also translated into outbound messages or a clean disconnect.
+async fn run_peer_task(
+    peer_id: PeerId,
+    handle: ServerHandle,
+    mut inbound_rx: mpsc::Receiver<WireMessage>,
+    mut command_rx: mpsc::Receiver<PeerCommand>,
+    outbound_tx: mpsc::Sender<WireMessage>,
+) {
+    loop {
+        tokio::select! {
+            inbound = inbound_rx.recv() => {
+                let Some(message) = inbound else {
+                    break;
+                };
+                match handle.request_peer_message(peer_id.clone(), message).await {
+                    Ok(StateResponse::PeerReplies(replies)) => {
+                        // Emit any direct peer replies in protocol order.
+                        for reply in replies {
+                            if outbound_tx.send(reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(StateResponse::None) => {}
+                    Err(_) => break,
+                }
+            }
+            command = command_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    PeerCommand::Send(message) => {
+                        if outbound_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    PeerCommand::Disconnect => break,
+                }
+            }
+        }
+    }
+
+    let _ = handle.notify_peer_disconnected(peer_id).await;
 }
 
 #[cfg(test)]
@@ -959,6 +1087,46 @@ mod tests {
 
         coordinator.stop();
         let _task = coordinator.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_task_forwards_inbound_messages_through_state_task() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let peer = runtime.spawn_peer_task("peer-1".to_string(), 4);
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let state = runtime.spawn_state_task(task);
+
+        peer.send_inbound(WireMessage::GetTip).await.unwrap();
+        let mut peer = peer;
+        assert_eq!(
+            peer.recv_outbound().await,
+            Some(WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            }))
+        );
+
+        peer.disconnect().await.unwrap();
+        state.stop();
+        peer.join().await;
+        let _task = state.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_task_emits_coordinator_commands_as_outbound_messages() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let mut peer = runtime.spawn_peer_task("peer-2".to_string(), 4);
+        let command_tx = peer.command_tx();
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let state = runtime.spawn_state_task(task);
+
+        command_tx.send(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip)).await.unwrap();
+        assert_eq!(peer.recv_outbound().await, Some(WireMessage::GetTip));
+
+        command_tx.send(crate::async_runtime::PeerCommand::Disconnect).await.unwrap();
+        peer.join().await;
+        state.stop();
+        let _task = state.join().await;
     }
 
     #[test]

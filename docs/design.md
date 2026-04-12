@@ -263,7 +263,9 @@ The next runtime design should separate:
 
 `PeerTask`
 - owns one live peer connection
-- performs handshake, reads wire messages, and writes outbound messages
+- in the current scaffold, owns one transport-facing channel set
+- forwards inbound wire messages into the state task
+- emits outbound wire messages and coordinator-issued sends
 - does not mutate `NodeState` directly
 
 `PeerManager`
@@ -309,7 +311,6 @@ Asynchronous side effects:
 - `PeerDisconnected { peer_id }`
 
 `StateEffect`
-- `ReplyToPeer { peer_id, message }`
 - `Relay { peers, message }`
 - `Persist`
 - `StartMiningJob { job }`
@@ -326,6 +327,10 @@ Asynchronous side effects:
 
 `MinerEvent`
 - `FoundBlock { job_id, block }`
+
+Current scaffold note:
+- direct request-specific replies are returned over per-command reply channels
+- `StateEffect` is only for asynchronous follow-up work the runtime must route
 
 ### Mining Model
 
