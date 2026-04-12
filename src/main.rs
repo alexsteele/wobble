@@ -52,6 +52,8 @@ enum Command {
     Bootstrap(BootstrapCommand),
     /// Starts the local node server.
     Serve(ServeCommand),
+    /// Alias for `wallet balance`.
+    Balance(HomeArg),
     /// Reads or updates the local wallet stored under the node home.
     Wallet {
         #[command(subcommand)]
@@ -400,6 +402,7 @@ fn run() -> Result<(), String> {
         Command::Init(command) => run_init(command),
         Command::Bootstrap(command) => run_bootstrap(command),
         Command::Serve(command) => run_serve(command),
+        Command::Balance(command) => run_balance(command),
         Command::Wallet { command } => run_wallet(command),
         Command::Transactions(command) => run_transactions(command),
         Command::Status(command) => run_status(command),
@@ -1580,6 +1583,18 @@ mod tests {
 
     #[test]
     fn parses_balance_with_home_override() {
+        let cli = Cli::try_parse_from(["wobble", "balance", "--home", "/tmp/node"]).unwrap();
+
+        match cli.command {
+            Command::Balance(HomeArg { home }) => {
+                assert_eq!(home, Some(PathBuf::from("/tmp/node")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_wallet_balance_with_home_override() {
         let cli =
             Cli::try_parse_from(["wobble", "wallet", "balance", "--home", "/tmp/node"]).unwrap();
 

@@ -48,6 +48,7 @@ Usage: wobble <COMMAND>
 Commands:
   init            Initializes a node home with default state, wallet, aliases, and peers
   serve           Starts the local node server
+  balance         Alias for `wallet balance`
   wallet          Reads or updates the local wallet stored under the node home
   transactions    Prints recent wallet transactions from the local sqlite index
   pay             Builds and queues a local payment from the node wallet
@@ -64,6 +65,7 @@ Example:
 
 ```shell
 wobble init                                            # create ~/.wobble with wallet, state, and config
+wobble balance                                         # quick alias for wallet balance
 wobble wallet info                                     # show this node's wallet keys and metadata
 wobble wallet balance                                  # show wallet balances from local sqlite state
 wobble wallet new-key miner                            # add a named keypair to the local wallet
