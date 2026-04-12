@@ -18,6 +18,10 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
     thread,
@@ -163,6 +167,26 @@ struct RuntimePeer {
     session: Option<PeerSession>,
 }
 
+/// Shared stop signal for one running server instance.
+///
+/// The server loop and any active stream handlers poll this flag so callers can
+/// stop a long-running node without depending on connection timing.
+#[derive(Debug, Clone, Default)]
+pub struct ServerControl {
+    stop_requested: Arc<AtomicBool>,
+}
+
+impl ServerControl {
+    /// Requests that the server stop serving as soon as its loops next poll.
+    pub fn stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+}
+
 /// Owns local protocol configuration and mutable node state for networking.
 #[derive(Debug)]
 pub struct Server {
@@ -172,6 +196,7 @@ pub struct Server {
     sqlite_store: Option<sqlite_store::SqliteStore>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
+    control: ServerControl,
 }
 
 /// Errors produced by the live server while handling protocol messages.
@@ -271,7 +296,13 @@ impl Server {
             sqlite_store: None,
             bootstrap_sync: false,
             mining: None,
+            control: ServerControl::default(),
         }
+    }
+
+    /// Returns a cloneable control handle for this running server.
+    pub fn control(&self) -> ServerControl {
+        self.control.clone()
     }
 
     /// Configures the peer addresses that should receive relayed transactions and blocks.
@@ -484,6 +515,7 @@ impl Server {
     /// handled immediately and any resulting replies are written back in order.
     /// Gap: this does not yet track per-peer state or initiate background relay.
     pub fn handle_stream(&mut self, mut stream: TcpStream) -> io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
         let reader_stream = stream.try_clone()?;
         let mut reader = io::BufReader::new(reader_stream);
         let mut origin = RelayOrigin::default();
@@ -492,10 +524,18 @@ impl Server {
         info!(peer_addr = ?peer_addr, "accepted peer stream");
 
         loop {
+            if self.control.is_stopped() {
+                return Ok(());
+            }
             let message = match net::receive_message_from_reader(&mut reader) {
                 Ok(message) => message,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 }
@@ -566,14 +606,23 @@ impl Server {
     /// Admin requests are intentionally separate from the public peer protocol
     /// so local management operations are not exposed to arbitrary peers.
     pub fn handle_admin_stream(&mut self, mut stream: TcpStream) -> io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
         let reader_stream = stream.try_clone()?;
         let mut reader = io::BufReader::new(reader_stream);
 
         loop {
+            if self.control.is_stopped() {
+                return Ok(());
+            }
             let request = match receive_admin_request_from_reader(&mut reader) {
                 Ok(request) => request,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 }
@@ -631,6 +680,9 @@ impl Server {
             admin_listener.set_nonblocking(true)?;
         }
         loop {
+            if self.control.is_stopped() {
+                return Ok(());
+            }
             self.sync_configured_peers_if_due(&mut next_peer_sync_at);
             if let Some(admin_listener) = admin_listener.as_ref() {
                 match admin_listener.accept() {
@@ -2818,5 +2870,23 @@ mod tests {
         let block = server.state().get_block(&tip).unwrap();
         assert_eq!(block.transactions.len(), 2);
         assert_eq!(block.transactions[1].txid(), txid);
+    }
+
+    #[test]
+    fn serve_listener_stops_when_control_requests_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let control = server.control();
+
+        let worker = thread::spawn(move || {
+            server.serve_listener(listener).unwrap();
+            server
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        control.stop();
+
+        let stopped = worker.join().unwrap();
+        assert!(stopped.state().chain().best_tip().is_none());
     }
 }
