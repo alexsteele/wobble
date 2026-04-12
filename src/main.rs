@@ -592,6 +592,7 @@ fn run_status(command: HomeArg) -> Result<(), String> {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<none>".to_string())
     );
+    println!("branches: {}", state.chain().branch_count());
     match admin::request_status(&node_config.admin_addr) {
         Ok(status) => {
             println!("server: running");

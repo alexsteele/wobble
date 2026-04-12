@@ -52,6 +52,24 @@ impl ChainIndex {
         self.entries.iter()
     }
 
+    /// Returns how many known branch heads currently exist in the index.
+    ///
+    /// A branch head is any indexed block with no known child. This count is
+    /// `1` for a simple single-chain view and grows when the node is tracking
+    /// competing side branches.
+    pub fn branch_count(&self) -> usize {
+        let mut non_heads = std::collections::HashSet::new();
+        for entry in self.entries.values() {
+            if let Some(parent) = entry.parent {
+                non_heads.insert(parent);
+            }
+        }
+        self.entries
+            .keys()
+            .filter(|hash| !non_heads.contains(hash))
+            .count()
+    }
+
     /// Validates `block` in isolation, links it to its parent, and updates the
     /// best tip if the new branch has more cumulative work.
     pub fn insert_block(&mut self, block: &Block) -> Result<ChainIndexEntry, ChainError> {
@@ -235,6 +253,24 @@ mod tests {
         index.insert_block(&harder).unwrap();
 
         assert_eq!(index.best_tip(), Some(harder_hash));
+    }
+
+    #[test]
+    fn counts_known_branch_heads() {
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, 0);
+        let genesis_hash = genesis.header.block_hash();
+        let child = mine_block(genesis_hash, 0x207f_ffff, 1);
+        let sibling = mine_block(genesis_hash, 0x207f_ffff, 2);
+        let mut index = ChainIndex::new();
+
+        index.insert_block(&genesis).unwrap();
+        assert_eq!(index.branch_count(), 1);
+
+        index.insert_block(&child).unwrap();
+        assert_eq!(index.branch_count(), 1);
+
+        index.insert_block(&sibling).unwrap();
+        assert_eq!(index.branch_count(), 2);
     }
 
     #[test]
