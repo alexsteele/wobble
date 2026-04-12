@@ -143,16 +143,28 @@ Non-goals for v1:
 
 ## Mining
 
-Mining loop:
-- select transactions from mempool
-- build coinbase
-- compute merkle root
-- iterate nonce and extra nonce until hash meets target
-- broadcast found block
+Mining is part of the server loop, not a separate miner service.
 
-Difficulty:
-- v1 may use a fixed target
-- next step is periodic retargeting based on observed block interval
+Current behavior:
+- a node enables mining through its server config or `serve --mining`
+- the server polls periodically for work
+- it mines only when the mempool is non-empty
+- it builds a coinbase that pays the configured reward wallet
+- block reward is subsidy plus included transaction fees
+- it searches nonce values until the block hash is below the target from `bits`
+- accepted blocks go through the normal validation, persistence, logging, and relay path
+
+Current settings:
+- `enabled`
+- `reward_wallet`
+- `interval_ms`
+- `max_transactions`
+- `bits`
+
+This is the intended shape for the project: one server owns networking, state,
+and optional mining.
+
+Difficulty is fixed and intentionally easy for local testing.
 
 ## Storage
 
