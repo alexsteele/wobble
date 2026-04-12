@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod async_runtime;
 pub mod aliases;
 pub mod chain;
 pub mod client;
