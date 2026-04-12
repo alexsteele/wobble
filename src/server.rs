@@ -20,7 +20,7 @@ use std::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,7 @@ use crate::{
     net,
     node_state::{NodeState, NodeStateError},
     peer::{self, PeerConfig, PeerError},
+    peers::{PeerSource, StoredPeer},
     sqlite_store::{self, SqliteStoreError},
     types::{Block, BlockHash},
     wire::{HelloMessage, WireMessage},
@@ -380,6 +381,8 @@ impl Server {
                     advertised_addr: remote_hello.advertised_addr.clone(),
                     node_name: remote_hello.node_name.clone(),
                 };
+                self.record_inbound_hello(peer_addr, remote_hello)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
                 let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
                     .map_err(|err| {
                         io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
@@ -641,6 +644,7 @@ impl Server {
         let peers = self.peers.clone();
         for peer in &peers {
             if let Err(err) = self.sync_from_peer(peer) {
+                let _ = self.record_peer_connect_failure(peer, &err);
                 warn!(peer_addr = %peer.addr, error = ?err, "bootstrap sync from peer failed");
             }
         }
@@ -654,8 +658,11 @@ impl Server {
     /// keep one stream open while downloading a range.
     fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
         info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
+        let _ = self.record_peer_connect_attempt(peer);
         let (_, remote_hello) = client::connect_and_handshake(&peer.addr, &self.config)
             .map_err(SyncError::Handshake)?;
+        self.record_peer_connect_success(peer, &remote_hello)
+            .map_err(SyncError::SqlitePersist)?;
         debug!(
             peer_addr = %peer.addr,
             remote_node = ?remote_hello.node_name,
@@ -877,6 +884,115 @@ impl Server {
             .find(|peer| peer.node_name.as_deref() == Some(node_name))
             .cloned()
     }
+
+    /// Records peer metadata learned from one inbound `hello`.
+    fn record_inbound_hello(
+        &self,
+        peer_addr: Option<std::net::SocketAddr>,
+        remote_hello: &HelloMessage,
+    ) -> Result<(), SqliteStoreError> {
+        let Some(store) = self.sqlite_store.as_ref() else {
+            return Ok(());
+        };
+        let addr = remote_hello
+            .advertised_addr
+            .clone()
+            .or_else(|| peer_addr.map(|addr| addr.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        self.update_persisted_peer(
+            store,
+            &PeerEndpoint::new(addr, remote_hello.node_name.clone()),
+            PeerSource::Hello,
+            |peer| {
+                peer.advertised_tip_hash = remote_hello.tip;
+                peer.advertised_height = remote_hello.height;
+                peer.last_hello_at = Some(now_timestamp_string());
+                peer.last_seen_at = Some(now_timestamp_string());
+            },
+        )
+    }
+
+    /// Records the start of one outbound sync attempt to a configured peer.
+    fn record_peer_connect_attempt(&self, peer: &PeerEndpoint) -> Result<(), SqliteStoreError> {
+        let Some(store) = self.sqlite_store.as_ref() else {
+            return Ok(());
+        };
+        self.update_persisted_peer(store, peer, PeerSource::Seed, |stored| {
+            stored.last_connect_at = Some(now_timestamp_string());
+        })
+    }
+
+    /// Records a successful outbound handshake and the peer's advertised tip.
+    fn record_peer_connect_success(
+        &self,
+        peer: &PeerEndpoint,
+        remote_hello: &HelloMessage,
+    ) -> Result<(), SqliteStoreError> {
+        let Some(store) = self.sqlite_store.as_ref() else {
+            return Ok(());
+        };
+        self.update_persisted_peer(store, peer, PeerSource::Seed, |stored| {
+            stored.node_name = remote_hello.node_name.clone().or_else(|| stored.node_name.clone());
+            stored.advertised_tip_hash = remote_hello.tip;
+            stored.advertised_height = remote_hello.height;
+            stored.last_hello_at = Some(now_timestamp_string());
+            stored.last_seen_at = Some(now_timestamp_string());
+            stored.last_connect_at = Some(now_timestamp_string());
+            stored.last_success_at = Some(now_timestamp_string());
+            stored.last_error = None;
+            stored.connections = stored.connections.saturating_add(1);
+        })
+    }
+
+    /// Records a failed outbound sync attempt for one configured peer.
+    fn record_peer_connect_failure(
+        &self,
+        peer: &PeerEndpoint,
+        err: &SyncError,
+    ) -> Result<(), SqliteStoreError> {
+        let Some(store) = self.sqlite_store.as_ref() else {
+            return Ok(());
+        };
+        self.update_persisted_peer(store, peer, PeerSource::Seed, |stored| {
+            stored.last_connect_at = Some(now_timestamp_string());
+            stored.last_error = Some(format!("{err:?}"));
+            stored.failed_connections = stored.failed_connections.saturating_add(1);
+        })
+    }
+
+    /// Loads, updates, and rewrites the persisted peer set with one upserted peer.
+    fn update_persisted_peer<F>(
+        &self,
+        store: &sqlite_store::SqliteStore,
+        endpoint: &PeerEndpoint,
+        source: PeerSource,
+        update: F,
+    ) -> Result<(), SqliteStoreError>
+    where
+        F: FnOnce(&mut StoredPeer),
+    {
+        let mut peers = store.load_peers().unwrap_or_default();
+        let index = peers.iter().position(|peer| peer.addr == endpoint.addr);
+        let mut peer = index
+            .map(|index| peers.remove(index))
+            .unwrap_or_else(|| StoredPeer::from_endpoint(endpoint.clone(), source));
+        if endpoint.node_name.is_some() {
+            peer.node_name = endpoint.node_name.clone();
+        }
+        update(&mut peer);
+        peers.push(peer);
+        peers.sort_by(|left, right| left.addr.cmp(&right.addr));
+        store.save_peers(&peers)
+    }
+}
+
+/// Returns a small stable timestamp string for persisted peer metadata.
+fn now_timestamp_string() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_secs();
+    format!("unix:{seconds}")
 }
 
 fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&RelayOrigin>) -> bool {
@@ -1421,6 +1537,44 @@ mod tests {
         );
         assert_eq!(loaded_best_tip, server.state().chain().best_tip());
         assert_eq!(loaded_utxos.len(), server.state().active_utxos().len());
+    }
+
+    #[test]
+    fn inbound_hello_persists_peer_tip_metadata() {
+        let sqlite_path = temp_sqlite_path();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+            .with_sqlite_path(&sqlite_path);
+        let (mut client, server_stream) = connected_pair();
+
+        let worker = thread::spawn(move || server.handle_stream(server_stream).map(|_| server));
+
+        net::send_message(
+            &mut client,
+            &WireMessage::Hello(HelloMessage {
+                network: "wobble-local".to_string(),
+                version: PROTOCOL_VERSION,
+                node_name: Some("beta".to_string()),
+                advertised_addr: Some("127.0.0.1:9002".to_string()),
+                tip: Some(BlockHash::new([0x22; 32])),
+                height: Some(5),
+            }),
+        )
+        .unwrap();
+        let _ = net::receive_message(&mut client).unwrap();
+        drop(client);
+
+        let _server = worker.join().unwrap().unwrap();
+        let store = SqliteStore::open(&sqlite_path).unwrap();
+        let peers = store.load_peers().unwrap();
+        drop(store);
+        fs::remove_file(&sqlite_path).unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addr, "127.0.0.1:9002");
+        assert_eq!(peers[0].node_name.as_deref(), Some("beta"));
+        assert_eq!(peers[0].advertised_tip_hash, Some(BlockHash::new([0x22; 32])));
+        assert_eq!(peers[0].advertised_height, Some(5));
+        assert!(peers[0].last_hello_at.is_some());
     }
 
     #[test]
