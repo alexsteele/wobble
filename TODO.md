@@ -2,10 +2,8 @@
 
 ## Node Operation
 
-- Add a clean “run a node” workflow around `serve`.
-- Add optional integrated mining while the node is serving.
 - Add simple mining controls for testnet use: reward wallet, max transactions, difficulty bits, and mining cadence.
-- Surface basic live node status clearly: best tip, height, mempool size, and configured peers.
+- Keep improving local operator flows around `serve`, `status`, `wallet-info`, and `bootstrap`.
 
 ## Remote Wallet Flow
 
@@ -16,16 +14,14 @@
 
 ## CLI Ergonomics
 
-- Improve the CLI with structured subcommands and clearer output.
-- Document a short manual testnet flow in the README: start nodes, submit a payment, mine it, and inspect balances.
+- Document the local two-node demo flow in the README and explain the generated logs/artifacts.
 - Reduce rough edges between local and remote command shapes where practical.
 
 ## Networking And Sync
 
 - Move from one-shot sync triggers toward a more continuous background sync loop.
-- Introduce basic peer-to-peer networking for block and transaction relay.
 - Add block and transaction import/export formats for easier testing.
-
+m 
 ## State And Performance
 
 - Add an owner-to-UTXO index so balance queries and coin selection do not scan the full active UTXO set.
@@ -38,6 +34,7 @@
 ## Testing
 
 - Add property tests and adversarial fork/restart scenarios.
+- Keep tightening the local two-node demo script until it is a reliable executable smoke test.
 - Add a `test-net` command that can provision wobble nodes across configured hosts over SSH, start them with generated configs, and drive random transactions and mining activity.
 - Add a `test-net --local` mode that reuses the local test harness, spins up multiple local nodes, and fuzzes actions like payments, mining, restart, and reconnect.
 

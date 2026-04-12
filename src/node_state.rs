@@ -130,33 +130,47 @@ impl NodeState {
     }
 
     /// Builds a signed payment transaction by selecting active UTXOs locked to
-    /// `sender_signing_key`, then submits it to the mempool.
+    /// any of `sender_signing_keys`, then submits it to the mempool.
     ///
     /// If the selected inputs exceed `amount`, a change output is created back
-    /// to the sender's verifying key.
+    /// to `change_verifying_key`. Each input is signed by the owned key that
+    /// locked the corresponding UTXO, so one wallet payment may consume outputs
+    /// controlled by multiple named keys.
     pub fn submit_payment(
         &mut self,
-        sender_signing_key: &SigningKey,
+        sender_signing_keys: &[&SigningKey],
+        change_verifying_key: &VerifyingKey,
         recipient_verifying_key: &VerifyingKey,
         amount: Amount,
         uniqueness: u32,
     ) -> Result<Txid, NodeStateError> {
-        let sender_verifying_key = sender_signing_key.verifying_key();
-        let sender_locking_data = crypto::verifying_key_bytes(&sender_verifying_key).to_vec();
+        let sender_keys: Vec<(Vec<u8>, &SigningKey)> = sender_signing_keys
+            .iter()
+            .map(|key| {
+                (
+                    crypto::verifying_key_bytes(&key.verifying_key()).to_vec(),
+                    *key,
+                )
+            })
+            .collect();
+        let change_locking_data = crypto::verifying_key_bytes(change_verifying_key).to_vec();
         let mut selected = Vec::new();
         let mut total = 0_u64;
 
-        // Find active UTXOs controlled by the sender and gather enough value
-        // to fund the requested payment plus any change output.
+        // Find active UTXOs controlled by any owned key and gather enough
+        // value to fund the requested payment plus any change output.
         for outpoint in self.active_outpoints() {
             let Some(utxo) = self.active_utxos.get(&outpoint) else {
                 continue;
             };
-            if utxo.output.locking_data != sender_locking_data {
+            let Some((_, signing_key)) = sender_keys
+                .iter()
+                .find(|(locking_data, _)| *locking_data == utxo.output.locking_data)
+            else {
                 continue;
-            }
+            };
 
-            selected.push((outpoint, utxo.output.value));
+            selected.push((outpoint, utxo.output.value, *signing_key));
             total = total.saturating_add(utxo.output.value);
             if total >= amount {
                 break;
@@ -178,27 +192,36 @@ impl NodeState {
         if change > 0 {
             outputs.push(TxOut {
                 value: change,
-                locking_data: sender_locking_data.clone(),
+                locking_data: change_locking_data.clone(),
             });
         }
 
+        let selected_inputs: Vec<(TxIn, &SigningKey)> = selected
+            .into_iter()
+            .map(|(previous_output, _, signing_key)| {
+                (
+                    TxIn {
+                        previous_output,
+                        unlocking_data: Vec::new(),
+                    },
+                    signing_key,
+                )
+            })
+            .collect();
+
         let mut tx = Transaction {
             version: 1,
-            inputs: selected
-                .into_iter()
-                .map(|(previous_output, _)| TxIn {
-                    previous_output,
-                    unlocking_data: Vec::new(),
-                })
+            inputs: selected_inputs
+                .iter()
+                .map(|(input, _)| input.clone())
                 .collect(),
             outputs,
             lock_time: uniqueness,
         };
-        let signature = crypto::sign_message(sender_signing_key, &tx.signing_digest()).to_vec();
-        for input in &mut tx.inputs {
-            input.unlocking_data = signature.clone();
+        let signing_digest = tx.signing_digest();
+        for (input, (_, signing_key)) in tx.inputs.iter_mut().zip(selected_inputs.iter()) {
+            input.unlocking_data = crypto::sign_message(signing_key, &signing_digest).to_vec();
         }
-
         self.submit_transaction(tx)
     }
 
@@ -704,7 +727,13 @@ mod tests {
         state.accept_block(genesis).unwrap();
 
         let txid = state
-            .submit_payment(&sender, &recipient.verifying_key(), 30, 7)
+            .submit_payment(
+                &[&sender],
+                &sender.verifying_key(),
+                &recipient.verifying_key(),
+                30,
+                7,
+            )
             .unwrap();
         let tx = state
             .mempool()
@@ -730,7 +759,13 @@ mod tests {
         state.accept_block(genesis).unwrap();
 
         assert_eq!(
-            state.submit_payment(&recipient, &sender.verifying_key(), 30, 7),
+            state.submit_payment(
+                &[&recipient],
+                &recipient.verifying_key(),
+                &sender.verifying_key(),
+                30,
+                7
+            ),
             Err(NodeStateError::InsufficientFunds {
                 requested: 30,
                 available: 0,
@@ -751,7 +786,13 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state
-            .submit_payment(&sender, &recipient.verifying_key(), 30, 1)
+            .submit_payment(
+                &[&sender],
+                &sender.verifying_key(),
+                &recipient.verifying_key(),
+                30,
+                1,
+            )
             .unwrap();
         state
             .mine_block(BLOCK_SUBSIDY, &miner.verifying_key(), 2, 0x207f_ffff, 100)
@@ -760,5 +801,45 @@ mod tests {
         assert_eq!(state.balance_for_key(&sender.verifying_key()), 20);
         assert_eq!(state.balance_for_key(&recipient.verifying_key()), 30);
         assert_eq!(state.balance_for_key(&miner.verifying_key()), 50);
+    }
+
+    #[test]
+    fn submits_payment_across_multiple_owned_keys() {
+        let first = signing_key(1);
+        let second = signing_key(2);
+        let recipient = signing_key(3);
+        let first_block = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            vec![coinbase(40, &first.verifying_key(), 0)],
+        );
+        let second_block = mine_block(
+            first_block.header.block_hash(),
+            0x207f_ffff,
+            vec![coinbase(20, &second.verifying_key(), 1)],
+        );
+        let mut state = NodeState::new();
+        state.accept_block(first_block).unwrap();
+        state.accept_block(second_block).unwrap();
+
+        let txid = state
+            .submit_payment(
+                &[&first, &second],
+                &first.verifying_key(),
+                &recipient.verifying_key(),
+                50,
+                9,
+            )
+            .unwrap();
+        let tx = state.mempool().get(&txid).unwrap();
+
+        assert_eq!(tx.inputs.len(), 2);
+        assert_eq!(tx.outputs[0].value, 50);
+        assert_eq!(tx.outputs[1].value, 10);
+        assert_eq!(
+            tx.outputs[1].locking_data,
+            crypto::verifying_key_bytes(&first.verifying_key()).to_vec()
+        );
+        assert_ne!(tx.inputs[0].unlocking_data, tx.inputs[1].unlocking_data);
     }
 }

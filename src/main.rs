@@ -196,6 +196,8 @@ enum AdminCommand {
     GenerateKey,
     /// Creates a wallet file at the requested path.
     CreateWallet(CreateWalletCommand),
+    /// Adds a new named keypair to an existing wallet.
+    WalletAddKey(WalletAddKeyCommand),
     /// Creates an empty alias book JSON file.
     CreateAliasBook(CreateAliasBookCommand),
     /// Adds or replaces an alias entry in an alias book.
@@ -207,6 +209,12 @@ enum AdminCommand {
 #[derive(Debug, Args)]
 struct CreateWalletCommand {
     wallet_path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct WalletAddKeyCommand {
+    wallet_path: PathBuf,
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -526,23 +534,41 @@ fn load_wallet_context(command: &HomeArg) -> Result<(NodeHome, NodeConfig, Walle
     Ok((home, node_config, wallet))
 }
 
+/// Collects all signing keys owned by one loaded wallet for payment assembly.
+fn wallet_signing_keys(wallet: &Wallet) -> Vec<&ed25519_dalek::SigningKey> {
+    wallet.keys().map(|key| key.signing_key()).collect()
+}
+
 /// Prints the local wallet identity plus the best live balance available.
 ///
 /// The address and persisted balance are always read from local files. This
 /// keeps the command useful even when the node server is stopped.
 fn run_wallet_info(command: HomeArg) -> Result<(), String> {
     let (home, node_config, wallet) = load_wallet_context(&command)?;
-    let public_key = crypto::verifying_key_bytes(&wallet.verifying_key()).to_vec();
-    let public_key_hex = encode_hex(&public_key);
     let state = load_sqlite_state_read_only(&home.state_path())?;
-    let balance = state.balance_for_key(&wallet.verifying_key());
+    let balance: u64 = wallet
+        .verifying_keys()
+        .map(|key| state.balance_for_key(&key))
+        .sum();
 
     println!("node home: {}", home.root().display());
     println!("wallet: {}", home.wallet_path().display());
     println!("state: {}", home.state_path().display());
     println!("admin addr: {}", node_config.admin_addr);
-    println!("public key: {public_key_hex}");
+    println!("default key: {}", wallet.default_key_name());
+    println!("key count: {}", wallet.key_count());
+    println!(
+        "public key: {}",
+        encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
+    );
     println!("balance: {balance}");
+    for key in wallet.keys() {
+        println!(
+            "key {}: {}",
+            key.name(),
+            encode_hex(&crypto::verifying_key_bytes(&key.verifying_key()))
+        );
+    }
     Ok(())
 }
 
@@ -597,7 +623,8 @@ fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
     let mut state = load_sqlite_state(&home.state_path())?;
     let submitted = state
         .submit_payment(
-            sender_wallet.signing_key(),
+            &wallet_signing_keys(&sender_wallet),
+            &sender_wallet.verifying_key(),
             &recipient_verifying_key,
             command.amount,
             command.uniqueness.unwrap_or_else(default_uniqueness),
@@ -712,6 +739,25 @@ fn run_admin(command: AdminCommand) -> Result<(), String> {
             );
             Ok(())
         }
+        AdminCommand::WalletAddKey(command) => {
+            let mut wallet = wallet::load_wallet(&command.wallet_path)
+                .map_err(|err| format!("wallet load failed: {err:?}"))?;
+            let public_key = wallet
+                .generate_key(command.name.clone())
+                .map_err(|err| format!("wallet add-key failed: {err:?}"))?;
+            wallet::save_wallet(&command.wallet_path, &wallet)
+                .map_err(|err| format!("wallet save failed: {err:?}"))?;
+            println!(
+                "added wallet key {} to {}",
+                command.name,
+                command.wallet_path.display()
+            );
+            println!(
+                "public: {}",
+                encode_hex(&crypto::verifying_key_bytes(&public_key))
+            );
+            Ok(())
+        }
         AdminCommand::CreateAliasBook(command) => {
             aliases::save_alias_book(&command.alias_book, &AliasBook::new())
                 .map_err(|err| format!("alias save failed: {err:?}"))?;
@@ -819,7 +865,8 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             let mut state = load_sqlite_state(&state_path)?;
             let submitted = state
                 .submit_payment(
-                    sender_wallet.signing_key(),
+                    &wallet_signing_keys(&sender_wallet),
+                    &sender_wallet.verifying_key(),
                     &recipient_verifying_key,
                     command.amount,
                     command.uniqueness.unwrap_or_else(default_uniqueness),
@@ -844,7 +891,8 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
             let mut local_state = load_sqlite_state(&sqlite_path)?;
             let txid = local_state
                 .submit_payment(
-                    sender_wallet.signing_key(),
+                    &wallet_signing_keys(&sender_wallet),
+                    &sender_wallet.verifying_key(),
                     &recipient_verifying_key,
                     command.amount,
                     command.uniqueness.unwrap_or_else(default_uniqueness),
