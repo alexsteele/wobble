@@ -506,6 +506,51 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Saves one peer record by address without rewriting the full peer set.
+    pub fn save_peer(&self, peer: &StoredPeer) -> Result<(), SqliteStoreError> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO peers (
+                 addr, node_name, source, advertised_tip_hash, advertised_height,
+                 last_hello_at, last_seen_at, last_connect_at, last_success_at,
+                 last_error, connections, failed_connections, behavior_score, banned_until
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                peer.addr,
+                peer.node_name,
+                peer.source.as_str(),
+                peer.advertised_tip_hash.map(|hash| hash.to_string()),
+                peer.advertised_height.map(|height| height as i64),
+                peer.last_hello_at,
+                peer.last_seen_at,
+                peer.last_connect_at,
+                peer.last_success_at,
+                peer.last_error,
+                peer.connections as i64,
+                peer.failed_connections as i64,
+                peer.behavior_score,
+                peer.banned_until,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Loads one persisted peer by address when present.
+    pub fn load_peer(&self, addr: &str) -> Result<Option<StoredPeer>, SqliteStoreError> {
+        self.connection
+            .query_row(
+                "SELECT
+                     addr, node_name, source, advertised_tip_hash, advertised_height,
+                     last_hello_at, last_seen_at, last_connect_at, last_success_at,
+                     last_error, connections, failed_connections, behavior_score, banned_until
+                 FROM peers
+                 WHERE addr = ?1",
+                params![addr],
+                |row| stored_peer_from_row(row),
+            )
+            .optional()
+            .map_err(SqliteStoreError::from)
+    }
+
     /// Loads the persisted peer store ordered by address.
     pub fn load_peers(&self) -> Result<Vec<StoredPeer>, SqliteStoreError> {
         let mut statement = self.connection.prepare(
@@ -516,48 +561,7 @@ impl SqliteStore {
              FROM peers
              ORDER BY addr ASC",
         )?;
-        let rows = statement.query_map([], |row| {
-            let source_text: String = row.get(2)?;
-            let source = PeerSource::parse(&source_text).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid peer source: {source_text}"),
-                    )),
-                )
-            })?;
-            Ok(StoredPeer {
-                addr: row.get(0)?,
-                node_name: row.get(1)?,
-                source,
-                advertised_tip_hash: row
-                    .get::<_, Option<String>>(3)?
-                    .map(|value| parse_block_hash(&value))
-                    .transpose()
-                    .map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("{err:?}"),
-                            )),
-                        )
-                    })?,
-                advertised_height: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
-                last_hello_at: row.get(5)?,
-                last_seen_at: row.get(6)?,
-                last_connect_at: row.get(7)?,
-                last_success_at: row.get(8)?,
-                last_error: row.get(9)?,
-                connections: row.get::<_, i64>(10)? as u32,
-                failed_connections: row.get::<_, i64>(11)? as u32,
-                behavior_score: row.get(12)?,
-                banned_until: row.get(13)?,
-            })
-        })?;
+        let rows = statement.query_map([], stored_peer_from_row)?;
 
         let mut peers = Vec::new();
         for row in rows {
@@ -1432,6 +1436,49 @@ fn parse_txid(value: &str) -> Result<Txid, SqliteStoreError> {
         .try_into()
         .map_err(|_| SqliteStoreError::InvalidHashLength(len))?;
     Ok(Txid::new(array))
+}
+
+fn stored_peer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPeer> {
+    let source_text: String = row.get(2)?;
+    let source = PeerSource::parse(&source_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid peer source: {source_text}"),
+            )),
+        )
+    })?;
+    Ok(StoredPeer {
+        addr: row.get(0)?,
+        node_name: row.get(1)?,
+        source,
+        advertised_tip_hash: row
+            .get::<_, Option<String>>(3)?
+            .map(|value| parse_block_hash(&value))
+            .transpose()
+            .map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{err:?}"),
+                    )),
+                )
+            })?,
+        advertised_height: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+        last_hello_at: row.get(5)?,
+        last_seen_at: row.get(6)?,
+        last_connect_at: row.get(7)?,
+        last_success_at: row.get(8)?,
+        last_error: row.get(9)?,
+        connections: row.get::<_, i64>(10)? as u32,
+        failed_connections: row.get::<_, i64>(11)? as u32,
+        behavior_score: row.get(12)?,
+        banned_until: row.get(13)?,
+    })
 }
 
 /// Builds the persisted transaction index view from the current chain and mempool.
@@ -2714,6 +2761,35 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert_eq!(loaded, peers);
+    }
+
+    #[test]
+    fn save_peer_and_load_peer_round_trip() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let peer = StoredPeer {
+            addr: "127.0.0.1:9101".to_string(),
+            node_name: Some("alpha".to_string()),
+            source: PeerSource::Hello,
+            advertised_tip_hash: Some(BlockHash::new([0x55; 32])),
+            advertised_height: Some(9),
+            last_hello_at: Some("unix:1".to_string()),
+            last_seen_at: Some("unix:2".to_string()),
+            last_connect_at: Some("unix:3".to_string()),
+            last_success_at: Some("unix:4".to_string()),
+            last_error: None,
+            connections: 2,
+            failed_connections: 1,
+            behavior_score: 99,
+            banned_until: None,
+        };
+
+        store.save_peer(&peer).unwrap();
+        let loaded = store.load_peer(&peer.addr).unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded, Some(peer));
     }
 
     #[test]

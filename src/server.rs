@@ -1094,19 +1094,15 @@ impl Server {
             .sqlite_store
             .as_ref()
             .expect("peer persistence requires an open sqlite store");
-        let mut peers = store.load_peers().unwrap_or_default();
-        let index = peers.iter().position(|peer| peer.addr == endpoint.addr);
-        let mut peer = index
-            .map(|index| peers.remove(index))
+        let mut peer = store
+            .load_peer(&endpoint.addr)?
             .unwrap_or_else(|| StoredPeer::from_endpoint(endpoint.clone(), source));
         if endpoint.node_name.is_some() {
             peer.node_name = endpoint.node_name.clone();
         }
         update(&mut peer);
         self.peer_state.insert(peer.addr.clone(), peer.clone());
-        peers.push(peer);
-        peers.sort_by(|left, right| left.addr.cmp(&right.addr));
-        store.save_peers(&peers)
+        store.save_peer(&peer)
     }
 
     /// Returns whether the local server should spend one periodic sync attempt
