@@ -7,6 +7,10 @@ By default every generated node also points at the local user's node from
 `~/.wobble/config.json`, so the temporary cluster joins that existing listener
 without mutating the user's home.
 
+When a seed peer is configured, the cluster treats that external node as the
+source of truth and waits for the temporary nodes to sync to it. Only isolated
+runs with no seed peer bootstrap a fresh local genesis on `node0`.
+
 Optional random payments submit confirmed transfers at a fixed rate. The
 harness waits for each payment to clear before choosing the next sender so it
 does not intentionally overspend stale confirmed balances.
@@ -322,7 +326,13 @@ class LocalTestNet:
                 )
 
     def bootstrap(self) -> None:
-        """Bootstraps the first managed node so the rest must discover that chain."""
+        """Either bootstraps a fresh local chain or joins the configured seed chain."""
+        if self.seed_peer:
+            self.log(f"joining seeded chain from {self.seed_peer}")
+            self.wait_for_cluster_sync(self.nodes[0])
+            return
+
+        self.log(f"bootstrapping local chain on {self.nodes[0].name}")
         self.run_command(
             str(BIN),
             "bootstrap",
@@ -360,16 +370,21 @@ class LocalTestNet:
                     mismatches.append(
                         f"{node.name}(height={node_status.get('height')} tip={node_status.get('best tip')})"
                     )
-                    break
             if all_match:
                 self.log(f"cluster synced at height={reference_height} best_tip={reference_tip}")
                 return
             if time.time() >= next_progress_log:
-                self.log(
-                    "still waiting for cluster sync: "
-                    f"reference height={reference_height} tip={reference_tip} "
-                    + " ".join(mismatches)
-                )
+                if mismatches:
+                    self.log(
+                        "still waiting for cluster sync: "
+                        f"reference height={reference_height} tip={reference_tip} "
+                        + " ".join(mismatches[:3])
+                    )
+                else:
+                    self.log(
+                        "still waiting for cluster sync: "
+                        f"reference height={reference_height} tip={reference_tip}"
+                    )
                 next_progress_log = time.time() + 10
             time.sleep(0.5)
 

@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
+    chain::ChainError,
     client::{self, ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
     net,
@@ -236,6 +237,9 @@ impl Server {
         message: WireMessage,
         origin: Option<&RelayOrigin>,
     ) -> Result<Vec<WireMessage>, ServerError> {
+        if let Some(recovered) = self.try_handle_announced_block_with_sync(&message, origin)? {
+            return Ok(recovered);
+        }
         log_inbound_message(&message, &self.state);
         let should_persist = message_mutates_state(&message);
         let relay = self.relay_message_before_handle(&message);
@@ -251,6 +255,85 @@ impl Server {
             self.relay_best_effort(&relay, origin);
         }
         Ok(replies)
+    }
+
+    /// Handles announced blocks that arrive before their parents by syncing
+    /// missing ancestors from the origin peer and retrying the block once.
+    ///
+    /// This keeps relay resilient when blocks are announced out of order or
+    /// before the local node has finished catching up to that peer. If sync
+    /// still does not make the parent available, the original validation error
+    /// is returned unchanged.
+    fn try_handle_announced_block_with_sync(
+        &mut self,
+        message: &WireMessage,
+        origin: Option<&RelayOrigin>,
+    ) -> Result<Option<Vec<WireMessage>>, ServerError> {
+        let WireMessage::AnnounceBlock { block } = message else {
+            return Ok(None);
+        };
+
+        let block_hash = block.header.block_hash();
+        let parent_hash = block.header.prev_blockhash;
+
+        let Some(peer) = origin.and_then(|origin| self.sync_peer_from_origin(origin)) else {
+            return Ok(None);
+        };
+
+        let relay = self.relay_message_before_handle(message);
+        log_inbound_message(message, &self.state);
+
+        match peer::handle_message(&self.config, &mut self.state, message.clone()) {
+            Ok(replies) => {
+                log_post_handle_state(&replies, &self.state);
+                self.persist_sqlite(Some(block_hash), &replies)
+                    .map_err(ServerError::SqlitePersist)?;
+                if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
+                    self.relay_best_effort(&relay, origin);
+                }
+                return Ok(Some(replies));
+            }
+            Err(PeerError::BlockRejected(err))
+                if announced_block_needs_ancestor_sync(&err, parent_hash) =>
+            {
+                info!(
+                    peer_addr = %peer.addr,
+                    block_hash = %format_hash(Some(block_hash)),
+                    parent_hash = %format_hash(Some(parent_hash)),
+                    "announced block missing parent locally; syncing ancestors before retry"
+                );
+            }
+            Err(err) => return Err(ServerError::Peer(err)),
+        }
+
+        match self.sync_from_peer(&peer) {
+            Ok(synced_blocks) => {
+                info!(
+                    peer_addr = %peer.addr,
+                    synced_blocks = synced_blocks.len(),
+                    block_hash = %format_hash(Some(block_hash)),
+                    "retrying announced block after ancestor sync"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    peer_addr = %peer.addr,
+                    block_hash = %format_hash(Some(block_hash)),
+                    error = ?err,
+                    "ancestor sync failed for announced block"
+                );
+            }
+        }
+
+        let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
+            .map_err(ServerError::Peer)?;
+        log_post_handle_state(&replies, &self.state);
+        self.persist_sqlite(Some(block_hash), &replies)
+            .map_err(ServerError::SqlitePersist)?;
+        if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
+            self.relay_best_effort(&relay, origin);
+        }
+        Ok(Some(replies))
     }
 
     /// Serves a single connected stream until the peer closes the connection or
@@ -733,6 +816,23 @@ impl Server {
             _ => None,
         })
     }
+
+    /// Resolves the best peer address to call back when an inbound stream
+    /// announced an object that requires follow-up sync.
+    ///
+    /// The advertised listener address is preferred because it is the most
+    /// direct way to reconnect to the exact peer that sent the object. When
+    /// absent, a configured peer entry with the same node name is used.
+    fn sync_peer_from_origin(&self, origin: &RelayOrigin) -> Option<PeerEndpoint> {
+        if let Some(addr) = origin.advertised_addr.as_ref() {
+            return Some(PeerEndpoint::new(addr.clone(), origin.node_name.clone()));
+        }
+        let node_name = origin.node_name.as_deref()?;
+        self.peers
+            .iter()
+            .find(|peer| peer.node_name.as_deref() == Some(node_name))
+            .cloned()
+    }
 }
 
 fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&RelayOrigin>) -> bool {
@@ -766,6 +866,21 @@ fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
         WireMessage::MinedBlock(result) => Some(result.block_hash),
         _ => None,
     })
+}
+
+/// Returns whether an announced block rejection should trigger ancestor sync.
+///
+/// Two local validation errors are recoverable here:
+/// - `MissingParent`, when the node already has a chain but not this branch
+/// - `GenesisHasParent`, when an empty node hears about a child block before
+///   learning the remote genesis
+fn announced_block_needs_ancestor_sync(
+    err: &NodeStateError,
+    parent_hash: BlockHash,
+) -> bool {
+    matches!(err, NodeStateError::Chain(ChainError::MissingParent(_)))
+        || (matches!(err, NodeStateError::Chain(ChainError::GenesisHasParent))
+            && parent_hash != BlockHash::default())
 }
 
 /// Emits a concise log event for one inbound message before it is handled.
@@ -915,8 +1030,9 @@ mod tests {
 
     use crate::{
         admin::{AdminRequest, AdminResponse},
+        chain::ChainError,
         crypto, net,
-        node_state::NodeState,
+        node_state::{NodeState, NodeStateError},
         peer::PeerConfig,
         server::{MiningConfig, PeerEndpoint, Server},
         sqlite_store::SqliteStore,
@@ -1483,6 +1599,168 @@ mod tests {
         worker.join().unwrap();
 
         assert!(matches!(err, super::SyncError::MissingRemoteBlock(hash) if hash == missing_hash));
+    }
+
+    #[test]
+    fn announced_block_syncs_missing_parent_then_retries_acceptance() {
+        let owner = crypto::signing_key_from_bytes([11; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let child = mine_block(
+            genesis.header.block_hash(),
+            0x207f_ffff,
+            &owner.verifying_key(),
+            1,
+        );
+        let child_hash = child.header.block_hash();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer_addr = addr.clone();
+        let served_genesis = genesis.clone();
+        let served_child = child.clone();
+        let worker = thread::spawn(move || {
+            let (mut hello_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut hello_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut hello_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr.clone()),
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            drop(hello_stream);
+
+            let (mut child_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut child_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut child_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr.clone()),
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut child_stream).unwrap();
+            let WireMessage::GetBlock { block_hash } = request else {
+                panic!("expected child get_block request");
+            };
+            assert_eq!(block_hash, child_hash);
+            net::send_message(
+                &mut child_stream,
+                &WireMessage::Block {
+                    block: Some(served_child),
+                },
+            )
+            .unwrap();
+            drop(child_stream);
+
+            let (mut genesis_stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut genesis_stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut genesis_stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr),
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut genesis_stream).unwrap();
+            let WireMessage::GetBlock { block_hash } = request else {
+                panic!("expected genesis get_block request");
+            };
+            assert_eq!(block_hash, served_genesis.header.block_hash());
+            net::send_message(
+                &mut genesis_stream,
+                &WireMessage::Block {
+                    block: Some(served_genesis),
+                },
+            )
+            .unwrap();
+        });
+
+        let mut server = Server::new(
+            PeerConfig::new("wobble-local", Some("local".to_string())),
+            NodeState::new(),
+        );
+        let origin = RelayOrigin {
+            advertised_addr: Some(peer_addr),
+            node_name: Some("remote".to_string()),
+        };
+
+        let replies = server
+            .handle_message_from_peer(
+                WireMessage::AnnounceBlock {
+                    block: child.clone(),
+                },
+                Some(&origin),
+            )
+            .unwrap();
+        worker.join().unwrap();
+
+        assert!(replies.is_empty());
+        assert_eq!(server.state().chain().best_tip(), Some(child_hash));
+        assert!(server.state().get_block(&genesis.header.block_hash()).is_some());
+        assert!(server.state().get_block(&child_hash).is_some());
+    }
+
+    #[test]
+    fn announced_competing_genesis_still_returns_original_rejection() {
+        let local_owner = crypto::signing_key_from_bytes([12; 32]);
+        let remote_owner = crypto::signing_key_from_bytes([13; 32]);
+        let local_genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &local_owner.verifying_key(),
+            0,
+        );
+        let remote_genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &remote_owner.verifying_key(),
+            1,
+        );
+        let mut state = NodeState::new();
+        state.accept_block(local_genesis).unwrap();
+        let mut server = Server::new(
+            PeerConfig::new("wobble-local", Some("local".to_string())),
+            state,
+        );
+        let origin = RelayOrigin {
+            advertised_addr: Some("127.0.0.1:9999".to_string()),
+            node_name: Some("remote".to_string()),
+        };
+
+        let err = server
+            .handle_message_from_peer(
+                WireMessage::AnnounceBlock {
+                    block: remote_genesis,
+                },
+                Some(&origin),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            super::ServerError::Peer(crate::peer::PeerError::BlockRejected(
+                NodeStateError::Chain(ChainError::MissingParent(hash))
+            )) if hash == BlockHash::default()
+        ));
     }
 
     #[test]
