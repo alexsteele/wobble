@@ -5,7 +5,10 @@
 //! boundary is that runtime tasks perform I/O and coordination, while a single
 //! state-owning task remains the only place that mutates `NodeState`.
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+};
 
 use crate::{
     admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
@@ -113,14 +116,23 @@ pub enum MinerEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub state_channel_capacity: usize,
+    pub effect_channel_capacity: usize,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             state_channel_capacity: 256,
+            effect_channel_capacity: 256,
         }
     }
+}
+
+/// Errors returned while using the async server handle.
+#[derive(Debug)]
+pub enum ServerHandleError {
+    SubmitClosed,
+    ResponseDropped,
 }
 
 /// Cloneable control handle exposed to tests and callers.
@@ -152,6 +164,59 @@ impl ServerHandle {
     ) -> Result<(), mpsc::error::SendError<StateCommand>> {
         self.state_tx.send(command).await
     }
+
+    /// Sends one peer message through the state task and waits for the direct response.
+    pub async fn request_peer_message(
+        &self,
+        peer_id: PeerId,
+        message: WireMessage,
+    ) -> Result<StateResponse, ServerHandleError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.submit(StateCommand::InboundPeerMessage {
+            peer_id,
+            message,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ServerHandleError::SubmitClosed)?;
+        reply_rx.await.map_err(|_| ServerHandleError::ResponseDropped)
+    }
+
+    /// Sends one admin request through the state task and waits for the response.
+    pub async fn request_admin(
+        &self,
+        request: AdminRequest,
+    ) -> Result<AdminResponse, ServerHandleError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.submit(StateCommand::AdminRequest {
+            request,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ServerHandleError::SubmitClosed)?;
+        reply_rx.await.map_err(|_| ServerHandleError::ResponseDropped)
+    }
+
+    /// Notifies the state task that one peer disconnected.
+    pub async fn notify_peer_disconnected(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<(), ServerHandleError> {
+        self.submit(StateCommand::PeerDisconnected { peer_id })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
+
+    /// Delivers one mined block candidate back to the state task.
+    pub async fn notify_miner_found_block(
+        &self,
+        job_id: MiningJobId,
+        block: Block,
+    ) -> Result<(), ServerHandleError> {
+        self.submit(StateCommand::MinerFoundBlock { job_id, block })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
 }
 
 /// Scaffolding for the future Tokio-based runtime shell.
@@ -164,6 +229,26 @@ pub struct ServerRuntime {
     handle: ServerHandle,
     shutdown_rx: watch::Receiver<bool>,
     state_rx: mpsc::Receiver<StateCommand>,
+}
+
+/// Running async state loop plus the effect receiver it drives.
+pub struct SpawnedStateTask {
+    effects_rx: mpsc::Receiver<StateEffect>,
+    worker: JoinHandle<StateTask>,
+}
+
+impl SpawnedStateTask {
+    /// Receives the next asynchronous effect emitted by the state task.
+    pub async fn recv_effect(&mut self) -> Option<StateEffect> {
+        self.effects_rx.recv().await
+    }
+
+    /// Waits for the state task to exit and returns its final state owner.
+    pub async fn join(self) -> StateTask {
+        self.worker
+            .await
+            .expect("state task should not panic during tests")
+    }
 }
 
 impl ServerRuntime {
@@ -208,6 +293,18 @@ impl ServerRuntime {
                 break;
             }
         }
+    }
+
+    /// Consumes this runtime shell and spawns the async state loop.
+    pub fn spawn_state_task(self, task: StateTask) -> SpawnedStateTask {
+        let (effects_tx, effects_rx) = mpsc::channel(self.config.effect_channel_capacity);
+        let worker = tokio::spawn(run_state_task(
+            task,
+            self.state_rx,
+            self.shutdown_rx,
+            effects_tx,
+        ));
+        SpawnedStateTask { effects_rx, worker }
     }
 }
 
@@ -345,13 +442,44 @@ impl StateTask {
     }
 }
 
+/// Drives the serialized state owner until shutdown or channel close.
+async fn run_state_task(
+    mut task: StateTask,
+    mut state_rx: mpsc::Receiver<StateCommand>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    effects_tx: mpsc::Sender<StateEffect>,
+) -> StateTask {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            command = state_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                for effect in task.handle_command(command) {
+                    if effects_tx.send(effect).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    task
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::oneshot;
 
     use crate::{
         admin::{AdminRequest, AdminResponse},
-        async_runtime::{RuntimeConfig, ServerRuntime, StateCommand, StateResponse, StateTask},
+        async_runtime::{
+            RuntimeConfig, ServerRuntime, StateCommand, StateEffect, StateResponse, StateTask,
+        },
         crypto,
         node_state::NodeState,
         peer::PeerConfig,
@@ -454,6 +582,74 @@ mod tests {
             runtime.recv_state_command().await,
             Some(StateCommand::AdminRequest { .. })
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_handle_round_trips_peer_message_through_state_task() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let handle = runtime.handle();
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let worker = runtime.spawn_state_task(task);
+
+        let response = handle
+            .request_peer_message("peer-1".to_string(), WireMessage::GetTip)
+            .await
+            .unwrap();
+
+        handle.stop();
+        let _task = worker.join().await;
+
+        assert_eq!(
+            response,
+            StateResponse::PeerReplies(vec![WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_handle_round_trips_admin_request_through_state_task() {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let handle = runtime.handle();
+        let mut task =
+            StateTask::new(PeerConfig::new("wobble-local", Some("node".to_string())), NodeState::new());
+        task.set_peer_count(2);
+        let worker = runtime.spawn_state_task(task);
+
+        let response = handle.request_admin(AdminRequest::GetStatus).await.unwrap();
+
+        handle.stop();
+        let _task = worker.join().await;
+
+        assert_eq!(
+            response,
+            AdminResponse::Status(crate::admin::StatusSummary {
+                tip: None,
+                height: None,
+                branch_count: 0,
+                mempool_size: 0,
+                peer_count: 2,
+                mining_enabled: false,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn miner_found_block_emits_persist_effect() {
+        let owner = crypto::signing_key_from_bytes([9; 32]);
+        let block = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let handle = runtime.handle();
+        let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let mut worker = runtime.spawn_state_task(task);
+
+        handle.notify_miner_found_block(7, block).await.unwrap();
+
+        assert_eq!(worker.recv_effect().await, Some(StateEffect::Persist));
+        handle.stop();
+        let task = worker.join().await;
+        assert!(task.state().chain().best_tip().is_some());
     }
 
     #[test]
