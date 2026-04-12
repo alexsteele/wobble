@@ -8,14 +8,24 @@ Derived from local git history.
 
 | Date       | # Commits | Hours | Line Changes     |
 | ---------- | --------: | ----: | ---------------- |
+| 2026-04-12 |        21 |   5.8 | +4,002 / -510    |
 | 2026-04-11 |        56 |   9.3 | +11,667 / -3,252 |
 | 2026-04-10 |        44 |   4.2 | +7,924 / -487    |
 
 Current code size:
 
-- `src/`: `12,547` lines
-- `tests/`: `828` lines
+- `src/`: `15,681` lines
+- `tests/`: `808` lines
 - `scripts/`: `688` lines
+
+## 2026-04-12 Notes
+
+- Tightened SQLite persistence around accepted blocks, mempool transactions, peer rows, and best-tip rebuild checks so state recovery is moving away from full snapshot rewrites.
+- Added runtime-driven `disconnect()` and `stop()` controls and updated the TCP test harness to stop servers explicitly instead of relying on guessed connection counts.
+- Stabilized the sync and testnet path around persisted peer tip metadata, better peer selection, and more reliable seeded-chain catch-up behavior.
+- Introduced the first async runtime scaffold: `ServerRuntime`, `ServerHandle`, `StateTask`, and the spawned state loop that keeps `NodeState` ownership serialized behind channels.
+- Added `StateEffect` routing through a lightweight `RuntimeCoordinator` so relay, persistence, disconnect, and mining actions have an explicit async handoff point.
+- Added a transport-agnostic `PeerTask` plus a newline-delimited async `PeerTransport` adapter, with in-memory transport tests to validate the first live async peer path before porting TCP.
 
 ## 2026-04-11 Notes
 
