@@ -15,6 +15,15 @@
 //! - `transaction_keys` stores the one-to-many per-key input/output edges for
 //!   each transaction so wallet-style queries can match any participating key
 //! - `metadata` stores singleton node-level values such as the current best tip
+//!
+//! Save strategy:
+//! - admitted mempool transactions use `save_mempool_transaction` so the hot
+//!   path can upsert one pending transaction without rewriting the full mempool
+//! - best-tip block extensions use `save_accepted_block`, which updates the new
+//!   block record, active UTXO view, stale mempool rows, and confirmed
+//!   transaction rows for that block
+//! - bulk sync, rebuild, and reorg fallback still use `save_node_state` as the
+//!   authoritative full-snapshot path when incremental updates are not enough
 
 use std::{io, path::Path};
 

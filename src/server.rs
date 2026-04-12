@@ -1691,6 +1691,57 @@ mod tests {
     }
 
     #[test]
+    fn reorg_block_falls_back_to_full_snapshot_save() {
+        let miner_a = crypto::signing_key_from_bytes([11; 32]);
+        let miner_b = crypto::signing_key_from_bytes([12; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &miner_a.verifying_key(),
+            0,
+        );
+        let genesis_hash = genesis.header.block_hash();
+        let easy_child = mine_block(genesis_hash, 0x207f_ffff, &miner_a.verifying_key(), 1);
+        let easy_child_hash = easy_child.header.block_hash();
+        let harder_child = mine_block(genesis_hash, 0x201f_ffff, &miner_b.verifying_key(), 2);
+        let harder_child_hash = harder_child.header.block_hash();
+        let sqlite_path = temp_sqlite_path();
+        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+            .with_sqlite_path(&sqlite_path);
+
+        server
+            .handle_message(WireMessage::AnnounceBlock { block: genesis })
+            .unwrap();
+        server
+            .handle_message(WireMessage::AnnounceBlock { block: easy_child })
+            .unwrap();
+        server
+            .handle_message(WireMessage::AnnounceBlock {
+                block: harder_child.clone(),
+            })
+            .unwrap();
+
+        let store = SqliteStore::open(&sqlite_path).unwrap();
+        let reloaded = store.load_node_state().unwrap();
+        let persisted_harder = store.load_block(harder_child_hash).unwrap();
+        let persisted_tip = store.load_best_tip().unwrap();
+        drop(store);
+        fs::remove_file(&sqlite_path).unwrap();
+
+        assert_eq!(server.state().chain().best_tip(), Some(harder_child_hash));
+        assert_ne!(easy_child_hash, harder_child_hash);
+        assert_eq!(persisted_tip, Some(harder_child_hash));
+        assert_eq!(persisted_harder, Some(harder_child));
+        assert_eq!(reloaded.chain().best_tip(), Some(harder_child_hash));
+        assert_eq!(
+            reloaded.active_utxos().len(),
+            server.state().active_utxos().len()
+        );
+        assert_eq!(reloaded.active_outpoints(), server.state().active_outpoints());
+        assert_eq!(reloaded.mempool().len(), server.state().mempool().len());
+    }
+
+    #[test]
     fn inbound_hello_persists_peer_tip_metadata() {
         let sqlite_path = temp_sqlite_path();
         let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
