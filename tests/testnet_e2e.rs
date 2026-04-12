@@ -361,7 +361,7 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     testnet.sync_delay();
 
     let mut proposer = proposer.join();
-    proposer.close_outbound_peer_sessions();
+    proposer.disconnect();
     let miner_server = miner_server.join();
 
     assert_eq!(
@@ -471,7 +471,7 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
     testnet.sync_delay();
 
     let mut restarted_proposer = restarted_proposer.join();
-    restarted_proposer.close_outbound_peer_sessions();
+    restarted_proposer.disconnect();
     let miner_server = miner_server.join();
 
     assert_eq!(
@@ -549,9 +549,9 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
     testnet.sync_delay();
 
     let mut proposer = proposer.join();
-    proposer.close_outbound_peer_sessions();
+    proposer.disconnect();
     let mut relay_server = relay_server.join();
-    relay_server.close_outbound_peer_sessions();
+    relay_server.disconnect();
     let miner_server = miner_server.join();
 
     assert_eq!(
@@ -652,7 +652,7 @@ fn bootstrap_sync_follower_catches_up_to_seeded_server() {
 
     let mut follower = follower.join();
     assert_eq!(follower.state().chain().best_tip(), Some(best_tip));
-    follower.close_outbound_peer_sessions();
+    follower.disconnect();
     drop(follower);
 
     let seed = seed.join();
@@ -715,9 +715,9 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
         testnet.start_with_sync("observer", NodeBootstrap::State(observer_state), 0, true);
 
     let mut proposer = proposer.join();
-    proposer.close_outbound_peer_sessions();
+    proposer.disconnect();
     let mut observer = observer.join();
-    observer.close_outbound_peer_sessions();
+    observer.disconnect();
     let miner_server = miner_server.join();
 
     assert_eq!(observer.state().chain().best_tip(), Some(block_hash));
@@ -798,9 +798,9 @@ fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
         },
     );
     let mut proposer = proposer.join();
-    proposer.close_outbound_peer_sessions();
+    proposer.disconnect();
     let mut observer = observer.join();
-    observer.close_outbound_peer_sessions();
+    observer.disconnect();
     let miner_server = miner_server.join();
 
     // The handshake reply is sent before the best-effort sync runs, so it

@@ -1397,12 +1397,12 @@ impl Server {
         peers
     }
 
-    /// Closes all cached outbound peer sessions.
+    /// Disconnects this server from all currently cached outbound peers.
     ///
-    /// This is mainly useful when a caller wants deterministic teardown after
-    /// bootstrap sync or relay activity instead of waiting for `Server` drop to
-    /// release live peer sockets.
-    pub fn close_outbound_peer_sessions(&mut self) {
+    /// This gives callers an explicit way to tear down long-lived peer
+    /// sessions without relying on server drop timing. The current testnet
+    /// harness uses it to make multi-node teardown deterministic.
+    pub fn disconnect(&mut self) {
         for runtime_peer in self.peers.values_mut() {
             runtime_peer.session = None;
         }
