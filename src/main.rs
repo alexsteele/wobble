@@ -154,8 +154,8 @@ struct SubmitPaymentCommand {
 /// Read-only inspection commands for local stores and peers.
 #[derive(Debug, Subcommand)]
 enum InspectCommand {
-    /// Prints chain summary from a local sqlite state file.
-    Info(InfoCommand),
+    /// Prints persisted chain summary from a local sqlite state file.
+    Chain(InfoCommand),
     /// Prints the balance for a public key from a local sqlite state file.
     Balance(BalanceCommand),
     /// Prints the active UTXO set from a local sqlite state file.
@@ -173,8 +173,8 @@ struct InfoCommand {
 
 #[derive(Debug, Args)]
 struct BalanceCommand {
-    sqlite_path: Option<PathBuf>,
     public_key: String,
+    sqlite_path: Option<PathBuf>,
     #[arg(long)]
     home: Option<PathBuf>,
 }
@@ -690,40 +690,70 @@ fn run_submit_payment(command: SubmitPaymentCommand) -> Result<(), String> {
 
 fn run_inspect(command: InspectCommand) -> Result<(), String> {
     match command {
-        InspectCommand::Info(command) => {
+        InspectCommand::Chain(command) => {
             let sqlite_path =
                 resolve_state_path(command.home.as_deref(), command.sqlite_path.as_deref())?;
-            let state = load_sqlite_state(&sqlite_path)?;
+            let store = SqliteStore::open_read_only(&sqlite_path)
+                .map_err(|err| format!("sqlite open failed: {err:?}"))?;
+            let indexed_blocks = store
+                .count_chain_entries()
+                .map_err(|err| format!("sqlite load failed: {err:?}"))?;
+            let best_tip = store
+                .load_best_tip()
+                .map_err(|err| format!("sqlite load failed: {err:?}"))?;
+            let active_utxos = store
+                .load_active_utxos()
+                .map_err(|err| format!("sqlite load failed: {err:?}"))?;
+            let mempool = store
+                .load_mempool()
+                .map_err(|err| format!("sqlite load failed: {err:?}"))?;
             println!("sqlite: {}", sqlite_path.display());
-            println!("indexed blocks: {}", state.chain().len());
-            println!("best tip: {}", format_hash(state.chain().best_tip()));
-            println!("active utxos: {}", state.active_utxos().len());
-            println!("mempool txs: {}", state.mempool().len());
+            println!("indexed blocks: {indexed_blocks}");
+            println!("best tip: {}", format_hash(best_tip));
+            println!("active utxos: {}", active_utxos.len());
+            println!("mempool txs: {}", mempool.len());
             Ok(())
         }
         InspectCommand::Balance(command) => {
             let owner = parse_public_key(&command.public_key)?;
             let sqlite_path =
                 resolve_state_path(command.home.as_deref(), command.sqlite_path.as_deref())?;
-            let state = load_sqlite_state(&sqlite_path)?;
-            println!("{}", state.balance_for_key(&owner));
+            let store = SqliteStore::open_read_only(&sqlite_path)
+                .map_err(|err| format!("sqlite open failed: {err:?}"))?;
+            let owner_bytes = crypto::verifying_key_bytes(&owner);
+            let balance: u64 = store
+                .load_active_utxos()
+                .map_err(|err| format!("sqlite load failed: {err:?}"))?
+                .iter()
+                .filter(|(_, utxo)| utxo.output.locking_data == owner_bytes)
+                .map(|(_, utxo)| utxo.output.value)
+                .sum();
+            println!("{balance}");
             Ok(())
         }
         InspectCommand::Utxos(command) => {
             let sqlite_path =
                 resolve_state_path(command.home.as_deref(), command.sqlite_path.as_deref())?;
-            let state = load_sqlite_state(&sqlite_path)?;
-            for outpoint in state.active_outpoints() {
-                if let Some(utxo) = state.active_utxos().get(&outpoint) {
-                    println!(
-                        "{}:{} value={} coinbase={} owner={}",
-                        outpoint.txid,
-                        outpoint.vout,
-                        utxo.output.value,
-                        utxo.is_coinbase,
-                        encode_hex(&utxo.output.locking_data)
-                    );
-                }
+            let store = SqliteStore::open_read_only(&sqlite_path)
+                .map_err(|err| format!("sqlite open failed: {err:?}"))?;
+            let utxos = store
+                .load_active_utxos()
+                .map_err(|err| format!("sqlite load failed: {err:?}"))?;
+            let mut outpoints: Vec<OutPoint> =
+                utxos.iter().map(|(outpoint, _)| *outpoint).collect();
+            outpoints.sort_by_key(|outpoint| (outpoint.txid.to_string(), outpoint.vout));
+            for outpoint in outpoints {
+                let utxo = utxos
+                    .get(&outpoint)
+                    .expect("sorted outpoint should still exist in loaded UTXO set");
+                println!(
+                    "{}:{} value={} coinbase={} owner={}",
+                    outpoint.txid,
+                    outpoint.vout,
+                    utxo.output.value,
+                    utxo.is_coinbase,
+                    encode_hex(&utxo.output.locking_data)
+                );
             }
             Ok(())
         }
@@ -1737,15 +1767,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_inspect_info_without_sqlite_path() {
-        let cli = Cli::try_parse_from(["wobble", "inspect", "info"]).unwrap();
+    fn parses_inspect_chain_without_sqlite_path() {
+        let cli = Cli::try_parse_from(["wobble", "inspect", "chain"]).unwrap();
 
         match cli.command {
             Command::Inspect {
-                command: InspectCommand::Info(command),
+                command: InspectCommand::Chain(command),
             } => {
                 assert!(command.sqlite_path.is_none());
                 assert!(command.home.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_inspect_balance_with_public_key_and_optional_sqlite_path() {
+        let cli = Cli::try_parse_from([
+            "wobble",
+            "inspect",
+            "balance",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "/tmp/node.sqlite",
+            "--home",
+            "/tmp/node",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Inspect {
+                command: InspectCommand::Balance(command),
+            } => {
+                assert_eq!(
+                    command.public_key,
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                );
+                assert_eq!(command.sqlite_path, Some(PathBuf::from("/tmp/node.sqlite")));
+                assert_eq!(command.home, Some(PathBuf::from("/tmp/node")));
             }
             other => panic!("unexpected command: {other:?}"),
         }

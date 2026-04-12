@@ -195,6 +195,14 @@ impl SqliteStore {
         best_tip.map(|value| parse_block_hash(&value)).transpose()
     }
 
+    /// Returns how many chain index entries are currently persisted.
+    pub fn count_chain_entries(&self) -> Result<usize, SqliteStoreError> {
+        let count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM chain_entries", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
     /// Replaces the persisted active-chain UTXO view with `utxos`.
     ///
     /// This is still a whole-view rewrite rather than incremental spend/create
@@ -1130,6 +1138,47 @@ mod tests {
         assert_eq!(loaded_block, block);
         assert_eq!(loaded_entry, entry);
         assert_eq!(best_tip, Some(block_hash));
+    }
+
+    #[test]
+    fn counts_persisted_chain_entries() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let first = mine_block(BlockHash::default(), 0x207f_ffff, 0);
+        let first_hash = first.header.block_hash();
+        let second = mine_block(first_hash, 0x207f_ffff, 1);
+        let second_hash = second.header.block_hash();
+
+        store
+            .save_block_record(
+                &first,
+                &ChainIndexEntry {
+                    block_hash: first_hash,
+                    height: 0,
+                    cumulative_work: 1,
+                    parent: None,
+                },
+                Some(second_hash),
+            )
+            .unwrap();
+        store
+            .save_block_record(
+                &second,
+                &ChainIndexEntry {
+                    block_hash: second_hash,
+                    height: 1,
+                    cumulative_work: 2,
+                    parent: Some(first_hash),
+                },
+                Some(second_hash),
+            )
+            .unwrap();
+
+        let count = store.count_chain_entries().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(count, 2);
     }
 
     #[test]
