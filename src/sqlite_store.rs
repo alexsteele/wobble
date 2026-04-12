@@ -10,15 +10,17 @@
 //!   as height, cumulative work, and parent linkage
 //! - `active_utxos` stores the current active-chain unspent outputs
 //! - `mempool_transactions` stores the current pending transaction set
+//! - `peers` stores seed and learned peer metadata for future discovery work
 //! - `metadata` stores singleton node-level values such as the current best tip
 
-use std::path::Path;
+use std::{io, path::Path};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::{
     mempool::Mempool,
     node_state::{NodeState, NodeStateError},
+    peers::{PeerSource, StoredPeer},
     state::UtxoSet,
     types::{Block, BlockHash, ChainIndexEntry, OutPoint, Transaction, TxOut, Txid, Utxo},
 };
@@ -288,6 +290,78 @@ impl SqliteStore {
         Ok(Mempool::from_persisted(transactions))
     }
 
+    /// Replaces the persisted peer store with `peers`.
+    pub fn save_peers(&self, peers: &[StoredPeer]) -> Result<(), SqliteStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM peers", [])?;
+        for peer in peers {
+            tx.execute(
+                "INSERT INTO peers (
+                     addr, node_name, source, last_seen_at, last_connect_at, last_success_at,
+                     last_error, connections, failed_connections, behavior_score, banned_until
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    peer.addr,
+                    peer.node_name,
+                    peer.source.as_str(),
+                    peer.last_seen_at,
+                    peer.last_connect_at,
+                    peer.last_success_at,
+                    peer.last_error,
+                    peer.connections as i64,
+                    peer.failed_connections as i64,
+                    peer.behavior_score,
+                    peer.banned_until,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted peer store ordered by address.
+    pub fn load_peers(&self) -> Result<Vec<StoredPeer>, SqliteStoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                 addr, node_name, source, last_seen_at, last_connect_at, last_success_at,
+                 last_error, connections, failed_connections, behavior_score, banned_until
+             FROM peers
+             ORDER BY addr ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let source_text: String = row.get(2)?;
+            let source = PeerSource::parse(&source_text).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid peer source: {source_text}"),
+                    )),
+                )
+            })?;
+            Ok(StoredPeer {
+                addr: row.get(0)?,
+                node_name: row.get(1)?,
+                source,
+                last_seen_at: row.get(3)?,
+                last_connect_at: row.get(4)?,
+                last_success_at: row.get(5)?,
+                last_error: row.get(6)?,
+                connections: row.get::<_, i64>(7)? as u32,
+                failed_connections: row.get::<_, i64>(8)? as u32,
+                behavior_score: row.get(9)?,
+                banned_until: row.get(10)?,
+            })
+        })?;
+
+        let mut peers = Vec::new();
+        for row in rows {
+            peers.push(row?);
+        }
+        Ok(peers)
+    }
+
     /// Rebuilds a full in-memory `NodeState` from persisted SQLite data.
     ///
     /// The current schema stores the authoritative block history, active UTXO
@@ -377,6 +451,19 @@ impl SqliteStore {
                  txid TEXT PRIMARY KEY,
                  transaction_bytes BLOB NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS peers (
+                 addr TEXT PRIMARY KEY,
+                 node_name TEXT NULL,
+                 source TEXT NOT NULL,
+                 last_seen_at TEXT NULL,
+                 last_connect_at TEXT NULL,
+                 last_success_at TEXT NULL,
+                 last_error TEXT NULL,
+                 connections INTEGER NOT NULL DEFAULT 0,
+                 failed_connections INTEGER NOT NULL DEFAULT 0,
+                 behavior_score INTEGER NOT NULL DEFAULT 100,
+                 banned_until TEXT NULL
+             );
              CREATE TABLE IF NOT EXISTS metadata (
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -393,6 +480,7 @@ impl SqliteStore {
              DELETE FROM chain_entries;
              DELETE FROM active_utxos;
              DELETE FROM mempool_transactions;
+             DELETE FROM peers;
              DELETE FROM metadata;
              COMMIT;",
         )?;
@@ -495,6 +583,7 @@ mod tests {
 
     use crate::{
         mempool::Mempool,
+        peers::{PeerSource, StoredPeer},
         state::UtxoSet,
         types::{
             Block, BlockHash, BlockHeader, ChainIndexEntry, OutPoint, Transaction, TxIn, TxOut,
@@ -647,6 +736,48 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get(&txid), Some(&transaction));
+    }
+
+    #[test]
+    fn round_trips_persisted_peers() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let peers = vec![
+            StoredPeer {
+                addr: "127.0.0.1:9001".to_string(),
+                node_name: Some("alpha".to_string()),
+                source: PeerSource::Seed,
+                last_seen_at: Some("2026-04-11T12:00:00Z".to_string()),
+                last_connect_at: Some("2026-04-11T12:01:00Z".to_string()),
+                last_success_at: Some("2026-04-11T12:02:00Z".to_string()),
+                last_error: None,
+                connections: 3,
+                failed_connections: 1,
+                behavior_score: 100,
+                banned_until: None,
+            },
+            StoredPeer {
+                addr: "127.0.0.1:9002".to_string(),
+                node_name: None,
+                source: PeerSource::Hello,
+                last_seen_at: None,
+                last_connect_at: None,
+                last_success_at: None,
+                last_error: Some("timed out".to_string()),
+                connections: 0,
+                failed_connections: 2,
+                behavior_score: 85,
+                banned_until: Some("2026-04-12T00:00:00Z".to_string()),
+            },
+        ];
+
+        store.save_peers(&peers).unwrap();
+
+        let loaded = store.load_peers().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded, peers);
     }
 
     #[test]

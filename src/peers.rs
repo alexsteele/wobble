@@ -1,13 +1,85 @@
-//! Bootstrap peer configuration loaded from disk.
+//! Bootstrap and persisted peer configuration types.
 //!
 //! This module keeps peer-file parsing separate from CLI code so a node can
 //! load a small static peer list at startup without mixing filesystem and JSON
-//! handling into the networking path. The file format is intentionally simple:
-//! a JSON array of `PeerEndpoint` records.
+//! handling into the networking path. It also defines the persisted peer-record
+//! types that back the longer-lived sqlite peer store.
 
 use std::{fs, path::Path};
 
+use serde::{Deserialize, Serialize};
+
 use crate::server::PeerEndpoint;
+
+/// Describes how a peer first entered the local peer store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerSource {
+    Seed,
+    Hello,
+    PeerExchange,
+    Manual,
+}
+
+impl PeerSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Hello => "hello",
+            Self::PeerExchange => "peer_exchange",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "seed" => Some(Self::Seed),
+            "hello" => Some(Self::Hello),
+            "peer_exchange" => Some(Self::PeerExchange),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted peer record stored in sqlite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPeer {
+    pub addr: String,
+    pub node_name: Option<String>,
+    pub source: PeerSource,
+    pub last_seen_at: Option<String>,
+    pub last_connect_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub connections: u32,
+    pub failed_connections: u32,
+    pub behavior_score: i32,
+    pub banned_until: Option<String>,
+}
+
+impl StoredPeer {
+    /// Builds a new persisted peer record from a known endpoint and source.
+    pub fn from_endpoint(endpoint: PeerEndpoint, source: PeerSource) -> Self {
+        Self {
+            addr: endpoint.addr,
+            node_name: endpoint.node_name,
+            source,
+            last_seen_at: None,
+            last_connect_at: None,
+            last_success_at: None,
+            last_error: None,
+            connections: 0,
+            failed_connections: 0,
+            behavior_score: 100,
+            banned_until: None,
+        }
+    }
+
+    /// Returns the minimal runtime endpoint view used by the networking layer.
+    pub fn endpoint(&self) -> PeerEndpoint {
+        PeerEndpoint::new(self.addr.clone(), self.node_name.clone())
+    }
+}
 
 /// Loads a startup peer list from a JSON file on disk.
 ///
@@ -40,7 +112,7 @@ mod tests {
     };
 
     use crate::{
-        peers::{load_peer_endpoints, save_peer_endpoints},
+        peers::{PeerSource, StoredPeer, load_peer_endpoints, save_peer_endpoints},
         server::PeerEndpoint,
     };
 
@@ -108,5 +180,18 @@ mod tests {
         fs::remove_file(&path).unwrap();
 
         assert_eq!(loaded, peers);
+    }
+
+    #[test]
+    fn stored_peer_defaults_to_perfect_behavior() {
+        let stored = StoredPeer::from_endpoint(
+            PeerEndpoint::new("127.0.0.1:9001", Some("miner".to_string())),
+            PeerSource::Seed,
+        );
+
+        assert_eq!(stored.behavior_score, 100);
+        assert_eq!(stored.connections, 0);
+        assert_eq!(stored.failed_connections, 0);
+        assert_eq!(stored.endpoint().addr, "127.0.0.1:9001");
     }
 }
