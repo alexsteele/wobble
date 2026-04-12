@@ -51,8 +51,10 @@ enum Command {
     Bootstrap(BootstrapCommand),
     /// Starts the local node server.
     Serve(ServeCommand),
-    /// Prints the local node wallet public key and live balance.
+    /// Prints wallet identity and key metadata.
     WalletInfo(HomeArg),
+    /// Prints total and per-key wallet balances from local state.
+    Balance(HomeArg),
     /// Prints status from the running local node server.
     Status(HomeArg),
     /// Builds and queues a local payment from the node wallet.
@@ -379,6 +381,7 @@ fn run() -> Result<(), String> {
         Command::Bootstrap(command) => run_bootstrap(command),
         Command::Serve(command) => run_serve(command),
         Command::WalletInfo(command) => run_wallet_info(command),
+        Command::Balance(command) => run_balance(command),
         Command::Status(command) => run_status(command),
         Command::SubmitPayment(command) => run_submit_payment(command),
         Command::Inspect { command } => run_inspect(command),
@@ -539,17 +542,9 @@ fn wallet_signing_keys(wallet: &Wallet) -> Vec<&ed25519_dalek::SigningKey> {
     wallet.keys().map(|key| key.signing_key()).collect()
 }
 
-/// Prints the local wallet identity plus the best live balance available.
-///
-/// The address and persisted balance are always read from local files. This
-/// keeps the command useful even when the node server is stopped.
+/// Prints local wallet metadata without requiring a running server.
 fn run_wallet_info(command: HomeArg) -> Result<(), String> {
     let (home, node_config, wallet) = load_wallet_context(&command)?;
-    let state = load_sqlite_state_read_only(&home.state_path())?;
-    let balance: u64 = wallet
-        .verifying_keys()
-        .map(|key| state.balance_for_key(&key))
-        .sum();
 
     println!("node home: {}", home.root().display());
     println!("wallet: {}", home.wallet_path().display());
@@ -561,7 +556,6 @@ fn run_wallet_info(command: HomeArg) -> Result<(), String> {
         "public key: {}",
         encode_hex(&crypto::verifying_key_bytes(&wallet.verifying_key()))
     );
-    println!("balance: {balance}");
     for key in wallet.keys() {
         println!(
             "key {}: {}",
@@ -569,6 +563,24 @@ fn run_wallet_info(command: HomeArg) -> Result<(), String> {
             encode_hex(&crypto::verifying_key_bytes(&key.verifying_key()))
         );
     }
+    Ok(())
+}
+
+/// Prints total wallet balance plus one line per named wallet key.
+fn run_balance(command: HomeArg) -> Result<(), String> {
+    let (home, _, wallet) = load_wallet_context(&command)?;
+    let state = load_sqlite_state_read_only(&home.state_path())?;
+    let mut total = 0_u64;
+
+    println!("wallet: {}", home.wallet_path().display());
+    println!("state: {}", home.state_path().display());
+    println!("default key: {}", wallet.default_key_name());
+    for key in wallet.keys() {
+        let balance = state.balance_for_key(&key.verifying_key());
+        total = total.saturating_add(balance);
+        println!("{}: {}", key.name(), balance);
+    }
+    println!("total: {total}");
     Ok(())
 }
 
@@ -1323,6 +1335,18 @@ mod tests {
 
         match cli.command {
             Command::WalletInfo(HomeArg { home }) => {
+                assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_balance_with_home_override() {
+        let cli = Cli::try_parse_from(["wobble", "balance", "--home", "/tmp/node"]).unwrap();
+
+        match cli.command {
+            Command::Balance(HomeArg { home }) => {
                 assert_eq!(home.unwrap(), PathBuf::from("/tmp/node"));
             }
             other => panic!("unexpected command: {other:?}"),
