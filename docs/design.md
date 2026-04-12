@@ -237,6 +237,152 @@ Near-term intent:
 - give one runtime task explicit ownership of state mutation, rather than
   letting many peer tasks mutate `NodeState` concurrently
 
+## Async Runtime Outline
+
+The next runtime design should separate:
+- deterministic state mutation
+- async socket I/O
+- CPU-bound mining
+
+### Runtime Roles
+
+`ServerRuntime`
+- owns the live async node process
+- starts listeners, peer tasks, admin handling, timers, and shutdown
+- routes commands and effects between tasks
+
+`ServerHandle`
+- small cloneable control surface for callers and tests
+- supports lifecycle actions such as `stop()`
+
+`StateTask`
+- the single owner of `NodeState`
+- receives commands from peers, admin clients, and the miner
+- validates and applies all chain, mempool, and UTXO mutations
+- emits effects such as replies, relay actions, persistence, and mining updates
+
+`PeerTask`
+- owns one live peer connection
+- performs handshake, reads wire messages, and writes outbound messages
+- does not mutate `NodeState` directly
+
+`PeerManager`
+- tracks known peers and active peer-task channels
+- maintains outbound connections and reconnect policy
+
+`MinerThread`
+- runs proof-of-work on a dedicated blocking thread
+- receives mining jobs over a channel
+- reports found blocks back to the state task
+
+### Ownership Rule
+
+Only the state task mutates `NodeState`.
+
+Peer tasks:
+- decode messages from sockets
+- send commands to the state task
+- write replies or outbound relays they are instructed to send
+
+This keeps consensus and state transitions serialized even though networking is concurrent.
+
+### Command Flow
+
+Inbound request-response flow:
+1. a peer task reads one wire message
+2. it sends a `StateCommand` carrying the message plus a reply channel
+3. the state task validates and applies any needed mutation
+4. the state task returns a reply over that reply channel
+5. the peer task writes the reply back to the socket
+
+Asynchronous side effects:
+1. the state task accepts an object or changes local state
+2. it emits effects such as relay, persistence, or mining updates
+3. the runtime routes those effects to peer tasks, the store, or the miner
+
+### Suggested Runtime Types
+
+`StateCommand`
+- `InboundPeerMessage { peer_id, message, reply }`
+- `AdminRequest { request, reply }`
+- `MinerFoundBlock { job_id, block }`
+- `PeerDisconnected { peer_id }`
+
+`StateEffect`
+- `ReplyToPeer { peer_id, message }`
+- `Relay { peers, message }`
+- `Persist`
+- `StartMiningJob { job }`
+- `StopMining`
+- `DisconnectPeer { peer_id }`
+
+`PeerCommand`
+- `Send(WireMessage)`
+- `Disconnect`
+
+`MinerCommand`
+- `StartJob(MiningJob)`
+- `Stop`
+
+`MinerEvent`
+- `FoundBlock { job_id, block }`
+
+### Mining Model
+
+Mining should not run on the async executor.
+
+Instead:
+- the state task decides what the current mining job is
+- the miner thread receives that job over a channel
+- the miner thread searches nonces in a loop
+- when the tip or mempool changes, the state task sends a replacement job
+- when the miner finds a valid block, it sends a `MinerEvent::FoundBlock` back
+
+The miner thread never mutates `NodeState` directly.
+
+### Mining Cancellation
+
+Mining jobs should be replaceable.
+
+Simple first design:
+- each job has a monotonically increasing `job_id`
+- the miner thread checks for a newer job between nonce batches
+- if a newer job arrives, the old job is abandoned
+
+This is sufficient for local testnet mining.
+
+### Persistence
+
+SQLite access should remain coordinated by the state task.
+
+Reason:
+- accepted blocks, mempool changes, and peer metadata should still follow one
+  authoritative mutation path
+- this avoids many async tasks performing ad hoc concurrent writes
+
+If blocking SQLite calls become a latency problem, the runtime can move them behind
+`spawn_blocking` without changing ownership.
+
+### Shutdown
+
+`stop()` should:
+- stop accepting new inbound connections
+- tell peer tasks to disconnect
+- tell the miner thread to stop
+- let the state task finish any final persistence
+- wait for all runtime tasks to exit cleanly
+
+`disconnect()` should remain narrower:
+- drop live outbound peer sessions without stopping the node
+
+### Migration Plan
+
+1. introduce the runtime types and channels without changing consensus logic
+2. port transport and listeners to Tokio
+3. move the current server loop into a state-owning async task
+4. move mining to a dedicated thread with command/event channels
+5. re-enable long-lived relay and sync sessions once multiple live peer tasks are supported
+
 ## Execution Plan
 
 Milestone 1:
