@@ -468,14 +468,6 @@ impl Server {
             admin_listener.set_nonblocking(true)?;
         }
         loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    self.handle_stream(stream)?
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(err),
-            }
             if let Some(admin_listener) = admin_listener.as_ref() {
                 match admin_listener.accept() {
                     Ok((stream, _)) => {
@@ -485,6 +477,14 @@ impl Server {
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     Err(err) => return Err(err),
                 }
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    self.handle_stream(stream)?
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err),
             }
             self.mine_pending_best_effort()?;
             let interval = self

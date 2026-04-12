@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ class NodeHandle:
     log_path: Path
     process: subprocess.Popen[str] | None = None
     log_handle: object | None = None
+    tee_thread: threading.Thread | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payment-count", type=int, default=0, help="number of random confirmed payments to submit after bootstrap")
     parser.add_argument("--payment-rate", type=float, default=0.0, help="payments per second when random payments are enabled")
     parser.add_argument("--payment-amount", type=int, default=5, help="coins sent by each random payment")
+    parser.add_argument("--tee-logs", action="store_true", help="mirror each server log to stderr with a node prefix")
     parser.add_argument("--run-dir", type=Path, default=None, help="existing directory to reuse instead of a fresh /tmp run")
     return parser.parse_args()
 
@@ -77,7 +80,22 @@ class LocalTestNet:
         self.command_log = self.run_dir / "commands.log"
         self.randomizer = random.Random()
         self.nodes: list[NodeHandle] = []
-        self.seed_peer = args.seed_peer or self.default_seed_peer()
+        normalized_seed_peer = self.normalize_seed_peer(args.seed_peer)
+        if args.seed_peer is not None:
+            self.seed_peer = normalized_seed_peer
+        else:
+            self.seed_peer = self.default_seed_peer()
+
+    def normalize_seed_peer(self, value: str | None) -> str | None:
+        """Treats empty or sentinel CLI values as an absent seed peer."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.lower() in {"none", "null"}:
+            return None
+        return normalized
 
     def log(self, message: str) -> None:
         """Writes one timestamped line to stdout and the shared command log."""
@@ -97,6 +115,17 @@ class LocalTestNet:
             handle.write(text)
             if not text.endswith("\n"):
                 handle.write("\n")
+
+    def tee_server_output(self, node: NodeHandle) -> None:
+        """Mirrors one server process's combined output to stderr with a node prefix."""
+        assert node.process is not None
+        assert node.process.stdout is not None
+        assert node.log_handle is not None
+        for line in node.process.stdout:
+            node.log_handle.write(line)
+            node.log_handle.flush()
+            rendered = line.rstrip("\n")
+            print(f"[{node.name}] {rendered}", file=sys.stderr, flush=True)
 
     def run_command(
         self,
@@ -237,19 +266,39 @@ class LocalTestNet:
 
     def start_node(self, node: NodeHandle, mining: bool) -> None:
         """Starts one local wobble server and captures its combined stdout/stderr."""
-        node.log_handle = node.log_path.open("w", encoding="utf-8")
         command = [str(BIN), "serve", "--home", str(node.home)]
         if mining:
             command.append("--mining")
         self.log(f"starting {node.name} server")
-        node.process = subprocess.Popen(
-            command,
-            cwd=ROOT_DIR,
-            stdout=node.log_handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env={**os.environ, "RUST_LOG": RUST_LOG},
-        )
+        if self.args.tee_logs:
+            node.log_handle = node.log_path.open("w", encoding="utf-8")
+            node.process = subprocess.Popen(
+                command,
+                cwd=ROOT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env={**os.environ, "RUST_LOG": RUST_LOG},
+            )
+            tee = threading.Thread(
+                target=self.tee_server_output,
+                args=(node,),
+                name=f"{node.name}-log-tee",
+                daemon=True,
+            )
+            tee.start()
+            node.tee_thread = tee
+        else:
+            node.log_handle = node.log_path.open("w", encoding="utf-8")
+            node.process = subprocess.Popen(
+                command,
+                cwd=ROOT_DIR,
+                stdout=node.log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, "RUST_LOG": RUST_LOG},
+            )
 
     def start_servers(self) -> None:
         """Starts all managed node servers and waits for them to report live."""
@@ -340,6 +389,7 @@ class LocalTestNet:
             str(self.nodes[0].home),
             "--blocks",
             str(self.args.bootstrap_blocks),
+            timeout=30.0,
         )
         self.wait_for_cluster_sync(self.nodes[0])
 
