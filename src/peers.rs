@@ -9,7 +9,10 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::server::PeerEndpoint;
+use crate::{
+    server::PeerEndpoint,
+    types::{BlockHash, BlockHeight},
+};
 
 /// Describes how a peer first entered the local peer store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +50,9 @@ pub struct StoredPeer {
     pub addr: String,
     pub node_name: Option<String>,
     pub source: PeerSource,
+    pub advertised_tip_hash: Option<BlockHash>,
+    pub advertised_height: Option<BlockHeight>,
+    pub last_hello_at: Option<String>,
     pub last_seen_at: Option<String>,
     pub last_connect_at: Option<String>,
     pub last_success_at: Option<String>,
@@ -64,6 +70,9 @@ impl StoredPeer {
             addr: endpoint.addr,
             node_name: endpoint.node_name,
             source,
+            advertised_tip_hash: None,
+            advertised_height: None,
+            last_hello_at: None,
             last_seen_at: None,
             last_connect_at: None,
             last_success_at: None,
@@ -192,6 +201,9 @@ mod tests {
         assert_eq!(stored.behavior_score, 100);
         assert_eq!(stored.connections, 0);
         assert_eq!(stored.failed_connections, 0);
+        assert_eq!(stored.advertised_tip_hash, None);
+        assert_eq!(stored.advertised_height, None);
+        assert_eq!(stored.last_hello_at, None);
         assert_eq!(stored.endpoint().addr, "127.0.0.1:9001");
     }
 }

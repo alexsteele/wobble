@@ -68,12 +68,12 @@ struct RelayOrigin {
 }
 
 /// Owns local protocol configuration and mutable node state for networking.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Server {
     config: PeerConfig,
     state: NodeState,
     peers: Vec<PeerEndpoint>,
-    sqlite_path: Option<PathBuf>,
+    sqlite_store: Option<sqlite_store::SqliteStore>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
 }
@@ -168,7 +168,7 @@ impl Server {
             config,
             state,
             peers: Vec::new(),
-            sqlite_path: None,
+            sqlite_store: None,
             bootstrap_sync: false,
             mining: None,
         }
@@ -184,7 +184,10 @@ impl Server {
     ///
     /// This stores the live server state in SQLite for restart and sync.
     pub fn with_sqlite_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.sqlite_path = Some(path.into());
+        let path = path.into();
+        let store = sqlite_store::SqliteStore::open(&path)
+            .expect("server sqlite store should open before serving");
+        self.sqlite_store = Some(store);
         self
     }
 
@@ -773,16 +776,14 @@ impl Server {
         request_block_hash: Option<BlockHash>,
         replies: &[WireMessage],
     ) -> Result<(), SqliteStoreError> {
-        let Some(path) = self.sqlite_path.as_deref() else {
+        let Some(store) = self.sqlite_store.as_ref() else {
             return Ok(());
         };
         let Some(block_hash) = request_block_hash.or_else(|| mined_block_hash(replies)) else {
-            let store = sqlite_store::SqliteStore::open(path)?;
             store.save_active_utxos(self.state.active_utxos())?;
             store.save_mempool(self.state.mempool())?;
             return Ok(());
         };
-        let store = sqlite_store::SqliteStore::open(path)?;
         store.save_active_utxos(self.state.active_utxos())?;
         store.save_mempool(self.state.mempool())?;
         let Some(block) = self.state.get_block(&block_hash) else {
@@ -796,10 +797,9 @@ impl Server {
 
     /// Persists the full current node state when a bulk sync changed local history.
     fn persist_full_state(&self) -> Result<(), SqliteStoreError> {
-        let Some(path) = self.sqlite_path.as_deref() else {
+        let Some(store) = self.sqlite_store.as_ref() else {
             return Ok(());
         };
-        let store = sqlite_store::SqliteStore::open(path)?;
         store.save_node_state(&self.state)
     }
 

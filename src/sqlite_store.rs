@@ -312,13 +312,17 @@ impl SqliteStore {
         for peer in peers {
             tx.execute(
                 "INSERT INTO peers (
-                     addr, node_name, source, last_seen_at, last_connect_at, last_success_at,
+                     addr, node_name, source, advertised_tip_hash, advertised_height,
+                     last_hello_at, last_seen_at, last_connect_at, last_success_at,
                      last_error, connections, failed_connections, behavior_score, banned_until
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     peer.addr,
                     peer.node_name,
                     peer.source.as_str(),
+                    peer.advertised_tip_hash.map(|hash| hash.to_string()),
+                    peer.advertised_height.map(|height| height as i64),
+                    peer.last_hello_at,
                     peer.last_seen_at,
                     peer.last_connect_at,
                     peer.last_success_at,
@@ -338,7 +342,8 @@ impl SqliteStore {
     pub fn load_peers(&self) -> Result<Vec<StoredPeer>, SqliteStoreError> {
         let mut statement = self.connection.prepare(
             "SELECT
-                 addr, node_name, source, last_seen_at, last_connect_at, last_success_at,
+                 addr, node_name, source, advertised_tip_hash, advertised_height,
+                 last_hello_at, last_seen_at, last_connect_at, last_success_at,
                  last_error, connections, failed_connections, behavior_score, banned_until
              FROM peers
              ORDER BY addr ASC",
@@ -359,14 +364,30 @@ impl SqliteStore {
                 addr: row.get(0)?,
                 node_name: row.get(1)?,
                 source,
-                last_seen_at: row.get(3)?,
-                last_connect_at: row.get(4)?,
-                last_success_at: row.get(5)?,
-                last_error: row.get(6)?,
-                connections: row.get::<_, i64>(7)? as u32,
-                failed_connections: row.get::<_, i64>(8)? as u32,
-                behavior_score: row.get(9)?,
-                banned_until: row.get(10)?,
+                advertised_tip_hash: row
+                    .get::<_, Option<String>>(3)?
+                    .map(|value| parse_block_hash(&value))
+                    .transpose()
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("{err:?}"),
+                            )),
+                        )
+                    })?,
+                advertised_height: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                last_hello_at: row.get(5)?,
+                last_seen_at: row.get(6)?,
+                last_connect_at: row.get(7)?,
+                last_success_at: row.get(8)?,
+                last_error: row.get(9)?,
+                connections: row.get::<_, i64>(10)? as u32,
+                failed_connections: row.get::<_, i64>(11)? as u32,
+                behavior_score: row.get(12)?,
+                banned_until: row.get(13)?,
             })
         })?;
 
@@ -829,6 +850,9 @@ impl SqliteStore {
                  addr TEXT PRIMARY KEY,
                  node_name TEXT NULL,
                  source TEXT NOT NULL,
+                 advertised_tip_hash TEXT NULL,
+                 advertised_height INTEGER NULL,
+                 last_hello_at TEXT NULL,
                  last_seen_at TEXT NULL,
                  last_connect_at TEXT NULL,
                  last_success_at TEXT NULL,
@@ -1352,6 +1376,9 @@ mod tests {
                 addr: "127.0.0.1:9001".to_string(),
                 node_name: Some("alpha".to_string()),
                 source: PeerSource::Seed,
+                advertised_tip_hash: Some(BlockHash::new([0x11; 32])),
+                advertised_height: Some(7),
+                last_hello_at: Some("2026-04-11T11:59:00Z".to_string()),
                 last_seen_at: Some("2026-04-11T12:00:00Z".to_string()),
                 last_connect_at: Some("2026-04-11T12:01:00Z".to_string()),
                 last_success_at: Some("2026-04-11T12:02:00Z".to_string()),
@@ -1365,6 +1392,9 @@ mod tests {
                 addr: "127.0.0.1:9002".to_string(),
                 node_name: None,
                 source: PeerSource::Hello,
+                advertised_tip_hash: None,
+                advertised_height: None,
+                last_hello_at: None,
                 last_seen_at: None,
                 last_connect_at: None,
                 last_success_at: None,
@@ -1797,6 +1827,35 @@ mod tests {
 
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].txid, duplicate_txid);
+    }
+
+    #[test]
+    fn saves_and_loads_peer_tip_metadata() {
+        let path = temp_db_path();
+        let store = SqliteStore::open(&path).unwrap();
+        let peers = vec![StoredPeer {
+            addr: "127.0.0.1:9001".to_string(),
+            node_name: Some("seed".to_string()),
+            source: PeerSource::Seed,
+            advertised_tip_hash: Some(BlockHash::new([0x44; 32])),
+            advertised_height: Some(17),
+            last_hello_at: Some("2026-04-12T06:00:00Z".to_string()),
+            last_seen_at: Some("2026-04-12T06:00:01Z".to_string()),
+            last_connect_at: Some("2026-04-12T06:00:02Z".to_string()),
+            last_success_at: Some("2026-04-12T06:00:03Z".to_string()),
+            last_error: None,
+            connections: 4,
+            failed_connections: 1,
+            behavior_score: 97,
+            banned_until: None,
+        }];
+
+        store.save_peers(&peers).unwrap();
+        let loaded = store.load_peers().unwrap();
+        drop(store);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded, peers);
     }
 
     #[test]
