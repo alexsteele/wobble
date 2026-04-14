@@ -279,6 +279,10 @@ The next runtime design should separate:
 - tracks known peers and active peer-task channels
 - maintains outbound connections and reconnect policy
 
+Current scaffold note:
+- `RuntimeCoordinator` now owns live peer registration and can spawn/register
+  peer tasks and peer transports directly for inbound connections
+
 `MinerThread`
 - runs proof-of-work on a dedicated blocking thread
 - receives mining jobs over a channel

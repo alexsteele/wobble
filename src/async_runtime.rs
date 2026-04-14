@@ -101,6 +101,32 @@ pub struct SpawnedPeerTask {
 }
 
 impl SpawnedPeerTask {
+    /// Spawns one transport-agnostic peer task wired to the given state handle.
+    pub fn spawn(
+        peer_id: PeerId,
+        handle: ServerHandle,
+        channel_capacity: usize,
+    ) -> SpawnedPeerTask {
+        let (inbound_tx, inbound_rx) = mpsc::channel(channel_capacity);
+        let (command_tx, command_rx) = mpsc::channel(channel_capacity);
+        let (outbound_tx, outbound_rx) = mpsc::channel(channel_capacity);
+        let task_peer_id = peer_id.clone();
+        let worker = tokio::spawn(run_peer_task(
+            task_peer_id,
+            handle,
+            inbound_rx,
+            command_rx,
+            outbound_tx,
+        ));
+        SpawnedPeerTask {
+            peer_id,
+            inbound_tx,
+            command_tx,
+            outbound_rx,
+            worker,
+        }
+    }
+
     /// Returns the stable peer identifier owned by this task.
     pub fn peer_id(&self) -> &str {
         &self.peer_id
@@ -437,6 +463,45 @@ impl RuntimeCoordinator {
         self.peer_commands.insert(peer_id, commands);
     }
 
+    /// Spawns and registers one transport-agnostic peer task.
+    ///
+    /// This is the coordinator-owned construction path that future async
+    /// accept loops should use so live peer bookkeeping stays in one place.
+    pub fn spawn_peer_task(
+        &mut self,
+        peer_id: PeerId,
+        channel_capacity: usize,
+    ) -> SpawnedPeerTask {
+        let peer = SpawnedPeerTask::spawn(peer_id.clone(), self.handle(), channel_capacity);
+        self.register_peer(peer_id, peer.command_tx());
+        peer
+    }
+
+    /// Spawns, registers, and serves one line-oriented transport for a peer.
+    pub fn spawn_peer_transport<T>(
+        &mut self,
+        peer_id: PeerId,
+        channel_capacity: usize,
+        stream: T,
+    ) -> SpawnedPeerTransport
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let peer = self.spawn_peer_task(peer_id, channel_capacity);
+        ServerRuntime::spawn_peer_transport(peer, stream)
+    }
+
+    /// Spawns, registers, and serves one real Tokio TCP peer connection.
+    pub fn spawn_tcp_peer_transport(
+        &mut self,
+        peer_id: PeerId,
+        channel_capacity: usize,
+        stream: tokio::net::TcpStream,
+    ) -> SpawnedPeerTransport {
+        let peer = self.spawn_peer_task(peer_id, channel_capacity);
+        ServerRuntime::spawn_tcp_peer_transport(peer, stream)
+    }
+
     /// Removes one peer from the live routing table.
     pub fn unregister_peer(&mut self, peer_id: &str) {
         self.peer_commands.remove(peer_id);
@@ -582,33 +647,6 @@ impl ServerRuntime {
         SpawnedStateTask {
             handle,
             effects_rx,
-            worker,
-        }
-    }
-
-    /// Spawns one transport-agnostic peer task wired to this runtime handle.
-    pub fn spawn_peer_task(
-        &self,
-        peer_id: PeerId,
-        channel_capacity: usize,
-    ) -> SpawnedPeerTask {
-        let (inbound_tx, inbound_rx) = mpsc::channel(channel_capacity);
-        let (command_tx, command_rx) = mpsc::channel(channel_capacity);
-        let (outbound_tx, outbound_rx) = mpsc::channel(channel_capacity);
-        let handle = self.handle();
-        let task_peer_id = peer_id.clone();
-        let worker = tokio::spawn(run_peer_task(
-            task_peer_id,
-            handle,
-            inbound_rx,
-            command_rx,
-            outbound_tx,
-        ));
-        SpawnedPeerTask {
-            peer_id,
-            inbound_tx,
-            command_tx,
-            outbound_rx,
             worker,
         }
     }
@@ -1217,9 +1255,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn peer_task_forwards_inbound_messages_through_state_task() {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let peer = runtime.spawn_peer_task("peer-1".to_string(), 4);
         let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
         let state = runtime.spawn_state_task(task);
+        let mut coordinator = RuntimeCoordinator::new(state);
+        let peer = coordinator.spawn_peer_task("peer-1".to_string(), 4);
 
         peer.send_inbound(WireMessage::GetTip).await.unwrap();
         let mut peer = peer;
@@ -1232,38 +1271,39 @@ mod tests {
         );
 
         peer.disconnect().await.unwrap();
-        state.stop();
+        coordinator.stop();
         peer.join().await;
-        let _task = state.join().await;
+        let _task = coordinator.join().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn peer_task_emits_coordinator_commands_as_outbound_messages() {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let mut peer = runtime.spawn_peer_task("peer-2".to_string(), 4);
-        let command_tx = peer.command_tx();
         let task = StateTask::new(PeerConfig::new("wobble-local", None), NodeState::new());
         let state = runtime.spawn_state_task(task);
+        let mut coordinator = RuntimeCoordinator::new(state);
+        let mut peer = coordinator.spawn_peer_task("peer-2".to_string(), 4);
+        let command_tx = peer.command_tx();
 
         command_tx.send(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip)).await.unwrap();
         assert_eq!(peer.recv_outbound().await, Some(WireMessage::GetTip));
 
         command_tx.send(crate::async_runtime::PeerCommand::Disconnect).await.unwrap();
         peer.join().await;
-        state.stop();
-        let _task = state.join().await;
+        coordinator.stop();
+        let _task = coordinator.join().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn peer_transport_reads_wire_messages_and_writes_replies() {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let peer = runtime.spawn_peer_task("peer-transport-1".to_string(), 4);
         let (mut client, server_stream) = duplex(1024);
-        let transport = ServerRuntime::spawn_peer_transport(peer, server_stream);
         let state = runtime.spawn_state_task(StateTask::new(
             PeerConfig::new("wobble-local", None),
             NodeState::new(),
         ));
+        let mut coordinator = RuntimeCoordinator::new(state);
+        let transport = coordinator.spawn_peer_transport("peer-transport-1".to_string(), 4, server_stream);
 
         client
             .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
@@ -1285,21 +1325,22 @@ mod tests {
 
         transport.disconnect().await.unwrap();
         transport.join().await;
-        state.stop();
-        let _task = state.join().await;
+        coordinator.stop();
+        let _task = coordinator.join().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn peer_transport_writes_coordinator_sent_messages() {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let peer = runtime.spawn_peer_task("peer-transport-2".to_string(), 4);
-        let command_tx = peer.command_tx();
         let (client, server_stream) = duplex(1024);
-        let transport = ServerRuntime::spawn_peer_transport(peer, server_stream);
         let state = runtime.spawn_state_task(StateTask::new(
             PeerConfig::new("wobble-local", None),
             NodeState::new(),
         ));
+        let mut coordinator = RuntimeCoordinator::new(state);
+        let transport =
+            coordinator.spawn_peer_transport("peer-transport-2".to_string(), 4, server_stream);
+        let command_tx = transport.command_tx();
 
         command_tx
             .send(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip))
@@ -1314,8 +1355,8 @@ mod tests {
 
         transport.disconnect().await.unwrap();
         transport.join().await;
-        state.stop();
-        let _task = state.join().await;
+        coordinator.stop();
+        let _task = coordinator.join().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1323,7 +1364,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept_runtime = ServerRuntime::new(RuntimeConfig::default());
-        let peer = accept_runtime.spawn_peer_task("peer-tcp-1".to_string(), 4);
         let accept_state = accept_runtime.spawn_state_task(StateTask::new(
             PeerConfig::new("wobble-local", None),
             NodeState::new(),
@@ -1331,8 +1371,10 @@ mod tests {
 
         let accept_task = tokio::spawn(async move {
             let (server_stream, _) = listener.accept().await.unwrap();
-            let transport = ServerRuntime::spawn_tcp_peer_transport(peer, server_stream);
-            (transport, accept_state)
+            let mut coordinator = RuntimeCoordinator::new(accept_state);
+            let transport =
+                coordinator.spawn_tcp_peer_transport("peer-tcp-1".to_string(), 4, server_stream);
+            (transport, coordinator)
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1354,11 +1396,11 @@ mod tests {
             })
         );
 
-        let (transport, state) = accept_task.await.unwrap();
+        let (transport, coordinator) = accept_task.await.unwrap();
         transport.disconnect().await.unwrap();
         transport.join().await;
-        state.stop();
-        let _task = state.join().await;
+        coordinator.stop();
+        let _task = coordinator.join().await;
     }
 
     #[test]
