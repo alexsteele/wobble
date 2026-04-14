@@ -254,7 +254,8 @@ The next runtime design should separate:
 `AsyncPeerServer`
 - is the current server-layer bridge into the async runtime
 - consumes a synchronous `Server` and moves its config/state into `StateTask`
-- currently exposes only a narrow inbound-peer accept path
+- now supports a real async inbound-peer listener loop with clean stop/join
+- still excludes admin, mining, relay, and SQLite integration for now
 
 `ServerHandle`
 - small cloneable control surface for callers and tests

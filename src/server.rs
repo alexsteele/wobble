@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
-    async_runtime::{RuntimeConfig, RuntimeCoordinator, ServerRuntime, StateTask},
+    async_runtime::{RuntimeConfig, RuntimeCoordinator, ServerHandle, ServerRuntime, StateTask},
     chain::ChainError,
     client::{ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
@@ -208,9 +208,50 @@ pub struct Server {
 /// integration, so it is currently only the first live async peer entry point.
 pub struct AsyncPeerServer {
     coordinator: RuntimeCoordinator,
+    next_inbound_peer_id: u64,
 }
 
 impl AsyncPeerServer {
+    /// Accepts and serves inbound Tokio TCP peers until shutdown is requested.
+    ///
+    /// This is the first async peer listener for the server layer. It owns the
+    /// accept loop, assigns simple peer ids, and disconnects all live peer
+    /// transports before returning so the state task can shut down cleanly.
+    pub async fn serve_listener(
+        &mut self,
+        listener: &tokio::net::TcpListener,
+        channel_capacity: usize,
+    ) -> io::Result<()> {
+        let mut transports = Vec::new();
+
+        loop {
+            if self.coordinator.handle().is_stopped() {
+                break;
+            }
+
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, _) = accept_result?;
+                    let peer_id = self.allocate_inbound_peer_id();
+                    let transport =
+                        self.coordinator
+                            .spawn_tcp_peer_transport(peer_id, channel_capacity, stream);
+                    transports.push(transport);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+
+        for transport in &transports {
+            let _ = transport.disconnect().await;
+        }
+        for transport in transports {
+            transport.join().await;
+        }
+
+        Ok(())
+    }
+
     /// Accepts and serves one inbound Tokio TCP peer over the async runtime.
     pub async fn accept_one_peer(
         &mut self,
@@ -228,9 +269,21 @@ impl AsyncPeerServer {
         self.coordinator.stop();
     }
 
+    /// Returns a cloneable stop handle for the underlying async state task.
+    pub fn handle(&self) -> ServerHandle {
+        self.coordinator.handle()
+    }
+
     /// Waits for the async state task to exit and returns the final node state.
     pub async fn join(self) -> NodeState {
         self.coordinator.join().await.state().clone()
+    }
+
+    /// Allocates a simple monotonic peer id for an inbound async connection.
+    fn allocate_inbound_peer_id(&mut self) -> String {
+        let peer_id = format!("inbound-{}", self.next_inbound_peer_id);
+        self.next_inbound_peer_id = self.next_inbound_peer_id.wrapping_add(1);
+        peer_id
     }
 }
 
@@ -349,7 +402,10 @@ impl Server {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
         let state_task = StateTask::new(self.config, self.state);
         let coordinator = RuntimeCoordinator::new(runtime.spawn_state_task(state_task));
-        AsyncPeerServer { coordinator }
+        AsyncPeerServer {
+            coordinator,
+            next_inbound_peer_id: 0,
+        }
     }
 
     /// Configures the peer addresses that should receive relayed transactions and blocks.
@@ -2017,6 +2073,47 @@ mod tests {
         transport.disconnect().await.unwrap();
         transport.join().await;
         async_server.stop();
+        let final_state = async_server.join().await;
+        assert_eq!(final_state.tip_summary().tip, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_peer_server_serves_listener_until_stopped() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let async_server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        )
+        .into_async_peer_server();
+        let stop_handle = async_server.handle();
+        let serve_task = tokio::spawn(async move {
+            let mut async_server = async_server;
+            async_server.serve_listener(&listener, 4).await.unwrap();
+            async_server
+        });
+
+        let mut client = TokioTcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = AsyncBufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(
+            WireMessage::from_json_line(&line).unwrap(),
+            WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })
+        );
+
+        stop_handle.stop();
+        let async_server = serve_task.await.unwrap();
         let final_state = async_server.join().await;
         assert_eq!(final_state.tip_summary().tip, None);
     }
