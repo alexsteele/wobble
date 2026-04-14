@@ -252,6 +252,52 @@ impl AsyncPeerServer {
         Ok(())
     }
 
+    /// Serves peer and admin listeners on the async runtime until stopped.
+    ///
+    /// Peer sockets are routed through the async peer transport path, while
+    /// localhost admin requests are forwarded directly through the state task's
+    /// admin request channel. This is the first usable async server mode for
+    /// operator-facing status and control.
+    pub async fn serve_with_admin_listener(
+        &mut self,
+        peer_listener: &tokio::net::TcpListener,
+        admin_listener: &tokio::net::TcpListener,
+        channel_capacity: usize,
+    ) -> io::Result<()> {
+        let mut transports = Vec::new();
+
+        loop {
+            if self.coordinator.handle().is_stopped() {
+                break;
+            }
+
+            tokio::select! {
+                accept_result = peer_listener.accept() => {
+                    let (stream, _) = accept_result?;
+                    let peer_id = self.allocate_inbound_peer_id();
+                    let transport =
+                        self.coordinator
+                            .spawn_tcp_peer_transport(peer_id, channel_capacity, stream);
+                    transports.push(transport);
+                }
+                accept_result = admin_listener.accept() => {
+                    let (stream, _) = accept_result?;
+                    self.handle_admin_stream(stream).await?;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+
+        for transport in &transports {
+            let _ = transport.disconnect().await;
+        }
+        for transport in transports {
+            transport.join().await;
+        }
+
+        Ok(())
+    }
+
     /// Accepts and serves one inbound Tokio TCP peer over the async runtime.
     pub async fn accept_one_peer(
         &mut self,
@@ -296,6 +342,48 @@ impl AsyncPeerServer {
         let peer_id = format!("inbound-{}", self.next_inbound_peer_id);
         self.next_inbound_peer_id = self.next_inbound_peer_id.wrapping_add(1);
         peer_id
+    }
+
+    /// Handles one async localhost admin stream until the client disconnects.
+    ///
+    /// Each request is decoded from one JSON line, forwarded through the
+    /// runtime's admin request channel, and written back as one JSON line
+    /// response. This keeps async admin behavior aligned with the synchronous
+    /// admin protocol while the surrounding server transitions to async.
+    async fn handle_admin_stream(&self, stream: tokio::net::TcpStream) -> io::Result<()> {
+        let handle = self.coordinator.handle();
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+
+        loop {
+            if handle.is_stopped() {
+                return Ok(());
+            }
+
+            line.clear();
+            let bytes_read = tokio::select! {
+                result = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line) => result?,
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    continue;
+                }
+            };
+            if bytes_read == 0 {
+                return Ok(());
+            }
+
+            let request: AdminRequest = serde_json::from_str(line.trim_end_matches('\n'))
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            let response = handle
+                .request_admin(request)
+                .await
+                .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, format!("{err:?}")))?;
+            let mut response_line = serde_json::to_string(&response)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            response_line.push('\n');
+            tokio::io::AsyncWriteExt::write_all(&mut writer, response_line.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+        }
     }
 }
 
@@ -1855,7 +1943,7 @@ mod tests {
     };
 
     use crate::{
-        admin::{AdminRequest, AdminResponse},
+        admin::{AdminRequest, AdminResponse, StatusSummary},
         chain::ChainError,
         crypto, net,
         node_state::{NodeState, NodeStateError},
@@ -2164,6 +2252,154 @@ mod tests {
         transport.disconnect().await.unwrap();
         transport.join().await;
         async_server.stop();
+        let final_state = async_server.join().await;
+        assert_eq!(final_state.tip_summary().tip, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_peer_server_handles_admin_status_request() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let async_server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        )
+        .into_async_peer_server();
+        let stop_handle = async_server.handle();
+        let admin_task = tokio::spawn(async move {
+            let async_server = async_server;
+            let (stream, _) = listener.accept().await.unwrap();
+            async_server.handle_admin_stream(stream).await.unwrap();
+            async_server
+        });
+
+        let mut client = TokioTcpStream::connect(addr).await.unwrap();
+        let mut request = serde_json::to_string(&AdminRequest::GetStatus).unwrap();
+        request.push('\n');
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = AsyncBufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: AdminResponse = serde_json::from_str(line.trim_end_matches('\n')).unwrap();
+
+        assert_eq!(
+            response,
+            AdminResponse::Status(StatusSummary {
+                tip: None,
+                height: None,
+                branch_count: 0,
+                mempool_size: 0,
+                peer_count: 0,
+                mining_enabled: false,
+            })
+        );
+
+        stop_handle.stop();
+        let async_server = admin_task.await.unwrap();
+        let final_state = async_server.join().await;
+        assert_eq!(final_state.tip_summary().tip, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_peer_server_handles_admin_bootstrap_request() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let owner = crypto::signing_key_from_bytes([41; 32]);
+        let async_server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        )
+        .into_async_peer_server();
+        let stop_handle = async_server.handle();
+        let admin_task = tokio::spawn(async move {
+            let async_server = async_server;
+            let (stream, _) = listener.accept().await.unwrap();
+            async_server.handle_admin_stream(stream).await.unwrap();
+            async_server
+        });
+
+        let mut client = TokioTcpStream::connect(addr).await.unwrap();
+        let mut request = serde_json::to_string(&AdminRequest::Bootstrap {
+            public_key: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
+            blocks: 2,
+        })
+        .unwrap();
+        request.push('\n');
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = AsyncBufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: AdminResponse = serde_json::from_str(line.trim_end_matches('\n')).unwrap();
+
+        let AdminResponse::Bootstrapped(summary) = response else {
+            panic!("expected bootstrapped response");
+        };
+        assert_eq!(summary.blocks_mined, 2);
+        assert!(summary.last_block_hash.is_some());
+
+        stop_handle.stop();
+        let async_server = admin_task.await.unwrap();
+        let final_state = async_server.join().await;
+        assert_eq!(final_state.balance_for_key(&owner.verifying_key()), 100);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_peer_server_serves_peer_and_admin_listeners_until_stopped() {
+        let peer_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        let admin_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_addr = admin_listener.local_addr().unwrap();
+        let async_server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        )
+        .into_async_peer_server();
+        let stop_handle = async_server.handle();
+        let serve_task = tokio::spawn(async move {
+            let mut async_server = async_server;
+            async_server
+                .serve_with_admin_listener(&peer_listener, &admin_listener, 4)
+                .await
+                .unwrap();
+            async_server
+        });
+
+        let mut peer_client = TokioTcpStream::connect(peer_addr).await.unwrap();
+        peer_client
+            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        peer_client.flush().await.unwrap();
+
+        let mut peer_reader = AsyncBufReader::new(peer_client);
+        let mut peer_line = String::new();
+        peer_reader.read_line(&mut peer_line).await.unwrap();
+        assert_eq!(
+            WireMessage::from_json_line(&peer_line).unwrap(),
+            WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })
+        );
+
+        let mut admin_client = TokioTcpStream::connect(admin_addr).await.unwrap();
+        let mut request = serde_json::to_string(&AdminRequest::GetStatus).unwrap();
+        request.push('\n');
+        admin_client.write_all(request.as_bytes()).await.unwrap();
+        admin_client.flush().await.unwrap();
+
+        let mut admin_reader = AsyncBufReader::new(admin_client);
+        let mut admin_line = String::new();
+        admin_reader.read_line(&mut admin_line).await.unwrap();
+        let response: AdminResponse = serde_json::from_str(admin_line.trim_end_matches('\n')).unwrap();
+        assert!(matches!(response, AdminResponse::Status(_)));
+
+        stop_handle.stop();
+        let async_server = serve_task.await.unwrap();
         let final_state = async_server.join().await;
         assert_eq!(final_state.tip_summary().tip, None);
     }
