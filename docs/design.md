@@ -273,6 +273,7 @@ The next runtime design should separate:
 - parses inbound `WireMessage` values from the stream
 - writes outbound `WireMessage` values back to the stream
 - is generic over the async stream so tests can use in-memory transports first
+- now also has a thin Tokio `TcpStream` wrapper for the first real socket path
 
 `PeerManager`
 - tracks known peers and active peer-task channels

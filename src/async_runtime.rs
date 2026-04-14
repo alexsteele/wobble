@@ -617,11 +617,7 @@ impl ServerRuntime {
     ///
     /// This consumes the peer task because the transport owns its inbound and
     /// outbound channels for the lifetime of the connection.
-    pub fn spawn_peer_transport<T>(
-        &self,
-        peer: SpawnedPeerTask,
-        stream: T,
-    ) -> SpawnedPeerTransport
+    pub fn spawn_peer_transport<T>(peer: SpawnedPeerTask, stream: T) -> SpawnedPeerTransport
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -633,6 +629,19 @@ impl ServerRuntime {
             command_tx,
             worker,
         }
+    }
+
+    /// Spawns one real Tokio TCP transport adapter on top of a peer task.
+    ///
+    /// This is the first live-socket entry point for the async runtime. It is
+    /// intentionally a thin wrapper around the generic line-oriented transport
+    /// so tests can exercise real `TcpStream` behavior without changing the
+    /// transport loop itself.
+    pub fn spawn_tcp_peer_transport(
+        peer: SpawnedPeerTask,
+        stream: tokio::net::TcpStream,
+    ) -> SpawnedPeerTransport {
+        Self::spawn_peer_transport(peer, stream)
     }
 }
 
@@ -906,6 +915,7 @@ where
 mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex},
+        net::{TcpListener, TcpStream},
         sync::{mpsc, oneshot},
     };
 
@@ -1249,7 +1259,7 @@ mod tests {
         let runtime = ServerRuntime::new(RuntimeConfig::default());
         let peer = runtime.spawn_peer_task("peer-transport-1".to_string(), 4);
         let (mut client, server_stream) = duplex(1024);
-        let transport = runtime.spawn_peer_transport(peer, server_stream);
+        let transport = ServerRuntime::spawn_peer_transport(peer, server_stream);
         let state = runtime.spawn_state_task(StateTask::new(
             PeerConfig::new("wobble-local", None),
             NodeState::new(),
@@ -1285,7 +1295,7 @@ mod tests {
         let peer = runtime.spawn_peer_task("peer-transport-2".to_string(), 4);
         let command_tx = peer.command_tx();
         let (client, server_stream) = duplex(1024);
-        let transport = runtime.spawn_peer_transport(peer, server_stream);
+        let transport = ServerRuntime::spawn_peer_transport(peer, server_stream);
         let state = runtime.spawn_state_task(StateTask::new(
             PeerConfig::new("wobble-local", None),
             NodeState::new(),
@@ -1302,6 +1312,49 @@ mod tests {
 
         assert_eq!(WireMessage::from_json_line(&line).unwrap(), WireMessage::GetTip);
 
+        transport.disconnect().await.unwrap();
+        transport.join().await;
+        state.stop();
+        let _task = state.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tcp_peer_transport_reads_wire_messages_and_writes_replies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_runtime = ServerRuntime::new(RuntimeConfig::default());
+        let peer = accept_runtime.spawn_peer_task("peer-tcp-1".to_string(), 4);
+        let accept_state = accept_runtime.spawn_state_task(StateTask::new(
+            PeerConfig::new("wobble-local", None),
+            NodeState::new(),
+        ));
+
+        let accept_task = tokio::spawn(async move {
+            let (server_stream, _) = listener.accept().await.unwrap();
+            let transport = ServerRuntime::spawn_tcp_peer_transport(peer, server_stream);
+            (transport, accept_state)
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(
+            WireMessage::from_json_line(&line).unwrap(),
+            WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })
+        );
+
+        let (transport, state) = accept_task.await.unwrap();
         transport.disconnect().await.unwrap();
         transport.join().await;
         state.stop();
