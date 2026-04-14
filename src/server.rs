@@ -264,6 +264,18 @@ impl AsyncPeerServer {
             .await
     }
 
+    /// Connects and serves one outbound Tokio TCP peer over the async runtime.
+    pub async fn connect_one_peer(
+        &mut self,
+        addr: impl tokio::net::ToSocketAddrs,
+        peer_id: impl Into<String>,
+        channel_capacity: usize,
+    ) -> io::Result<crate::async_runtime::SpawnedPeerTransport> {
+        self.coordinator
+            .connect_one_tcp_peer(addr, peer_id.into(), channel_capacity)
+            .await
+    }
+
     /// Requests a clean shutdown of the underlying async state task.
     pub fn stop(&self) {
         self.coordinator.stop();
@@ -2114,6 +2126,44 @@ mod tests {
 
         stop_handle.stop();
         let async_server = serve_task.await.unwrap();
+        let final_state = async_server.join().await;
+        assert_eq!(final_state.tip_summary().tip, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_peer_server_connects_one_outbound_peer() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            let mut reader = AsyncBufReader::new(&mut stream);
+            reader.read_line(&mut line).await.unwrap();
+            WireMessage::from_json_line(&line).unwrap()
+        });
+
+        let mut async_server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        )
+        .into_async_peer_server();
+
+        let transport = async_server
+            .connect_one_peer(addr, "outbound-1", 4)
+            .await
+            .unwrap();
+        transport
+            .command_tx()
+            .send(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip))
+            .await
+            .unwrap();
+
+        let message = remote_task.await.unwrap();
+        assert_eq!(message, WireMessage::GetTip);
+
+        transport.disconnect().await.unwrap();
+        transport.join().await;
+        async_server.stop();
         let final_state = async_server.join().await;
         assert_eq!(final_state.tip_summary().tip, None);
     }

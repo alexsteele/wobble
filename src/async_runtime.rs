@@ -518,6 +518,22 @@ impl RuntimeCoordinator {
         Ok(self.spawn_tcp_peer_transport(peer_id, channel_capacity, stream))
     }
 
+    /// Connects one outbound Tokio TCP peer and immediately serves it.
+    ///
+    /// This gives the async runtime the same ownership model for outbound
+    /// peers that it already has for accepted inbound peers: the coordinator
+    /// dials the socket, registers the peer, and hands the stream to the
+    /// runtime-owned transport.
+    pub async fn connect_one_tcp_peer(
+        &mut self,
+        addr: impl tokio::net::ToSocketAddrs,
+        peer_id: PeerId,
+        channel_capacity: usize,
+    ) -> std::io::Result<SpawnedPeerTransport> {
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        Ok(self.spawn_tcp_peer_transport(peer_id, channel_capacity, stream))
+    }
+
     /// Removes one peer from the live routing table.
     pub fn unregister_peer(&mut self, peer_id: &str) {
         self.peer_commands.remove(peer_id);
@@ -976,8 +992,8 @@ mod tests {
     use crate::{
         admin::{AdminRequest, AdminResponse},
         async_runtime::{
-            RoutedEffect, RuntimeConfig, RuntimeCoordinator, ServerRuntime, StateCommand,
-            StateEffect, StateResponse, StateTask,
+            PeerCommand, RoutedEffect, RuntimeConfig, RuntimeCoordinator, ServerRuntime,
+            StateCommand, StateEffect, StateResponse, StateTask,
         },
         crypto,
         node_state::NodeState,
@@ -1458,6 +1474,45 @@ mod tests {
         );
 
         let (transport, coordinator) = accept_task.await.unwrap();
+        transport.disconnect().await.unwrap();
+        transport.join().await;
+        coordinator.stop();
+        let _task = coordinator.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_connects_one_outbound_tcp_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let state = runtime.spawn_state_task(StateTask::new(
+            PeerConfig::new("wobble-local", None),
+            NodeState::new(),
+        ));
+
+        let accept_task = tokio::spawn(async move {
+            let (mut server_stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(&mut server_stream);
+            reader.read_line(&mut line).await.unwrap();
+            WireMessage::from_json_line(&line).unwrap()
+        });
+
+        let mut coordinator = RuntimeCoordinator::new(state);
+        let transport = coordinator
+            .connect_one_tcp_peer(addr, "outbound-peer-1".to_string(), 4)
+            .await
+            .unwrap();
+
+        transport
+            .command_tx()
+            .send(PeerCommand::Send(WireMessage::GetTip))
+            .await
+            .unwrap();
+
+        let message = accept_task.await.unwrap();
+        assert_eq!(message, WireMessage::GetTip);
+
         transport.disconnect().await.unwrap();
         transport.join().await;
         coordinator.stop();

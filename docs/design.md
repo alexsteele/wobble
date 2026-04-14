@@ -255,6 +255,7 @@ The next runtime design should separate:
 - is the current server-layer bridge into the async runtime
 - consumes a synchronous `Server` and moves its config/state into `StateTask`
 - now supports a real async inbound-peer listener loop with clean stop/join
+- now also supports dialing and managing outbound peers on the same async path
 - still excludes admin, mining, relay, and SQLite integration for now
 
 `ServerHandle`
