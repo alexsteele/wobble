@@ -251,6 +251,11 @@ The next runtime design should separate:
 - starts listeners, peer tasks, admin handling, timers, and shutdown
 - routes commands and effects between tasks
 
+`AsyncPeerServer`
+- is the current server-layer bridge into the async runtime
+- consumes a synchronous `Server` and moves its config/state into `StateTask`
+- currently exposes only a narrow inbound-peer accept path
+
 `ServerHandle`
 - small cloneable control surface for callers and tests
 - supports lifecycle actions such as `stop()`

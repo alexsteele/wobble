@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
+    async_runtime::{RuntimeConfig, RuntimeCoordinator, ServerRuntime, StateTask},
     chain::ChainError,
     client::{ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
@@ -199,6 +200,40 @@ pub struct Server {
     control: ServerControl,
 }
 
+/// Minimal async peer-serving adapter built from a `Server`.
+///
+/// This consumes the synchronous `Server`, moves its config and `NodeState`
+/// into the async runtime scaffold, and exposes a narrow inbound-peer accept
+/// path. Gap: this adapter does not yet port admin, mining, relay, or SQLite
+/// integration, so it is currently only the first live async peer entry point.
+pub struct AsyncPeerServer {
+    coordinator: RuntimeCoordinator,
+}
+
+impl AsyncPeerServer {
+    /// Accepts and serves one inbound Tokio TCP peer over the async runtime.
+    pub async fn accept_one_peer(
+        &mut self,
+        listener: &tokio::net::TcpListener,
+        peer_id: impl Into<String>,
+        channel_capacity: usize,
+    ) -> io::Result<crate::async_runtime::SpawnedPeerTransport> {
+        self.coordinator
+            .accept_one_tcp_peer(listener, peer_id.into(), channel_capacity)
+            .await
+    }
+
+    /// Requests a clean shutdown of the underlying async state task.
+    pub fn stop(&self) {
+        self.coordinator.stop();
+    }
+
+    /// Waits for the async state task to exit and returns the final node state.
+    pub async fn join(self) -> NodeState {
+        self.coordinator.join().await.state().clone()
+    }
+}
+
 /// Errors produced by the live server while handling protocol messages.
 #[derive(Debug)]
 pub enum ServerError {
@@ -303,6 +338,18 @@ impl Server {
     /// Returns a cloneable control handle for this running server.
     pub fn control(&self) -> ServerControl {
         self.control.clone()
+    }
+
+    /// Converts this synchronous server into the minimal async peer adapter.
+    ///
+    /// This is the first server-layer bridge into the async runtime. It moves
+    /// the current config and node state into a `StateTask`, then hands peer
+    /// acceptance to a `RuntimeCoordinator`.
+    pub fn into_async_peer_server(self) -> AsyncPeerServer {
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let state_task = StateTask::new(self.config, self.state);
+        let coordinator = RuntimeCoordinator::new(runtime.spawn_state_task(state_task));
+        AsyncPeerServer { coordinator }
     }
 
     /// Configures the peer addresses that should receive relayed transactions and blocks.
@@ -1734,6 +1781,10 @@ mod tests {
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
+        net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream},
+    };
 
     use crate::{
         admin::{AdminRequest, AdminResponse},
@@ -1924,6 +1975,50 @@ mod tests {
 
         drop(reader);
         assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_peer_server_accepts_one_inbound_peer() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string())),
+            NodeState::new(),
+        );
+        let accept_task = tokio::spawn(async move {
+            let mut async_server = server.into_async_peer_server();
+            let transport = async_server
+                .accept_one_peer(&listener, "peer-1", 4)
+                .await
+                .unwrap();
+            (transport, async_server)
+        });
+
+        let mut client = TokioTcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = AsyncBufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(
+            WireMessage::from_json_line(&line).unwrap(),
+            WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })
+        );
+
+        let (transport, async_server) = accept_task.await.unwrap();
+        transport.disconnect().await.unwrap();
+        transport.join().await;
+        async_server.stop();
+        let final_state = async_server.join().await;
+        assert_eq!(final_state.tip_summary().tip, None);
     }
 
     #[test]
