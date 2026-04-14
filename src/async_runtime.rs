@@ -502,6 +502,22 @@ impl RuntimeCoordinator {
         ServerRuntime::spawn_tcp_peer_transport(peer, stream)
     }
 
+    /// Accepts one inbound Tokio TCP peer and immediately serves it.
+    ///
+    /// This is the first real async accept path: the coordinator owns peer
+    /// registration, accepts one socket from a live listener, and hands that
+    /// socket to the runtime peer transport without involving the synchronous
+    /// server loop.
+    pub async fn accept_one_tcp_peer(
+        &mut self,
+        listener: &tokio::net::TcpListener,
+        peer_id: PeerId,
+        channel_capacity: usize,
+    ) -> std::io::Result<SpawnedPeerTransport> {
+        let (stream, _) = listener.accept().await?;
+        Ok(self.spawn_tcp_peer_transport(peer_id, channel_capacity, stream))
+    }
+
     /// Removes one peer from the live routing table.
     pub fn unregister_peer(&mut self, peer_id: &str) {
         self.peer_commands.remove(peer_id);
@@ -1374,6 +1390,51 @@ mod tests {
             let mut coordinator = RuntimeCoordinator::new(accept_state);
             let transport =
                 coordinator.spawn_tcp_peer_transport("peer-tcp-1".to_string(), 4, server_stream);
+            (transport, coordinator)
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        assert_eq!(
+            WireMessage::from_json_line(&line).unwrap(),
+            WireMessage::Tip(TipSummary {
+                tip: None,
+                height: None,
+            })
+        );
+
+        let (transport, coordinator) = accept_task.await.unwrap();
+        transport.disconnect().await.unwrap();
+        transport.join().await;
+        coordinator.stop();
+        let _task = coordinator.join().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_accepts_one_inbound_tcp_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let runtime = ServerRuntime::new(RuntimeConfig::default());
+        let state = runtime.spawn_state_task(StateTask::new(
+            PeerConfig::new("wobble-local", None),
+            NodeState::new(),
+        ));
+
+        let accept_task = tokio::spawn(async move {
+            let mut coordinator = RuntimeCoordinator::new(state);
+            let transport = coordinator
+                .accept_one_tcp_peer(&listener, "accepted-peer-1".to_string(), 4)
+                .await
+                .unwrap();
             (transport, coordinator)
         });
 

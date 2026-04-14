@@ -282,6 +282,8 @@ The next runtime design should separate:
 Current scaffold note:
 - `RuntimeCoordinator` now owns live peer registration and can spawn/register
   peer tasks and peer transports directly for inbound connections
+- it now also has an async helper to accept one inbound Tokio TCP peer and
+  serve it through the coordinator-owned peer path
 
 `MinerThread`
 - runs proof-of-work on a dedicated blocking thread
