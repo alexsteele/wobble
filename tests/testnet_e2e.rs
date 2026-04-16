@@ -253,7 +253,8 @@ impl TestNet {
         };
         let mut server = Server::new(
             ServerConfig::new("wobble-local", Some(node.name.clone()), addr.clone())
-                .with_advertised_addr(&addr),
+                .with_advertised_addr(&addr)
+                .with_channel_capacity(64),
             state,
         )
         .with_peers(peer_endpoints)
@@ -262,19 +263,10 @@ impl TestNet {
             server = server.with_sqlite_path(sqlite_path);
         }
         let (control_tx, control_rx) = mpsc::channel();
-        let server_name = name.to_string();
 
         let running = RunningNode {
             name: name.to_string(),
-            worker: thread::spawn(move || {
-                server
-                    .start(
-                        ServerConfig::new("wobble-local", Some(server_name), addr)
-                            .with_channel_capacity(64),
-                        Some(control_tx),
-                    )
-                    .unwrap()
-            }),
+            worker: thread::spawn(move || server.start(Some(control_tx)).unwrap()),
             control: control_rx.recv().unwrap(),
         };
         self.wait_until_serving(name);

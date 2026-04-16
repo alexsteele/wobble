@@ -399,25 +399,13 @@ impl Server {
     /// - binds socket listeners
     /// - starts mining
     /// - runs the server event loop
-    pub fn start(
-        self,
-        config: ServerConfig,
-        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
-    ) -> io::Result<NodeState> {
-        info!(listen_addr = config.listen_addr, "Server::start");
+    pub fn start(self, ready: Option<std::sync::mpsc::Sender<ServerHandle>>) -> io::Result<NodeState> {
+        info!(listen_addr = self.config.listen_addr, "Server::start");
         let tokio_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|err| io::Error::other(format!("async runtime init failed: {err}")))?;
-        tokio_runtime.block_on(async move {
-            self.serve_inner(
-                &config.listen_addr,
-                config.admin_addr.as_deref(),
-                config.channel_capacity,
-                ready,
-            )
-                .await
-        })
+        tokio_runtime.block_on(async move { self.serve_inner(ready).await })
     }
 
     /// Returns a cloneable control handle for this running server.
@@ -433,13 +421,10 @@ impl Server {
     /// state and persistence on one dedicated event loop thread.
     async fn serve_inner(
         mut self,
-        listen_addr: &str,
-        admin_addr: Option<&str>,
-        _channel_capacity: usize,
         ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
     ) -> io::Result<NodeState> {
-        let peer_listener = tokio::net::TcpListener::bind(listen_addr).await?;
-        let admin_listener = match admin_addr {
+        let peer_listener = tokio::net::TcpListener::bind(&self.config.listen_addr).await?;
+        let admin_listener = match self.config.admin_addr.as_deref() {
             Some(admin_addr) => Some(tokio::net::TcpListener::bind(admin_addr).await?),
             None => None,
         };
@@ -447,7 +432,7 @@ impl Server {
         let mining_interval = self.mining.as_ref().map(|config| config.interval);
         let bootstrap_pending = self.bootstrap_sync;
         let stop_requested = Arc::new(AtomicBool::new(false));
-        let (command_tx, command_rx) = mpsc::channel(256);
+        let (command_tx, command_rx) = mpsc::channel(self.config.channel_capacity);
         let handle = ServerHandle {
             command_tx,
             stop_requested: stop_requested.clone(),
@@ -500,7 +485,6 @@ impl Server {
             .expect("server event loop thread should not panic");
         Ok(server.state)
     }
-
 
     /// Runs the authoritative server event loop on one dedicated thread.
     ///
@@ -1934,7 +1918,7 @@ mod tests {
         node_state::{NodeState, NodeStateError},
         peer::relay_to_peer,
         peers::{PeerSource, StoredPeer},
-        server::{PeerEndpoint, Server, ServerConfig},
+        server::{PeerEndpoint, Server, ServerConfig, ServerHandle},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
@@ -2127,7 +2111,8 @@ mod tests {
             .unwrap();
         let server = Server::new(
             server_config(Some("alpha"))
-                .with_advertised_addr(server_addr.to_string()),
+                .with_advertised_addr(server_addr.to_string())
+                .with_channel_capacity(4),
             state,
         )
         .with_peers(vec![PeerEndpoint::new(
@@ -2137,7 +2122,7 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let serve_task = tokio::spawn(async move {
             server
-                .serve_inner(&server_addr.to_string(), None, 4, Some(ready_tx))
+                .serve_inner(Some(ready_tx))
                 .await
                 .unwrap()
         });
@@ -2216,7 +2201,7 @@ mod tests {
             }
         );
 
-        let stop_handle = ready_rx.recv().unwrap();
+        let stop_handle: ServerHandle = ready_rx.recv().unwrap();
         stop_handle.stop();
         let final_state = serve_task.await.unwrap();
         assert!(final_state.mempool().get(&transaction.txid()).is_some());
@@ -2267,8 +2252,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(server_config(None), state)
-            .with_sqlite_path(&sqlite_path);
+        let mut server = Server::new(server_config(None), state).with_sqlite_path(&sqlite_path);
 
         server
             .handle_message(WireMessage::AnnounceTx { transaction })
@@ -2291,8 +2275,8 @@ mod tests {
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
         let genesis_hash = genesis.header.block_hash();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(server_config(None), NodeState::new())
-            .with_sqlite_path(&sqlite_path);
+        let mut server =
+            Server::new(server_config(None), NodeState::new()).with_sqlite_path(&sqlite_path);
 
         server
             .handle_message(WireMessage::AnnounceBlock {
@@ -2333,8 +2317,8 @@ mod tests {
         let harder_child = mine_block(genesis_hash, 0x201f_ffff, &miner_b.verifying_key(), 2);
         let harder_child_hash = harder_child.header.block_hash();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(server_config(None), NodeState::new())
-            .with_sqlite_path(&sqlite_path);
+        let mut server =
+            Server::new(server_config(None), NodeState::new()).with_sqlite_path(&sqlite_path);
 
         server
             .handle_message(WireMessage::AnnounceBlock { block: genesis })
@@ -2402,8 +2386,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(pending.clone()).unwrap();
-        let mut server = Server::new(server_config(None), state)
-            .with_sqlite_path(&sqlite_path);
+        let mut server = Server::new(server_config(None), state).with_sqlite_path(&sqlite_path);
         server.save_full_state().unwrap();
 
         server
@@ -2442,12 +2425,11 @@ mod tests {
                 0,
             ))
             .unwrap();
-        let mut server =
-            Server::new(server_config(None), state).with_peers(vec![
-                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
-                PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
-            ]);
+        let mut server = Server::new(server_config(None), state).with_peers(vec![
+            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+            PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
+        ]);
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             addr: "127.0.0.1:9001".to_string(),
             node_name: Some("alpha".to_string()),
@@ -2491,11 +2473,10 @@ mod tests {
 
     #[test]
     fn select_sync_peers_falls_back_to_first_configured_peer_without_tip_metadata() {
-        let server = Server::new(server_config(None), NodeState::new())
-            .with_peers(vec![
-                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
-            ]);
+        let server = Server::new(server_config(None), NodeState::new()).with_peers(vec![
+            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+        ]);
 
         let selected = server.select_sync_peers();
 
@@ -2507,9 +2488,10 @@ mod tests {
     #[test]
     fn select_sync_peers_skips_recently_contacted_unknown_peer() {
         let mut server =
-            Server::new(server_config(None), NodeState::new()).with_peers(vec![
-                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-            ]);
+            Server::new(server_config(None), NodeState::new()).with_peers(vec![PeerEndpoint::new(
+                "127.0.0.1:9001",
+                Some("alpha".to_string()),
+            )]);
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             last_connect_at: Some(format_timestamp_string(current_unix_seconds())),
             ..StoredPeer::from_endpoint(
@@ -2550,8 +2532,7 @@ mod tests {
 
     #[test]
     fn relay_best_effort_skips_origin_peer_by_node_name() {
-        let server = Server::new(server_config(Some("alpha")), NodeState::new())
-        .with_peers(vec![
+        let server = Server::new(server_config(Some("alpha")), NodeState::new()).with_peers(vec![
             PeerEndpoint::new("127.0.0.1:1", Some("beta".to_string())),
             PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string())),
         ]);
@@ -2977,7 +2958,7 @@ mod tests {
         });
 
         let mut server = Server::new(server_config(Some("local")), NodeState::new())
-        .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]);
+            .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]);
         let _runtime = attach_runtime(&mut server);
         let transaction = coinbase(
             50,
@@ -3035,12 +3016,12 @@ mod tests {
     fn start_stops_when_handle_requests_shutdown() {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            Server::new(server_config_at(None, "127.0.0.1:0"), NodeState::new())
-                .start(
-                    server_config_at(None, "127.0.0.1:0").with_channel_capacity(4),
-                    Some(ready_tx),
-                )
-                .unwrap()
+            Server::new(
+                server_config_at(None, "127.0.0.1:0").with_channel_capacity(4),
+                NodeState::new(),
+            )
+            .start(Some(ready_tx))
+            .unwrap()
         });
 
         let handle = ready_rx.recv().unwrap();

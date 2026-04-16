@@ -527,7 +527,9 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         serve_runtime.node_name.clone(),
         serve_runtime.listen_addr.clone(),
     )
-    .with_advertised_addr(&serve_runtime.listen_addr);
+    .with_advertised_addr(&serve_runtime.listen_addr)
+    .with_admin_addr(config_file.admin_addr.clone())
+    .with_channel_capacity(64);
     let peer_path = command
         .peers_path
         .clone()
@@ -590,12 +592,7 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
 
     println!("serve mode: async");
     server
-        .start(
-            server_config
-                .with_admin_addr(config_file.admin_addr.clone())
-                .with_channel_capacity(64),
-            None,
-        )
+        .start(None)
         .map(|_| ())
         .map_err(|err| format!("server failed: {err}"))
 }
