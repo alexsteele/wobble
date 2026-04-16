@@ -18,35 +18,36 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    net::{TcpListener, TcpStream, ToSocketAddrs},
-    path::PathBuf,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
 use crate::{
     admin::{AdminRequest, AdminResponse, BalanceSummary, BootstrapSummary, StatusSummary},
-    async_runtime::{RuntimeConfig, RuntimeCoordinator, ServerHandle, ServerRuntime, StateTask},
     chain::ChainError,
     client::{ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
-    net,
+    mempool::MempoolError,
+    mining::{MiningConfig, spawn_mining_loop},
     node_state::{NodeState, NodeStateError},
     peer::{self, PeerConfig, PeerError},
     peers::{PeerSource, StoredPeer},
     sqlite_store::{self, SqliteStoreError},
     types::{Block, BlockHash, Txid},
-    wire::{HelloMessage, TipSummary, WireMessage, PROTOCOL_VERSION},
+    wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
-use ed25519_dalek::VerifyingKey;
-
 /// Outbound relay destination configured for this server.
 ///
 /// `node_name` is optional because some callers may know only the socket
@@ -67,110 +68,9 @@ impl PeerEndpoint {
     }
 }
 
-/// Origin identity learned from the remote `hello` on a live stream.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct RelayOrigin {
-    advertised_addr: Option<String>,
-    node_name: Option<String>,
-}
-
-/// Placeholder for one long-lived peer connection.
-///
-/// The runtime peer map owns this optional session slot so the server can
-/// reuse one outbound handshake for repeated relays and sync requests instead
-/// of reconnecting for every message.
-#[derive(Debug)]
-struct PeerSession {
-    stream: TcpStream,
-    reader: io::BufReader<TcpStream>,
-    remote_hello: HelloMessage,
-}
-
-impl PeerSession {
-    /// Opens one outbound peer session and completes the protocol handshake.
-    fn connect(
-        endpoint: &PeerEndpoint,
-        config: &PeerConfig,
-        state: &NodeState,
-    ) -> Result<Self, ClientError> {
-        let mut stream = net::connect(&endpoint.addr).map_err(ClientError::Connect)?;
-        configure_outbound_peer_stream(&stream).map_err(ClientError::Connect)?;
-        let reader_stream = stream.try_clone().map_err(ClientError::Connect)?;
-        net::send_message(
-            &mut stream,
-            &WireMessage::Hello(HelloMessage {
-                network: config.network.clone(),
-                version: PROTOCOL_VERSION,
-                node_name: config.node_name.clone(),
-                advertised_addr: None,
-                tip: state.chain().best_tip(),
-                height: state.tip_summary().height,
-            }),
-        )
-        .map_err(ClientError::SendHello)?;
-        let remote_hello = net::receive_message_from_reader(io::BufReader::new(reader_stream))
-            .map_err(ClientError::ReceiveHello)?;
-        let WireMessage::Hello(remote_hello) = remote_hello else {
-            return Err(ClientError::UnexpectedHandshake(remote_hello));
-        };
-        let session_reader = io::BufReader::new(
-            stream
-                .try_clone()
-                .expect("connected peer stream should clone for session reader"),
-        );
-        Ok(Self {
-            stream,
-            reader: session_reader,
-            remote_hello,
-        })
-    }
-
-    /// Returns the remote peer identity learned during the outbound handshake.
-    fn remote_hello(&self) -> &HelloMessage {
-        &self.remote_hello
-    }
-
-    /// Requests the peer's current best-tip summary on an existing session.
-    fn request_tip(&mut self) -> Result<TipSummary, RequestError> {
-        net::send_message(&mut self.stream, &WireMessage::GetTip).map_err(RequestError::Send)?;
-        let reply =
-            net::receive_message_from_reader(&mut self.reader).map_err(RequestError::Receive)?;
-        let WireMessage::Tip(summary) = reply else {
-            return Err(RequestError::UnexpectedResponse(reply));
-        };
-        Ok(summary)
-    }
-
-    /// Requests one specific block from the connected peer.
-    fn request_block(&mut self, block_hash: BlockHash) -> Result<Option<Block>, RequestError> {
-        net::send_message(&mut self.stream, &WireMessage::GetBlock { block_hash })
-            .map_err(RequestError::Send)?;
-        let reply =
-            net::receive_message_from_reader(&mut self.reader).map_err(RequestError::Receive)?;
-        let WireMessage::Block { block } = reply else {
-            return Err(RequestError::UnexpectedResponse(reply));
-        };
-        Ok(block)
-    }
-
-    /// Sends one announcement over the existing session without reopening it.
-    fn announce(&mut self, message: &WireMessage) -> io::Result<()> {
-        net::send_message(&mut self.stream, message)
-    }
-}
-
-/// One runtime peer record combining endpoint identity, learned metadata, and
-/// any future live session state.
-#[derive(Debug)]
-struct RuntimePeer {
-    endpoint: PeerEndpoint,
-    stored: StoredPeer,
-    session: Option<PeerSession>,
-}
-
 /// Shared stop signal for one running server instance.
 ///
-/// The server loop and any active stream handlers poll this flag so callers can
+/// The server event loop and any active stream handlers poll this flag so callers can
 /// stop a long-running node without depending on connection timing.
 #[derive(Debug, Clone, Default)]
 pub struct ServerControl {
@@ -182,209 +82,118 @@ impl ServerControl {
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::Relaxed);
     }
+}
 
-    fn is_stopped(&self) -> bool {
+/// Cloneable event sender for the async server shell.
+#[derive(Debug, Clone)]
+pub struct ServerHandle {
+    command_tx: mpsc::Sender<ServerEvent>,
+    stop_requested: Arc<AtomicBool>,
+}
+
+impl ServerHandle {
+    /// Requests one bootstrap pass before the server begins normal serving.
+    async fn bootstrap(&self) -> Result<(), ServerHandleError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(ServerEvent::Bootstrap { reply: reply_tx })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| ServerHandleError::ResponseDropped)
+    }
+
+    /// Sends one peer message into the server event loop and waits for replies.
+    pub(crate) async fn request_peer_message(
+        &self,
+        peer_id: String,
+        origin: Option<RelayOrigin>,
+        message: WireMessage,
+    ) -> Result<Result<Vec<WireMessage>, ServerError>, ServerHandleError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(ServerEvent::PeerMessage {
+                peer_id,
+                origin,
+                message,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| ServerHandleError::ResponseDropped)
+    }
+
+    /// Sends one admin request into the server event loop and waits for the response.
+    pub async fn request_admin(
+        &self,
+        request: AdminRequest,
+    ) -> Result<AdminResponse, ServerHandleError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(ServerEvent::AdminRequest {
+                request,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| ServerHandleError::ResponseDropped)
+    }
+
+    /// Records one new connected peer in the server event loop.
+    pub(crate) async fn notify_peer_connected(
+        &self,
+        peer_id: String,
+    ) -> Result<(), ServerHandleError> {
+        self.command_tx
+            .send(ServerEvent::PeerConnected { peer_id })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
+
+    /// Records one disconnected peer in the server event loop.
+    pub(crate) async fn notify_peer_disconnected(
+        &self,
+        peer_id: String,
+    ) -> Result<(), ServerHandleError> {
+        self.command_tx
+            .send(ServerEvent::PeerDisconnected { peer_id })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
+
+    /// Triggers one mining poll against the owned server state.
+    pub(crate) async fn notify_mine_tick(&self) -> Result<(), ServerHandleError> {
+        self.command_tx
+            .send(ServerEvent::MineTick)
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
+
+    /// Requests server shutdown.
+    pub fn stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
         self.stop_requested.load(Ordering::Relaxed)
     }
 }
 
-/// Owns local protocol configuration and mutable node state for networking.
 #[derive(Debug)]
 pub struct Server {
     config: PeerConfig,
     state: NodeState,
     peers: HashMap<String, RuntimePeer>,
+    connected_peers: HashSet<String>,
     sqlite_store: Option<sqlite_store::SqliteStore>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
     control: ServerControl,
-}
-
-/// Minimal async peer-serving adapter built from a `Server`.
-///
-/// This consumes the synchronous `Server`, moves its config and `NodeState`
-/// into the async runtime scaffold, and exposes a narrow inbound-peer accept
-/// path. Gap: this adapter does not yet port admin, mining, relay, or SQLite
-/// integration, so it is currently only the first live async peer entry point.
-pub struct AsyncPeerServer {
-    coordinator: RuntimeCoordinator,
-    next_inbound_peer_id: u64,
-}
-
-impl AsyncPeerServer {
-    /// Accepts and serves inbound Tokio TCP peers until shutdown is requested.
-    ///
-    /// This is the first async peer listener for the server layer. It owns the
-    /// accept loop, assigns simple peer ids, and disconnects all live peer
-    /// transports before returning so the state task can shut down cleanly.
-    pub async fn serve_listener(
-        &mut self,
-        listener: &tokio::net::TcpListener,
-        channel_capacity: usize,
-    ) -> io::Result<()> {
-        let mut transports = Vec::new();
-
-        loop {
-            if self.coordinator.handle().is_stopped() {
-                break;
-            }
-
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    let (stream, _) = accept_result?;
-                    let peer_id = self.allocate_inbound_peer_id();
-                    let transport =
-                        self.coordinator
-                            .spawn_tcp_peer_transport(peer_id, channel_capacity, stream);
-                    transports.push(transport);
-                }
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-            }
-        }
-
-        for transport in &transports {
-            let _ = transport.disconnect().await;
-        }
-        for transport in transports {
-            transport.join().await;
-        }
-
-        Ok(())
-    }
-
-    /// Serves peer and admin listeners on the async runtime until stopped.
-    ///
-    /// Peer sockets are routed through the async peer transport path, while
-    /// localhost admin requests are forwarded directly through the state task's
-    /// admin request channel. This is the first usable async server mode for
-    /// operator-facing status and control.
-    pub async fn serve_with_admin_listener(
-        &mut self,
-        peer_listener: &tokio::net::TcpListener,
-        admin_listener: &tokio::net::TcpListener,
-        channel_capacity: usize,
-    ) -> io::Result<()> {
-        let mut transports = Vec::new();
-
-        loop {
-            if self.coordinator.handle().is_stopped() {
-                break;
-            }
-
-            tokio::select! {
-                accept_result = peer_listener.accept() => {
-                    let (stream, _) = accept_result?;
-                    let peer_id = self.allocate_inbound_peer_id();
-                    let transport =
-                        self.coordinator
-                            .spawn_tcp_peer_transport(peer_id, channel_capacity, stream);
-                    transports.push(transport);
-                }
-                accept_result = admin_listener.accept() => {
-                    let (stream, _) = accept_result?;
-                    self.handle_admin_stream(stream).await?;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-            }
-        }
-
-        for transport in &transports {
-            let _ = transport.disconnect().await;
-        }
-        for transport in transports {
-            transport.join().await;
-        }
-
-        Ok(())
-    }
-
-    /// Accepts and serves one inbound Tokio TCP peer over the async runtime.
-    pub async fn accept_one_peer(
-        &mut self,
-        listener: &tokio::net::TcpListener,
-        peer_id: impl Into<String>,
-        channel_capacity: usize,
-    ) -> io::Result<crate::async_runtime::SpawnedPeerTransport> {
-        self.coordinator
-            .accept_one_tcp_peer(listener, peer_id.into(), channel_capacity)
-            .await
-    }
-
-    /// Connects and serves one outbound Tokio TCP peer over the async runtime.
-    pub async fn connect_one_peer(
-        &mut self,
-        addr: impl tokio::net::ToSocketAddrs,
-        peer_id: impl Into<String>,
-        channel_capacity: usize,
-    ) -> io::Result<crate::async_runtime::SpawnedPeerTransport> {
-        self.coordinator
-            .connect_one_tcp_peer(addr, peer_id.into(), channel_capacity)
-            .await
-    }
-
-    /// Requests a clean shutdown of the underlying async state task.
-    pub fn stop(&self) {
-        self.coordinator.stop();
-    }
-
-    /// Returns a cloneable stop handle for the underlying async state task.
-    pub fn handle(&self) -> ServerHandle {
-        self.coordinator.handle()
-    }
-
-    /// Waits for the async state task to exit and returns the final node state.
-    pub async fn join(self) -> NodeState {
-        self.coordinator.join().await.state().clone()
-    }
-
-    /// Allocates a simple monotonic peer id for an inbound async connection.
-    fn allocate_inbound_peer_id(&mut self) -> String {
-        let peer_id = format!("inbound-{}", self.next_inbound_peer_id);
-        self.next_inbound_peer_id = self.next_inbound_peer_id.wrapping_add(1);
-        peer_id
-    }
-
-    /// Handles one async localhost admin stream until the client disconnects.
-    ///
-    /// Each request is decoded from one JSON line, forwarded through the
-    /// runtime's admin request channel, and written back as one JSON line
-    /// response. This keeps async admin behavior aligned with the synchronous
-    /// admin protocol while the surrounding server transitions to async.
-    async fn handle_admin_stream(&self, stream: tokio::net::TcpStream) -> io::Result<()> {
-        let handle = self.coordinator.handle();
-        let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = tokio::io::BufReader::new(reader);
-        let mut line = String::new();
-
-        loop {
-            if handle.is_stopped() {
-                return Ok(());
-            }
-
-            line.clear();
-            let bytes_read = tokio::select! {
-                result = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line) => result?,
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {
-                    continue;
-                }
-            };
-            if bytes_read == 0 {
-                return Ok(());
-            }
-
-            let request: AdminRequest = serde_json::from_str(line.trim_end_matches('\n'))
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            let response = handle
-                .request_admin(request)
-                .await
-                .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, format!("{err:?}")))?;
-            let mut response_line = serde_json::to_string(&response)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            response_line.push('\n');
-            tokio::io::AsyncWriteExt::write_all(&mut writer, response_line.as_bytes()).await?;
-            tokio::io::AsyncWriteExt::flush(&mut writer).await?;
-        }
-    }
 }
 
 /// Errors produced by the live server while handling protocol messages.
@@ -405,62 +214,61 @@ pub enum SyncError {
     SqlitePersist(SqliteStoreError),
 }
 
-/// Background testnet mining configuration for a serving node.
-#[derive(Debug, Clone)]
-pub struct MiningConfig {
-    pub miner_verifying_key: VerifyingKey,
-    pub interval: Duration,
-    pub max_transactions: usize,
-    pub bits: u32,
-    next_uniqueness: u32,
+/// Request/response errors for async tasks talking to the server event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerHandleError {
+    SubmitClosed,
+    ResponseDropped,
 }
 
-impl MiningConfig {
-    /// Builds a minimal integrated mining policy for local testnet use.
-    ///
-    /// Mining uses the standard block subsidy, mines only when the mempool is
-    /// non-empty, and increments `uniqueness` on each mined block so coinbase
-    /// transactions remain distinct.
-    pub fn new(miner_verifying_key: VerifyingKey) -> Self {
-        Self {
-            miner_verifying_key,
-            interval: Duration::from_millis(250),
-            max_transactions: 100,
-            bits: 0x207f_ffff,
-            next_uniqueness: 0,
-        }
-    }
+/// Origin identity learned from the remote `hello` on a live stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RelayOrigin {
+    pub(crate) advertised_addr: Option<String>,
+    pub(crate) node_name: Option<String>,
+}
 
-    /// Sets the poll interval for the integrated miner loop.
-    pub fn with_interval(mut self, interval: Duration) -> Self {
-        self.interval = interval;
-        self
-    }
+/// Event sent into the single-threaded server event loop.
+///
+/// Async listener, peer, admin, and mining tasks translate external activity
+/// into these concrete events so the owned `Server` remains the only authority
+/// for state mutation and policy decisions.
+enum ServerEvent {
+    Bootstrap {
+        reply: oneshot::Sender<()>,
+    },
+    PeerConnected {
+        peer_id: String,
+    },
+    PeerMessage {
+        peer_id: String,
+        origin: Option<RelayOrigin>,
+        message: WireMessage,
+        reply: oneshot::Sender<Result<Vec<WireMessage>, ServerError>>,
+    },
+    PeerDisconnected {
+        peer_id: String,
+    },
+    AdminRequest {
+        request: AdminRequest,
+        reply: oneshot::Sender<AdminResponse>,
+    },
+    MineTick,
+    Stop,
+}
 
-    /// Caps how many mempool transactions a mined block may include.
-    pub fn with_max_transactions(mut self, max_transactions: usize) -> Self {
-        self.max_transactions = max_transactions;
-        self
-    }
+/// One runtime peer record combining endpoint identity, learned metadata, and
+/// any future live session state.
+#[derive(Debug)]
+struct RuntimePeer {
+    endpoint: PeerEndpoint,
+    stored: StoredPeer,
+    session: Option<peer::PeerSession>,
+}
 
-    /// Sets the compact proof-of-work target used by the integrated miner.
-    pub fn with_bits(mut self, bits: u32) -> Self {
-        self.bits = bits;
-        self
-    }
-
-    fn next_request(&mut self) -> crate::wire::MinePendingRequest {
-        let request = crate::wire::MinePendingRequest {
-            reward: BLOCK_SUBSIDY,
-            miner_public_key: crate::crypto::verifying_key_bytes(&self.miner_verifying_key)
-                .to_vec(),
-            uniqueness: self.next_uniqueness,
-            bits: self.bits,
-            max_transactions: self.max_transactions,
-        };
-        self.next_uniqueness = self.next_uniqueness.wrapping_add(1);
-        request
-    }
+/// One spawned async peer transport task.
+struct LivePeerTask {
+    worker: JoinHandle<()>,
 }
 
 /// Retry budget for best-effort outbound relay dialing.
@@ -468,12 +276,8 @@ const RELAY_CONNECT_ATTEMPTS: usize = 3;
 /// Small pause between relay dial attempts so listeners finishing a prior
 /// request can accept the next inbound connection.
 const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
-/// Periodic retry interval for configured-peer catch-up while serving.
-const CONFIGURED_PEER_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 /// Cooldown between configured-peer sync attempts to the same peer.
 const CONFIGURED_PEER_SYNC_COOLDOWN: Duration = Duration::from_secs(5);
-/// Timeout for a reusable outbound peer session.
-const OUTBOUND_PEER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Server {
     pub fn new(config: PeerConfig, state: NodeState) -> Self {
@@ -481,30 +285,11 @@ impl Server {
             config,
             state,
             peers: HashMap::new(),
+            connected_peers: HashSet::new(),
             sqlite_store: None,
             bootstrap_sync: false,
             mining: None,
             control: ServerControl::default(),
-        }
-    }
-
-    /// Returns a cloneable control handle for this running server.
-    pub fn control(&self) -> ServerControl {
-        self.control.clone()
-    }
-
-    /// Converts this synchronous server into the minimal async peer adapter.
-    ///
-    /// This is the first server-layer bridge into the async runtime. It moves
-    /// the current config and node state into a `StateTask`, then hands peer
-    /// acceptance to a `RuntimeCoordinator`.
-    pub fn into_async_peer_server(self) -> AsyncPeerServer {
-        let runtime = ServerRuntime::new(RuntimeConfig::default());
-        let state_task = StateTask::new(self.config, self.state);
-        let coordinator = RuntimeCoordinator::new(runtime.spawn_state_task(state_task));
-        AsyncPeerServer {
-            coordinator,
-            next_inbound_peer_id: 0,
         }
     }
 
@@ -558,6 +343,219 @@ impl Server {
         self
     }
 
+    /// Starts the async peer/admin server and runs it until shutdown.
+    ///
+    /// This is the high-level entry point: it creates the Tokio runtime,
+    /// binds the requested listeners, starts the server event loop, and
+    /// optionally sends the cloneable `ServerHandle` back to the caller once
+    /// startup has completed.
+    pub fn start(
+        self,
+        listen_addr: &str,
+        admin_addr: Option<&str>,
+        channel_capacity: usize,
+        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
+    ) -> io::Result<NodeState> {
+        let listen_addr = listen_addr.to_string();
+        let admin_addr = admin_addr.map(str::to_string);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| io::Error::other(format!("async runtime init failed: {err}")))?;
+        runtime.block_on(async move {
+            let peer_listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+            match admin_addr.as_deref() {
+                Some(admin_addr) => {
+                    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+                    self.serve_with_admin_listener_async(
+                        &peer_listener,
+                        &admin_listener,
+                        channel_capacity,
+                        ready,
+                    )
+                    .await
+                }
+                None => {
+                    self.serve_listener_async(&peer_listener, channel_capacity, ready)
+                        .await
+                }
+            }
+        })
+    }
+
+    /// Returns a cloneable control handle for this running server.
+    pub fn control(&self) -> ServerControl {
+        self.control.clone()
+    }
+
+    /// Serves one async peer listener and returns the final node state on shutdown.
+    ///
+    /// The listener, peer tasks, and optional mining timer run asynchronously,
+    /// while this consumed `Server` instance continues to own all blockchain
+    /// state and persistence on one dedicated event loop thread.
+    pub async fn serve_listener_async(
+        self,
+        listener: &tokio::net::TcpListener,
+        _channel_capacity: usize,
+        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
+    ) -> io::Result<NodeState> {
+        self.serve_async_inner(listener, None, ready).await
+    }
+
+    /// Serves async peer and admin listeners and returns the final node state on shutdown.
+    pub async fn serve_with_admin_listener_async(
+        self,
+        peer_listener: &tokio::net::TcpListener,
+        admin_listener: &tokio::net::TcpListener,
+        _channel_capacity: usize,
+        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
+    ) -> io::Result<NodeState> {
+        self.serve_async_inner(peer_listener, Some(admin_listener), ready)
+            .await
+    }
+
+    /// Runs the async transport shell around the single-threaded server event loop.
+    async fn serve_async_inner(
+        self,
+        peer_listener: &tokio::net::TcpListener,
+        admin_listener: Option<&tokio::net::TcpListener>,
+        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
+    ) -> io::Result<NodeState> {
+        let mining_interval = self.mining.as_ref().map(|config| config.interval);
+        let bootstrap_pending = self.bootstrap_sync;
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let (command_tx, command_rx) = mpsc::channel(256);
+        let handle = ServerHandle {
+            command_tx,
+            stop_requested: stop_requested.clone(),
+        };
+        let worker = std::thread::spawn(move || self.run_event_loop(command_rx, stop_requested));
+
+        if bootstrap_pending {
+            handle
+                .bootstrap()
+                .await
+                .map_err(|err| io::Error::other(format!("{err:?}")))?;
+        }
+        if let Some(ready) = ready {
+            let _ = ready.send(handle.clone());
+        }
+
+        let mining_task = spawn_mining_loop(handle.clone(), mining_interval);
+        let mut peers: HashMap<String, LivePeerTask> = HashMap::new();
+        let mut next_inbound_peer_id = 0_u64;
+
+        loop {
+            if handle.is_stopped() {
+                break;
+            }
+            tokio::select! {
+                accept_result = peer_listener.accept() => {
+                    let (stream, _) = accept_result?;
+                    next_inbound_peer_id = next_inbound_peer_id.wrapping_add(1);
+                    let peer_id = format!("peer-{next_inbound_peer_id}");
+                    spawn_peer_task(&mut peers, handle.clone(), peer_id, stream);
+                }
+                accept_result = accept_optional_admin(admin_listener) => {
+                    if let Some(stream) = accept_result? {
+                        spawn_admin_task(handle.clone(), stream);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+            peers.retain(|_, peer| !peer.worker.is_finished());
+        }
+
+        let _ = handle.command_tx.try_send(ServerEvent::Stop);
+        if let Some(task) = mining_task {
+            task.abort();
+        }
+        peers.clear();
+
+        let server = worker
+            .join()
+            .expect("server event loop thread should not panic");
+        Ok(server.state)
+    }
+
+
+    /// Runs the authoritative server event loop on one dedicated thread.
+    ///
+    /// Every state mutation, persistence write, relay decision, bootstrap sync,
+    /// and mining action flows through this loop so protocol authority stays in
+    /// one place even though peer and admin sockets are handled asynchronously.
+    fn run_event_loop(
+        mut self,
+        mut command_rx: mpsc::Receiver<ServerEvent>,
+        stop_requested: Arc<AtomicBool>,
+    ) -> Server {
+        while let Some(event) = command_rx.blocking_recv() {
+            if !self.handle_event(event) || stop_requested.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        self.disconnect();
+        self
+    }
+
+    /// Dispatches one server event to the appropriate handler.
+    ///
+    /// The event loop stays intentionally small: it pulls one event from the
+    /// channel, routes it here, and lets the dedicated handler deal with peer
+    /// messages, admin requests, peer lifecycle, mining ticks, or shutdown.
+    fn handle_event(&mut self, event: ServerEvent) -> bool {
+        match event {
+            ServerEvent::Bootstrap { reply } => {
+                if self.bootstrap_sync {
+                    self.sync_configured_peers_best_effort();
+                    self.bootstrap_sync = false;
+                }
+                let _ = reply.send(());
+                true
+            }
+            ServerEvent::PeerConnected { peer_id } => {
+                self.connected_peers.insert(peer_id);
+                true
+            }
+            ServerEvent::PeerMessage {
+                peer_id,
+                origin,
+                message,
+                reply,
+            } => {
+                let result = self.handle_peer_event(&peer_id, origin.as_ref(), message);
+                let _ = reply.send(result);
+                true
+            }
+            ServerEvent::PeerDisconnected { peer_id } => {
+                self.connected_peers.remove(&peer_id);
+                true
+            }
+            ServerEvent::AdminRequest { request, reply } => {
+                let response = self.handle_admin_request(request);
+                let _ = reply.send(response);
+                true
+            }
+            ServerEvent::MineTick => {
+                if let Err(err) = self.mine_pending_best_effort() {
+                    warn!(error = %err, "integrated mining tick failed");
+                }
+                true
+            }
+            ServerEvent::Stop => false,
+        }
+    }
+
+    /// Handles one async peer event against the authoritative server state.
+    fn handle_peer_event(
+        &mut self,
+        _peer_id: &str,
+        origin: Option<&RelayOrigin>,
+        message: WireMessage,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        self.handle_peer_message(origin, message)
+    }
+
     pub fn config(&self) -> &PeerConfig {
         &self.config
     }
@@ -579,39 +577,217 @@ impl Server {
         &mut self,
         message: WireMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
-        self.handle_message_from_peer(message, None)
+        self.handle_peer_message(None, message)
     }
 
-    /// Handles one decoded wire message and optionally suppresses relay back to
-    /// the named peer that sent it on the current stream.
-    fn handle_message_from_peer(
+    /// Dispatches one decoded peer message to the appropriate server handler.
+    ///
+    /// Each supported wire message has a dedicated handler so handshake,
+    /// queries, announcements, mining, relay, and sync behavior stay easy to
+    /// follow as the protocol grows.
+    fn handle_peer_message(
         &mut self,
+        origin: Option<&RelayOrigin>,
         message: WireMessage,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        match message {
+            WireMessage::Hello(remote_hello) => self.handle_peer_hello(remote_hello),
+            WireMessage::GetTip => self.handle_peer_get_tip(),
+            WireMessage::GetBlock { block_hash } => self.handle_peer_get_block(block_hash),
+            WireMessage::AnnounceTx { transaction } => {
+                self.handle_peer_announce_tx(transaction, origin)
+            }
+            WireMessage::AnnounceBlock { block } => self.handle_peer_announce_block(block, origin),
+            WireMessage::MinePending(request) => self.handle_peer_mine_pending(request, origin),
+            WireMessage::Tip(_) | WireMessage::Block { .. } | WireMessage::MinedBlock(_) => {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Handles one incoming `hello`, persists any advertised peer metadata,
+    /// and optionally triggers a best-effort catch-up when the remote tip is
+    /// ahead of local state.
+    fn handle_peer_hello(
+        &mut self,
+        remote_hello: HelloMessage,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        let should_log_info = self.hello_advances_local_state(&remote_hello);
+        let remote_node = remote_hello.node_name.as_deref().unwrap_or("unknown");
+        let advertised_addr = remote_hello.advertised_addr.as_deref().unwrap_or("none");
+        if should_log_info {
+            info!(
+                remote_node,
+                advertised_addr,
+                remote_tip = %format_hash(remote_hello.tip),
+                remote_height = ?remote_hello.height,
+                "received peer hello with potentially useful tip"
+            );
+        } else {
+            debug!(
+                remote_node,
+                advertised_addr,
+                remote_tip = %format_hash(remote_hello.tip),
+                remote_height = ?remote_hello.height,
+                "received peer hello"
+            );
+        }
+        self.record_inbound_hello(None, &remote_hello)
+            .map_err(ServerError::SqlitePersist)?;
+        if remote_hello.network != self.config.network {
+            return Err(ServerError::Peer(PeerError::NetworkMismatch {
+                local: self.config.network.clone(),
+                remote: remote_hello.network,
+            }));
+        }
+        if remote_hello.version != PROTOCOL_VERSION {
+            return Err(ServerError::Peer(PeerError::UnsupportedVersion(
+                remote_hello.version,
+            )));
+        }
+        let local_hello = WireMessage::Hello(peer::local_hello(&self.config, &self.state));
+        if should_log_info {
+            let origin = RelayOrigin {
+                advertised_addr: remote_hello.advertised_addr.clone(),
+                node_name: remote_hello.node_name.clone(),
+            };
+            for block in self.sync_from_hello_best_effort(&remote_hello) {
+                info!(
+                    block_hash = %format_hash(Some(block.header.block_hash())),
+                    "relaying block learned during hello-triggered sync"
+                );
+                self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
+            }
+        }
+        Ok(vec![local_hello])
+    }
+
+    /// Handles one `get_tip` query by returning the current best-tip summary.
+    fn handle_peer_get_tip(&self) -> Result<Vec<WireMessage>, ServerError> {
+        Ok(vec![WireMessage::Tip(self.state.tip_summary())])
+    }
+
+    /// Handles one `get_block` query by returning the indexed block when known.
+    fn handle_peer_get_block(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        Ok(vec![WireMessage::Block {
+            block: self.state.get_block(&block_hash).cloned(),
+        }])
+    }
+
+    /// Handles one announced transaction, persists mempool changes, and relays
+    /// the transaction only when it was new to this node.
+    fn handle_peer_announce_tx(
+        &mut self,
+        transaction: crate::types::Transaction,
         origin: Option<&RelayOrigin>,
     ) -> Result<Vec<WireMessage>, ServerError> {
+        self.handle_state_mutating_peer_message(
+            WireMessage::AnnounceTx { transaction },
+            origin,
+            None,
+        )
+    }
+
+    /// Handles one announced block, including the best-effort missing-parent
+    /// sync path before retrying block validation.
+    fn handle_peer_announce_block(
+        &mut self,
+        block: Block,
+        origin: Option<&RelayOrigin>,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        let message = WireMessage::AnnounceBlock { block };
         if let Some(recovered) = self.try_handle_announced_block_with_sync(&message, origin)? {
             return Ok(recovered);
         }
+        let block_hash = saved_block_hash(&message);
+        self.handle_state_mutating_peer_message(message, origin, block_hash)
+    }
+
+    /// Handles one `mine_pending` request by mining a block from the current
+    /// mempool and relaying the accepted block back out to peers.
+    fn handle_peer_mine_pending(
+        &mut self,
+        request: crate::wire::MinePendingRequest,
+        origin: Option<&RelayOrigin>,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        let message = WireMessage::MinePending(request.clone());
         log_inbound_message(&message, &self.state);
         let previous_best_tip = self.state.chain().best_tip();
         let previous_mempool_txids = mempool_txids(self.state.mempool());
-        let should_save = message_mutates_state(&message);
-        let relay = self.relay_message_before_handle(&message);
-        let save_block_hash = saved_block_hash(&message);
-        let save_message = message.clone();
-        let replies = peer::handle_message(&self.config, &mut self.state, message)
-            .map_err(ServerError::Peer)?;
-        log_post_handle_state(&replies, &self.state);
-        if should_save {
-            self.save_sqlite(
-                &save_message,
-                save_block_hash,
-                previous_best_tip,
-                &previous_mempool_txids,
-                &replies,
+        let miner = crate::crypto::parse_verifying_key(&request.miner_public_key)
+            .ok_or(ServerError::Peer(PeerError::InvalidMinerPublicKey))?;
+        let block_hash = self
+            .state
+            .mine_block(
+                request.reward,
+                &miner,
+                request.uniqueness,
+                request.bits,
+                request.max_transactions,
             )
-                .map_err(ServerError::SqlitePersist)?;
+            .map_err(PeerError::MiningRejected)
+            .map_err(ServerError::Peer)?;
+        let replies = vec![WireMessage::MinedBlock(crate::wire::MinedBlock {
+            block_hash,
+        })];
+        log_post_handle_state(&replies, &self.state);
+        self.save_sqlite(
+            &message,
+            None,
+            previous_best_tip,
+            &previous_mempool_txids,
+            &replies,
+        )
+        .map_err(ServerError::SqlitePersist)?;
+        if let Some(relay) = self.relay_message_from_replies(&replies) {
+            self.relay_best_effort(&relay, origin);
         }
+        Ok(replies)
+    }
+
+    /// Applies one transaction or block announcement that mutates live state,
+    /// persists the resulting changes, and relays any newly accepted object.
+    fn handle_state_mutating_peer_message(
+        &mut self,
+        message: WireMessage,
+        origin: Option<&RelayOrigin>,
+        save_block_hash: Option<BlockHash>,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        log_inbound_message(&message, &self.state);
+        let previous_best_tip = self.state.chain().best_tip();
+        let previous_mempool_txids = mempool_txids(self.state.mempool());
+        let relay = self.relay_message_before_handle(&message);
+        let save_message = message.clone();
+        let replies = match message {
+            WireMessage::AnnounceTx { transaction } => {
+                match self.state.submit_transaction(transaction) {
+                    Ok(_) | Err(NodeStateError::Mempool(MempoolError::DuplicateTransaction(_))) => {
+                    }
+                    Err(err) => return Err(ServerError::Peer(PeerError::TransactionRejected(err))),
+                }
+                Vec::new()
+            }
+            WireMessage::AnnounceBlock { block } => {
+                self.state
+                    .accept_block(block)
+                    .map_err(PeerError::BlockRejected)
+                    .map_err(ServerError::Peer)?;
+                Vec::new()
+            }
+            _ => unreachable!("state-mutating peer handler only supports tx/block announcements"),
+        };
+        log_post_handle_state(&replies, &self.state);
+        self.save_sqlite(
+            &save_message,
+            save_block_hash,
+            previous_best_tip,
+            &previous_mempool_txids,
+            &replies,
+        )
+        .map_err(ServerError::SqlitePersist)?;
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
         }
@@ -656,7 +832,7 @@ impl Server {
                     &previous_mempool_txids,
                     &replies,
                 )
-                    .map_err(ServerError::SqlitePersist)?;
+                .map_err(ServerError::SqlitePersist)?;
                 if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
                     self.relay_best_effort(&relay, origin);
                 }
@@ -704,229 +880,11 @@ impl Server {
             &previous_mempool_txids,
             &replies,
         )
-            .map_err(ServerError::SqlitePersist)?;
+        .map_err(ServerError::SqlitePersist)?;
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
         }
         Ok(Some(replies))
-    }
-
-    /// Serves a single connected stream until the peer closes the connection or
-    /// sends an invalid protocol message.
-    ///
-    /// Current behavior is request-response oriented: each received message is
-    /// handled immediately and any resulting replies are written back in order.
-    /// Gap: this does not yet track per-peer state or initiate background relay.
-    pub fn handle_stream(&mut self, mut stream: TcpStream) -> io::Result<()> {
-        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-        let reader_stream = stream.try_clone()?;
-        let mut reader = io::BufReader::new(reader_stream);
-        let mut origin = RelayOrigin::default();
-        let peer_addr = stream.peer_addr().ok();
-
-        info!(peer_addr = ?peer_addr, "accepted peer stream");
-
-        loop {
-            if self.control.is_stopped() {
-                return Ok(());
-            }
-            let message = match net::receive_message_from_reader(&mut reader) {
-                Ok(message) => message,
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-
-            if let WireMessage::Hello(remote_hello) = &message {
-                let should_log_info = self.hello_advances_local_state(remote_hello);
-                let remote_node = remote_hello.node_name.as_deref().unwrap_or("unknown");
-                let advertised_addr = remote_hello.advertised_addr.as_deref().unwrap_or("none");
-                if should_log_info {
-                    info!(
-                        peer_addr = ?peer_addr,
-                        remote_node,
-                        advertised_addr,
-                        remote_tip = %format_hash(remote_hello.tip),
-                        remote_height = ?remote_hello.height,
-                        "received peer hello with potentially useful tip"
-                    );
-                } else {
-                    debug!(
-                        peer_addr = ?peer_addr,
-                        remote_node,
-                        advertised_addr,
-                        remote_tip = %format_hash(remote_hello.tip),
-                        remote_height = ?remote_hello.height,
-                        "received peer hello"
-                    );
-                }
-                origin = RelayOrigin {
-                    advertised_addr: remote_hello.advertised_addr.clone(),
-                    node_name: remote_hello.node_name.clone(),
-                };
-                self.record_inbound_hello(peer_addr, remote_hello)
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
-                let replies = peer::handle_message(&self.config, &mut self.state, message.clone())
-                    .map_err(|err| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                    })?;
-                for reply in replies {
-                    net::send_message(&mut stream, &reply)?;
-                }
-                let synced_blocks = if should_log_info {
-                    self.sync_from_hello_best_effort(remote_hello)
-                } else {
-                    Vec::new()
-                };
-                for block in synced_blocks {
-                    info!(
-                        block_hash = %format_hash(Some(block.header.block_hash())),
-                        "relaying block learned during hello-triggered sync"
-                    );
-                    self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
-                }
-                continue;
-            }
-            let replies = self
-                .handle_message_from_peer(message, Some(&origin))
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
-            for reply in replies {
-                net::send_message(&mut stream, &reply)?;
-            }
-        }
-    }
-
-    /// Serves one localhost admin stream until the client closes the connection.
-    ///
-    /// Admin requests are intentionally separate from the public peer protocol
-    /// so local management operations are not exposed to arbitrary peers.
-    pub fn handle_admin_stream(&mut self, mut stream: TcpStream) -> io::Result<()> {
-        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-        let reader_stream = stream.try_clone()?;
-        let mut reader = io::BufReader::new(reader_stream);
-
-        loop {
-            if self.control.is_stopped() {
-                return Ok(());
-            }
-            let request = match receive_admin_request_from_reader(&mut reader) {
-                Ok(request) => request,
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            let response = self.handle_admin_request(request);
-            send_admin_response(&mut stream, &response)?;
-        }
-    }
-
-    /// Binds a listener and serves inbound peers sequentially.
-    ///
-    /// This is enough for local manual testing. Later versions can move to
-    /// concurrent connection handling once shared-state policy is clear.
-    pub fn serve<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()> {
-        let listener = TcpListener::bind(addr)?;
-        self.serve_listener(listener)
-    }
-
-    /// Binds peer and localhost admin listeners and serves both.
-    pub fn serve_with_admin<A: ToSocketAddrs, B: ToSocketAddrs>(
-        &mut self,
-        peer_addr: A,
-        admin_addr: B,
-    ) -> io::Result<()> {
-        let peer_listener = TcpListener::bind(peer_addr)?;
-        let admin_listener = TcpListener::bind(admin_addr)?;
-        self.serve_listeners(peer_listener, Some(admin_listener))
-    }
-
-    /// Accepts inbound peer connections from an existing listener.
-    pub fn serve_listener(&mut self, listener: TcpListener) -> io::Result<()> {
-        self.serve_listeners(listener, None)
-    }
-
-    /// Accepts inbound peer and optional admin connections.
-    fn serve_listeners(
-        &mut self,
-        listener: TcpListener,
-        admin_listener: Option<TcpListener>,
-    ) -> io::Result<()> {
-        let mut next_peer_sync_at = Instant::now();
-        if self.bootstrap_sync {
-            info!(peer_count = self.peers.len(), "starting bootstrap sync");
-            self.sync_configured_peers_best_effort();
-            next_peer_sync_at = Instant::now() + CONFIGURED_PEER_SYNC_INTERVAL;
-        }
-        info!(listen_addr = ?listener.local_addr().ok(), "server listening");
-        if let Some(admin_listener) = admin_listener.as_ref() {
-            info!(admin_addr = ?admin_listener.local_addr().ok(), "admin listener active");
-        }
-
-        listener.set_nonblocking(true)?;
-        if let Some(admin_listener) = admin_listener.as_ref() {
-            admin_listener.set_nonblocking(true)?;
-        }
-        loop {
-            if self.control.is_stopped() {
-                self.disconnect();
-                return Ok(());
-            }
-            self.sync_configured_peers_if_due(&mut next_peer_sync_at);
-            if let Some(admin_listener) = admin_listener.as_ref() {
-                match admin_listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(false)?;
-                        self.handle_admin_stream(stream)?
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(err) => return Err(err),
-                }
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    self.handle_stream(stream)?
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                Err(err) => return Err(err),
-            }
-            self.mine_pending_best_effort()?;
-            let interval = self
-                .mining
-                .as_ref()
-                .map(|config| config.interval)
-                .unwrap_or(Duration::from_millis(50));
-            thread::sleep(interval);
-        }
-    }
-
-    /// Retries configured-peer sync on a fixed cadence while serving.
-    ///
-    /// This lets cold-start nodes recover from a missed initial sync attempt
-    /// without waiting for a fresh inbound announcement from the same peer.
-    fn sync_configured_peers_if_due(&mut self, next_sync_at: &mut Instant) {
-        if !self.bootstrap_sync || Instant::now() < *next_sync_at {
-            return;
-        }
-        debug!(peer_count = self.peers.len(), "running periodic configured-peer sync");
-        self.sync_configured_peers_best_effort();
-        *next_sync_at = Instant::now() + CONFIGURED_PEER_SYNC_INTERVAL;
     }
 
     /// Handles one localhost admin request against the live node state.
@@ -939,7 +897,7 @@ impl Server {
                     height: tip.height,
                     branch_count: self.state.chain().branch_count(),
                     mempool_size: self.state.mempool().len(),
-                    peer_count: self.peers.len(),
+                    peer_count: self.connected_peers.len(),
                     mining_enabled: self.mining.is_some(),
                 })
             }
@@ -1068,8 +1026,11 @@ impl Server {
     /// reconnect loops.
     fn select_sync_peers(&self) -> Vec<PeerEndpoint> {
         let local_height = self.state.tip_summary().height.unwrap_or(0);
-        let mut candidates: Vec<StoredPeer> =
-            self.peers.values().map(|peer| peer.stored.clone()).collect();
+        let mut candidates: Vec<StoredPeer> = self
+            .peers
+            .values()
+            .map(|peer| peer.stored.clone())
+            .collect();
         candidates.sort_by(|left, right| {
             right
                 .advertised_height
@@ -1077,13 +1038,9 @@ impl Server {
                 .cmp(&left.advertised_height.unwrap_or(0))
                 .then_with(|| left.addr.cmp(&right.addr))
         });
-        if let Some(best) = candidates
-            .into_iter()
-            .find(|peer| {
-                peer.advertised_height.unwrap_or(0) > local_height
-                    && self.peer_is_ready_for_sync(peer)
-            })
-        {
+        if let Some(best) = candidates.into_iter().find(|peer| {
+            peer.advertised_height.unwrap_or(0) > local_height && self.peer_is_ready_for_sync(peer)
+        }) {
             return vec![best.endpoint()];
         }
         self.peer_endpoints()
@@ -1171,8 +1128,7 @@ impl Server {
         }
 
         if !accepted_blocks.is_empty() {
-            self.save_full_state()
-                .map_err(SyncError::SqlitePersist)?;
+            self.save_full_state().map_err(SyncError::SqlitePersist)?;
         }
 
         info!(
@@ -1399,7 +1355,10 @@ impl Server {
             return Ok(());
         }
         self.update_persisted_peer(peer, PeerSource::Seed, |stored| {
-            stored.node_name = remote_hello.node_name.clone().or_else(|| stored.node_name.clone());
+            stored.node_name = remote_hello
+                .node_name
+                .clone()
+                .or_else(|| stored.node_name.clone());
             stored.advertised_tip_hash = remote_hello.tip;
             stored.advertised_height = remote_hello.height;
             stored.last_hello_at = Some(now_timestamp_string());
@@ -1510,7 +1469,7 @@ impl Server {
             return Ok(());
         }
         let _ = self.record_peer_connect_attempt(peer);
-        match PeerSession::connect(peer, &self.config, &self.state) {
+        match peer::PeerSession::connect(&peer.addr, &self.config, &self.state) {
             Ok(session) => {
                 let remote_hello = session.remote_hello().clone();
                 self.record_peer_connect_success(peer, &remote_hello)
@@ -1649,7 +1608,11 @@ impl Server {
 
     /// Returns the configured peer endpoints in a stable address order.
     fn peer_endpoints(&self) -> Vec<PeerEndpoint> {
-        let mut peers: Vec<_> = self.peers.values().map(|peer| peer.endpoint.clone()).collect();
+        let mut peers: Vec<_> = self
+            .peers
+            .values()
+            .map(|peer| peer.endpoint.clone())
+            .collect();
         peers.sort_by(|left, right| left.addr.cmp(&right.addr));
         peers
     }
@@ -1664,6 +1627,67 @@ impl Server {
             runtime_peer.session = None;
         }
     }
+}
+
+/// Runs one async admin transport and forwards requests into the server event loop.
+async fn run_async_admin(handle: ServerHandle, stream: tokio::net::TcpStream) -> io::Result<()> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes_read = tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        let request: AdminRequest = serde_json::from_str(line.trim_end_matches('\n'))
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let response = handle
+            .request_admin(request)
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, format!("{err:?}")))?;
+        let mut response_line = serde_json::to_string(&response)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        response_line.push('\n');
+        tokio::io::AsyncWriteExt::write_all(&mut writer, response_line.as_bytes()).await?;
+        tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+    }
+}
+
+/// Accepts one optional admin connection without duplicating select branches.
+async fn accept_optional_admin(
+    admin_listener: Option<&tokio::net::TcpListener>,
+) -> io::Result<Option<tokio::net::TcpStream>> {
+    let Some(admin_listener) = admin_listener else {
+        std::future::pending::<()>().await;
+        unreachable!();
+    };
+    let (stream, _) = admin_listener.accept().await?;
+    Ok(Some(stream))
+}
+
+/// Spawns one async peer send/recv task owned by the active server runtime.
+fn spawn_peer_task(
+    peers: &mut HashMap<String, LivePeerTask>,
+    handle: ServerHandle,
+    peer_id: String,
+    stream: tokio::net::TcpStream,
+) {
+    let peer_id_for_task = peer_id.clone();
+    let worker = tokio::spawn(async move {
+        let _ = handle.notify_peer_connected(peer_id_for_task.clone()).await;
+        peer::serve_peer_stream(peer_id_for_task.clone(), handle.clone(), stream).await;
+        let _ = handle.notify_peer_disconnected(peer_id_for_task).await;
+    });
+    peers.insert(peer_id, LivePeerTask { worker });
+}
+
+/// Spawns one async admin transport task owned by the active server runtime.
+fn spawn_admin_task(handle: ServerHandle, stream: tokio::net::TcpStream) {
+    tokio::spawn(async move {
+        let _ = run_async_admin(handle, stream).await;
+    });
 }
 
 /// Returns a small stable timestamp string for persisted peer metadata.
@@ -1697,15 +1721,6 @@ fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&RelayOrigin>) -> boo
         return peer.addr == origin_addr;
     }
     peer.node_name.as_deref() == origin.node_name.as_deref()
-}
-
-fn message_mutates_state(message: &WireMessage) -> bool {
-    matches!(
-        message,
-        WireMessage::AnnounceTx { .. }
-            | WireMessage::AnnounceBlock { .. }
-            | WireMessage::MinePending(..)
-    )
 }
 
 fn saved_block_hash(message: &WireMessage) -> Option<BlockHash> {
@@ -1774,10 +1789,7 @@ fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
 /// - `MissingParent`, when the node already has a chain but not this branch
 /// - `GenesisHasParent`, when an empty node hears about a child block before
 ///   learning the remote genesis
-fn announced_block_needs_ancestor_sync(
-    err: &NodeStateError,
-    parent_hash: BlockHash,
-) -> bool {
+fn announced_block_needs_ancestor_sync(err: &NodeStateError, parent_hash: BlockHash) -> bool {
     matches!(err, NodeStateError::Chain(ChainError::MissingParent(_)))
         || (matches!(err, NodeStateError::Chain(ChainError::GenesisHasParent))
             && parent_hash != BlockHash::default())
@@ -1851,88 +1863,11 @@ fn format_hash(hash: Option<BlockHash>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-/// Applies a short timeout to reusable outbound peer sessions.
-fn configure_outbound_peer_stream(stream: &TcpStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
-    Ok(())
-}
-
-/// Opens a short-lived outbound relay connection, completes the handshake, and
-/// sends one announcement message.
-///
-/// Relay is intentionally best effort. A small bounded retry helps with local
-/// testnet timing where the destination listener may still be unwinding a
-/// previous connection before it accepts the next one.
-#[cfg(test)]
-fn relay_to_peer(
-    peer_addr: &str,
-    config: &PeerConfig,
-    state: &NodeState,
-    message: &WireMessage,
-) -> io::Result<()> {
-    let mut last_error = None;
-    for attempt in 0..RELAY_CONNECT_ATTEMPTS {
-        match relay_to_peer_once(peer_addr, config, state, message) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                last_error = Some(err);
-                if attempt + 1 < RELAY_CONNECT_ATTEMPTS {
-                    thread::sleep(RELAY_CONNECT_RETRY_DELAY);
-                }
-            }
-        }
-    }
-
-    Err(last_error.expect("relay attempts should record an error"))
-}
-
-#[cfg(test)]
-fn relay_to_peer_once(
-    peer_addr: &str,
-    config: &PeerConfig,
-    state: &NodeState,
-    message: &WireMessage,
-) -> io::Result<()> {
-    let mut stream = net::connect(peer_addr)?;
-    configure_outbound_peer_stream(&stream)?;
-    net::send_message(
-        &mut stream,
-        &WireMessage::Hello(peer::local_hello(config, state)),
-    )?;
-    let _ = net::receive_message(&mut stream)?;
-    net::send_message(&mut stream, message)?;
-    Ok(())
-}
-
-fn receive_admin_request_from_reader<R: io::BufRead>(mut reader: R) -> io::Result<AdminRequest> {
-    let mut line = String::new();
-    let bytes_read = reader.read_line(&mut line)?;
-    if bytes_read == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "admin client closed connection",
-        ));
-    }
-    serde_json::from_str(line.trim_end_matches('\n'))
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-}
-
-fn send_admin_response(stream: &mut TcpStream, response: &AdminResponse) -> io::Result<()> {
-    let mut line = serde_json::to_string(response)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    line.push('\n');
-    use io::Write;
-    stream.write_all(line.as_bytes())?;
-    stream.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         fs, io,
-        io::{BufRead, BufReader, Write},
-        net::{TcpListener, TcpStream},
+        net::TcpListener,
         path::PathBuf,
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1943,42 +1878,21 @@ mod tests {
     };
 
     use crate::{
-        admin::{AdminRequest, AdminResponse, StatusSummary},
+        admin::{AdminRequest, AdminResponse},
         chain::ChainError,
-        crypto, net,
+        crypto,
+        mining::MiningConfig,
+        net,
         node_state::{NodeState, NodeStateError},
+        peer::{PeerConfig, relay_to_peer},
         peers::{PeerSource, StoredPeer},
-        peer::PeerConfig,
-        server::{MiningConfig, PeerEndpoint, Server},
+        server::{PeerEndpoint, Server},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
-    use super::{
-        RelayOrigin, current_unix_seconds, format_timestamp_string, peer_matches_origin,
-        relay_to_peer,
-    };
-
-    fn connected_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        (client, server)
-    }
-
-    fn read_admin_line(reader: &mut BufReader<TcpStream>) -> String {
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        line
-    }
-
-    fn read_line(reader: &mut BufReader<TcpStream>) -> String {
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        line
-    }
+    use super::{RelayOrigin, current_unix_seconds, format_timestamp_string, peer_matches_origin};
 
     fn temp_sqlite_path() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -2088,353 +2002,119 @@ mod tests {
         tx
     }
 
-    #[test]
-    fn responds_to_hello_and_get_tip_over_stream() {
-        let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_relays_announced_transaction_to_configured_peer() {
+        let sender = crypto::signing_key_from_bytes([61; 32]);
+        let recipient = crypto::signing_key_from_bytes([62; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &sender.verifying_key(),
+            0,
         );
-        let (mut client, server_stream) = connected_pair();
+        let spendable = OutPoint {
+            txid: genesis.transactions[0].txid(),
+            vout: 0,
+        };
+        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
 
-        let worker = thread::spawn(move || server.handle_stream(server_stream));
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
 
-        client
-            .write_all(
-                b"{\"type\":\"hello\",\"data\":{\"network\":\"wobble-local\",\"version\":1,\"node_name\":\"beta\",\"tip\":null,\"height\":null}}\n",
-            )
-            .unwrap();
-        client.write_all(b"{\"type\":\"get_tip\"}\n").unwrap();
-        client.flush().unwrap();
+        let remote_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let server_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let server = Server::new(
+            PeerConfig::new("wobble-local", Some("alpha".to_string()))
+                .with_advertised_addr(server_addr.to_string()),
+            state,
+        )
+        .with_peers(vec![PeerEndpoint::new(
+            remote_addr.to_string(),
+            Some("remote".to_string()),
+        )]);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let serve_task = tokio::spawn(async move {
+            server
+                .serve_listener_async(&server_listener, 4, Some(ready_tx))
+                .await
+                .unwrap()
+        });
 
-        let mut reader = BufReader::new(client);
-        let hello = WireMessage::from_json_line(&read_line(&mut reader)).unwrap();
-        let tip = WireMessage::from_json_line(&read_line(&mut reader)).unwrap();
-
-        assert_eq!(
-            hello,
-            WireMessage::Hello(HelloMessage {
+        let remote_task = tokio::spawn(async move {
+            let (stream, _) = remote_listener.accept().await.unwrap();
+            let mut reader = AsyncBufReader::new(stream);
+            let mut hello_line = String::new();
+            reader.read_line(&mut hello_line).await.unwrap();
+            let hello = WireMessage::from_json_line(&hello_line).unwrap();
+            let WireMessage::Hello(_) = hello else {
+                panic!("expected hello");
+            };
+            let mut stream = reader.into_inner();
+            let response = WireMessage::Hello(HelloMessage {
                 network: "wobble-local".to_string(),
                 version: PROTOCOL_VERSION,
-                node_name: Some("alpha".to_string()),
+                node_name: Some("remote".to_string()),
                 advertised_addr: None,
                 tip: None,
                 height: None,
-            })
-        );
-        assert_eq!(
-            tip,
-            WireMessage::Tip(TipSummary {
-                tip: None,
-                height: None,
-            })
-        );
-
-        drop(reader);
-        assert!(worker.join().unwrap().is_ok());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_peer_server_accepts_one_inbound_peer() {
-        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        );
-        let accept_task = tokio::spawn(async move {
-            let mut async_server = server.into_async_peer_server();
-            let transport = async_server
-                .accept_one_peer(&listener, "peer-1", 4)
+            });
+            stream
+                .write_all(response.to_json_line().unwrap().as_bytes())
                 .await
                 .unwrap();
-            (transport, async_server)
+            stream.flush().await.unwrap();
+            let mut reader = AsyncBufReader::new(stream);
+            let mut tx_line = String::new();
+            reader.read_line(&mut tx_line).await.unwrap();
+            WireMessage::from_json_line(&tx_line).unwrap()
         });
 
-        let mut client = TokioTcpStream::connect(addr).await.unwrap();
+        let mut client = TokioTcpStream::connect(server_addr).await.unwrap();
+        let hello = WireMessage::Hello(HelloMessage {
+            network: "wobble-local".to_string(),
+            version: PROTOCOL_VERSION,
+            node_name: Some("client".to_string()),
+            advertised_addr: None,
+            tip: None,
+            height: None,
+        });
         client
-            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .write_all(hello.to_json_line().unwrap().as_bytes())
             .await
             .unwrap();
         client.flush().await.unwrap();
-
         let mut reader = AsyncBufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-
-        assert_eq!(
-            WireMessage::from_json_line(&line).unwrap(),
-            WireMessage::Tip(TipSummary {
-                tip: None,
-                height: None,
-            })
-        );
-
-        let (transport, async_server) = accept_task.await.unwrap();
-        transport.disconnect().await.unwrap();
-        transport.join().await;
-        async_server.stop();
-        let final_state = async_server.join().await;
-        assert_eq!(final_state.tip_summary().tip, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_peer_server_serves_listener_until_stopped() {
-        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let async_server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        )
-        .into_async_peer_server();
-        let stop_handle = async_server.handle();
-        let serve_task = tokio::spawn(async move {
-            let mut async_server = async_server;
-            async_server.serve_listener(&listener, 4).await.unwrap();
-            async_server
-        });
-
-        let mut client = TokioTcpStream::connect(addr).await.unwrap();
+        let mut hello_reply = String::new();
+        reader.read_line(&mut hello_reply).await.unwrap();
+        let mut client = reader.into_inner();
         client
-            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
+            .write_all(
+                WireMessage::AnnounceTx {
+                    transaction: transaction.clone(),
+                }
+                .to_json_line()
+                .unwrap()
+                .as_bytes(),
+            )
             .await
             .unwrap();
         client.flush().await.unwrap();
+        drop(client);
 
-        let mut reader = AsyncBufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-
+        let relayed = remote_task.await.unwrap();
         assert_eq!(
-            WireMessage::from_json_line(&line).unwrap(),
-            WireMessage::Tip(TipSummary {
-                tip: None,
-                height: None,
-            })
+            relayed,
+            WireMessage::AnnounceTx {
+                transaction: transaction.clone(),
+            }
         );
 
+        let stop_handle = ready_rx.recv().unwrap();
         stop_handle.stop();
-        let async_server = serve_task.await.unwrap();
-        let final_state = async_server.join().await;
-        assert_eq!(final_state.tip_summary().tip, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_peer_server_connects_one_outbound_peer() {
-        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let remote_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut line = String::new();
-            let mut reader = AsyncBufReader::new(&mut stream);
-            reader.read_line(&mut line).await.unwrap();
-            WireMessage::from_json_line(&line).unwrap()
-        });
-
-        let mut async_server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        )
-        .into_async_peer_server();
-
-        let transport = async_server
-            .connect_one_peer(addr, "outbound-1", 4)
-            .await
-            .unwrap();
-        transport
-            .command_tx()
-            .send(crate::async_runtime::PeerCommand::Send(WireMessage::GetTip))
-            .await
-            .unwrap();
-
-        let message = remote_task.await.unwrap();
-        assert_eq!(message, WireMessage::GetTip);
-
-        transport.disconnect().await.unwrap();
-        transport.join().await;
-        async_server.stop();
-        let final_state = async_server.join().await;
-        assert_eq!(final_state.tip_summary().tip, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_peer_server_handles_admin_status_request() {
-        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let async_server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        )
-        .into_async_peer_server();
-        let stop_handle = async_server.handle();
-        let admin_task = tokio::spawn(async move {
-            let async_server = async_server;
-            let (stream, _) = listener.accept().await.unwrap();
-            async_server.handle_admin_stream(stream).await.unwrap();
-            async_server
-        });
-
-        let mut client = TokioTcpStream::connect(addr).await.unwrap();
-        let mut request = serde_json::to_string(&AdminRequest::GetStatus).unwrap();
-        request.push('\n');
-        client.write_all(request.as_bytes()).await.unwrap();
-        client.flush().await.unwrap();
-
-        let mut reader = AsyncBufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let response: AdminResponse = serde_json::from_str(line.trim_end_matches('\n')).unwrap();
-
-        assert_eq!(
-            response,
-            AdminResponse::Status(StatusSummary {
-                tip: None,
-                height: None,
-                branch_count: 0,
-                mempool_size: 0,
-                peer_count: 0,
-                mining_enabled: false,
-            })
-        );
-
-        stop_handle.stop();
-        let async_server = admin_task.await.unwrap();
-        let final_state = async_server.join().await;
-        assert_eq!(final_state.tip_summary().tip, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_peer_server_handles_admin_bootstrap_request() {
-        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let owner = crypto::signing_key_from_bytes([41; 32]);
-        let async_server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        )
-        .into_async_peer_server();
-        let stop_handle = async_server.handle();
-        let admin_task = tokio::spawn(async move {
-            let async_server = async_server;
-            let (stream, _) = listener.accept().await.unwrap();
-            async_server.handle_admin_stream(stream).await.unwrap();
-            async_server
-        });
-
-        let mut client = TokioTcpStream::connect(addr).await.unwrap();
-        let mut request = serde_json::to_string(&AdminRequest::Bootstrap {
-            public_key: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
-            blocks: 2,
-        })
-        .unwrap();
-        request.push('\n');
-        client.write_all(request.as_bytes()).await.unwrap();
-        client.flush().await.unwrap();
-
-        let mut reader = AsyncBufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let response: AdminResponse = serde_json::from_str(line.trim_end_matches('\n')).unwrap();
-
-        let AdminResponse::Bootstrapped(summary) = response else {
-            panic!("expected bootstrapped response");
-        };
-        assert_eq!(summary.blocks_mined, 2);
-        assert!(summary.last_block_hash.is_some());
-
-        stop_handle.stop();
-        let async_server = admin_task.await.unwrap();
-        let final_state = async_server.join().await;
-        assert_eq!(final_state.balance_for_key(&owner.verifying_key()), 100);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn async_peer_server_serves_peer_and_admin_listeners_until_stopped() {
-        let peer_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer_listener.local_addr().unwrap();
-        let admin_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_addr = admin_listener.local_addr().unwrap();
-        let async_server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        )
-        .into_async_peer_server();
-        let stop_handle = async_server.handle();
-        let serve_task = tokio::spawn(async move {
-            let mut async_server = async_server;
-            async_server
-                .serve_with_admin_listener(&peer_listener, &admin_listener, 4)
-                .await
-                .unwrap();
-            async_server
-        });
-
-        let mut peer_client = TokioTcpStream::connect(peer_addr).await.unwrap();
-        peer_client
-            .write_all(WireMessage::GetTip.to_json_line().unwrap().as_bytes())
-            .await
-            .unwrap();
-        peer_client.flush().await.unwrap();
-
-        let mut peer_reader = AsyncBufReader::new(peer_client);
-        let mut peer_line = String::new();
-        peer_reader.read_line(&mut peer_line).await.unwrap();
-        assert_eq!(
-            WireMessage::from_json_line(&peer_line).unwrap(),
-            WireMessage::Tip(TipSummary {
-                tip: None,
-                height: None,
-            })
-        );
-
-        let mut admin_client = TokioTcpStream::connect(admin_addr).await.unwrap();
-        let mut request = serde_json::to_string(&AdminRequest::GetStatus).unwrap();
-        request.push('\n');
-        admin_client.write_all(request.as_bytes()).await.unwrap();
-        admin_client.flush().await.unwrap();
-
-        let mut admin_reader = AsyncBufReader::new(admin_client);
-        let mut admin_line = String::new();
-        admin_reader.read_line(&mut admin_line).await.unwrap();
-        let response: AdminResponse = serde_json::from_str(admin_line.trim_end_matches('\n')).unwrap();
-        assert!(matches!(response, AdminResponse::Status(_)));
-
-        stop_handle.stop();
-        let async_server = serve_task.await.unwrap();
-        let final_state = async_server.join().await;
-        assert_eq!(final_state.tip_summary().tip, None);
-    }
-
-    #[test]
-    fn bootstrap_admin_request_mines_coinbase_blocks() {
-        let owner = crypto::signing_key_from_bytes([7; 32]);
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
-        let (mut client, server_stream) = connected_pair();
-        server_stream.set_nonblocking(true).unwrap();
-
-        let worker =
-            thread::spawn(move || server.handle_admin_stream(server_stream).map(|_| server));
-
-        let mut request = serde_json::to_string(&AdminRequest::Bootstrap {
-            public_key: crypto::verifying_key_bytes(&owner.verifying_key()).to_vec(),
-            blocks: 2,
-        })
-        .unwrap();
-        request.push('\n');
-        client.write_all(request.as_bytes()).unwrap();
-        client.flush().unwrap();
-
-        let mut reader = BufReader::new(client);
-        let response: AdminResponse =
-            serde_json::from_str(read_admin_line(&mut reader).trim_end_matches('\n')).unwrap();
-        let AdminResponse::Bootstrapped(summary) = response else {
-            panic!("expected bootstrapped response");
-        };
-        assert_eq!(summary.blocks_mined, 2);
-        assert!(summary.last_block_hash.is_some());
-
-        drop(reader);
-        let server = worker.join().unwrap().unwrap();
-        assert_eq!(server.state().balance_for_key(&owner.verifying_key()), 100);
+        let final_state = serve_task.await.unwrap();
+        assert!(final_state.mempool().get(&transaction.txid()).is_some());
     }
 
     #[test]
@@ -2452,83 +2132,15 @@ mod tests {
         let AdminResponse::Bootstrapped(summary) = response else {
             panic!("expected bootstrapped response");
         };
-        let block_hash = summary.last_block_hash.expect("bootstrap should mine one block");
+        let block_hash = summary
+            .last_block_hash
+            .expect("bootstrap should mine one block");
         let block = server
             .state()
             .get_block(&block_hash)
             .expect("mined block should be indexed");
 
         assert_eq!(block.transactions[0].lock_time, 1);
-    }
-
-    #[test]
-    fn rejects_invalid_handshake_over_stream() {
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
-        let (mut client, server_stream) = connected_pair();
-
-        let worker = thread::spawn(move || server.handle_stream(server_stream));
-
-        client
-            .write_all(
-                b"{\"type\":\"hello\",\"data\":{\"network\":\"other-net\",\"version\":1,\"node_name\":null,\"tip\":null,\"height\":null}}\n",
-            )
-            .unwrap();
-        client.flush().unwrap();
-
-        let result = worker.join().unwrap();
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn announced_transaction_reaches_server_mempool_end_to_end() {
-        let sender = crypto::signing_key_from_bytes([1; 32]);
-        let recipient = crypto::signing_key_from_bytes([2; 32]);
-        let genesis = mine_block(
-            BlockHash::default(),
-            0x207f_ffff,
-            &sender.verifying_key(),
-            0,
-        );
-        let spendable = OutPoint {
-            txid: genesis.transactions[0].txid(),
-            vout: 0,
-        };
-        let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
-        let txid = transaction.txid();
-        let mut state = NodeState::new();
-        state.accept_block(genesis).unwrap();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), state);
-        let (mut client, server_stream) = connected_pair();
-
-        let worker = thread::spawn(move || {
-            server.handle_stream(server_stream).unwrap();
-            server
-        });
-
-        // Handshake first so the server accepts later relay messages on this connection.
-        net::send_message(
-            &mut client,
-            &WireMessage::Hello(HelloMessage {
-                network: "wobble-local".to_string(),
-                version: PROTOCOL_VERSION,
-                node_name: Some("client".to_string()),
-                advertised_addr: None,
-                tip: None,
-                height: None,
-            }),
-        )
-        .unwrap();
-        let remote_hello = net::receive_message(&mut client).unwrap();
-        assert!(matches!(remote_hello, WireMessage::Hello(_)));
-
-        net::send_message(&mut client, &WireMessage::AnnounceTx { transaction }).unwrap();
-        drop(client);
-
-        let server = worker.join().unwrap();
-
-        assert!(server.state().mempool().get(&txid).is_some());
     }
 
     #[test]
@@ -2647,7 +2259,10 @@ mod tests {
             reloaded.active_utxos().len(),
             server.state().active_utxos().len()
         );
-        assert_eq!(reloaded.active_outpoints(), server.state().active_outpoints());
+        assert_eq!(
+            reloaded.active_outpoints(),
+            server.state().active_outpoints()
+        );
         assert_eq!(reloaded.mempool().len(), server.state().mempool().len());
     }
 
@@ -2711,44 +2326,6 @@ mod tests {
     }
 
     #[test]
-    fn inbound_hello_persists_peer_tip_metadata() {
-        let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
-            .with_sqlite_path(&sqlite_path);
-        let (mut client, server_stream) = connected_pair();
-
-        let worker = thread::spawn(move || server.handle_stream(server_stream).map(|_| server));
-
-        net::send_message(
-            &mut client,
-            &WireMessage::Hello(HelloMessage {
-                network: "wobble-local".to_string(),
-                version: PROTOCOL_VERSION,
-                node_name: Some("beta".to_string()),
-                advertised_addr: Some("127.0.0.1:9002".to_string()),
-                tip: Some(BlockHash::new([0x22; 32])),
-                height: Some(5),
-            }),
-        )
-        .unwrap();
-        let _ = net::receive_message(&mut client).unwrap();
-        drop(client);
-
-        let _server = worker.join().unwrap().unwrap();
-        let store = SqliteStore::open(&sqlite_path).unwrap();
-        let peers = store.load_peers().unwrap();
-        drop(store);
-        fs::remove_file(&sqlite_path).unwrap();
-
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].addr, "127.0.0.1:9002");
-        assert_eq!(peers[0].node_name.as_deref(), Some("beta"));
-        assert_eq!(peers[0].advertised_tip_hash, Some(BlockHash::new([0x22; 32])));
-        assert_eq!(peers[0].advertised_height, Some(5));
-        assert!(peers[0].last_hello_at.is_some());
-    }
-
-    #[test]
     fn select_sync_peers_prefers_highest_advertised_height_ahead_of_local_tip() {
         let mut state = NodeState::new();
         let owner = crypto::signing_key_from_bytes([1; 32]);
@@ -2760,11 +2337,12 @@ mod tests {
                 0,
             ))
             .unwrap();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), state).with_peers(vec![
-            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
-            PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
-        ]);
+        let mut server =
+            Server::new(PeerConfig::new("wobble-local", None), state).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+                PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
+            ]);
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             addr: "127.0.0.1:9001".to_string(),
             node_name: Some("alpha".to_string()),
@@ -2823,11 +2401,10 @@ mod tests {
 
     #[test]
     fn select_sync_peers_skips_recently_contacted_unknown_peer() {
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
-            .with_peers(vec![PeerEndpoint::new(
-                "127.0.0.1:9001",
-                Some("alpha".to_string()),
-            )]);
+        let mut server =
+            Server::new(PeerConfig::new("wobble-local", None), NodeState::new()).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+            ]);
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             last_connect_at: Some(format_timestamp_string(current_unix_seconds())),
             ..StoredPeer::from_endpoint(
@@ -3165,18 +2742,23 @@ mod tests {
         };
 
         let replies = server
-            .handle_message_from_peer(
+            .handle_peer_message(
+                Some(&origin),
                 WireMessage::AnnounceBlock {
                     block: child.clone(),
                 },
-                Some(&origin),
             )
             .unwrap();
         worker.join().unwrap();
 
         assert!(replies.is_empty());
         assert_eq!(server.state().chain().best_tip(), Some(child_hash));
-        assert!(server.state().get_block(&genesis.header.block_hash()).is_some());
+        assert!(
+            server
+                .state()
+                .get_block(&genesis.header.block_hash())
+                .is_some()
+        );
         assert!(server.state().get_block(&child_hash).is_some());
     }
 
@@ -3208,11 +2790,11 @@ mod tests {
         };
 
         let err = server
-            .handle_message_from_peer(
+            .handle_peer_message(
+                Some(&origin),
                 WireMessage::AnnounceBlock {
                     block: remote_genesis,
                 },
-                Some(&origin),
             )
             .unwrap_err();
 
@@ -3301,7 +2883,9 @@ mod tests {
                 WireMessage::GetTip
             );
             assert!(matches!(
-                net::receive_message_from_reader(&mut reader).unwrap_err().kind(),
+                net::receive_message_from_reader(&mut reader)
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::UnexpectedEof
             ));
         });
@@ -3353,20 +2937,19 @@ mod tests {
     }
 
     #[test]
-    fn serve_listener_stops_when_control_requests_shutdown() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
-        let control = server.control();
-
+    fn start_stops_when_handle_requests_shutdown() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            server.serve_listener(listener).unwrap();
-            server
+            Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+                .start("127.0.0.1:0", None, 4, Some(ready_tx))
+                .unwrap()
         });
 
+        let handle = ready_rx.recv().unwrap();
         thread::sleep(Duration::from_millis(100));
-        control.stop();
+        handle.stop();
 
         let stopped = worker.join().unwrap();
-        assert!(stopped.state().chain().best_tip().is_none());
+        assert!(stopped.chain().best_tip().is_none());
     }
 }

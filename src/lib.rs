@@ -1,5 +1,4 @@
 pub mod admin;
-pub mod async_runtime;
 pub mod aliases;
 pub mod chain;
 pub mod client;
@@ -8,6 +7,7 @@ pub mod crypto;
 pub mod home;
 pub mod logging;
 pub mod mempool;
+pub mod mining;
 pub mod net;
 pub mod node_state;
 pub mod peer;

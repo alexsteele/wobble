@@ -257,7 +257,10 @@ The next runtime design should separate:
 - now supports a real async inbound-peer listener loop with clean stop/join
 - now also supports dialing and managing outbound peers on the same async path
 - now also serves the local admin protocol over the async runtime
-- still excludes mining, relay integration, and SQLite integration for now
+- now can run the existing integrated mining policy by polling `MinePending` through the same state-task path
+- now owns the live async peer transport map instead of returning raw transport ownership to callers
+- updates runtime status from that live peer set so admin status reflects current peer count
+- still excludes configured-peer sync and higher-level relay/session policy for now
 
 `ServerHandle`
 - small cloneable control surface for callers and tests
@@ -267,7 +270,8 @@ The next runtime design should separate:
 - the single owner of `NodeState`
 - receives commands from peers, admin clients, and the miner
 - validates and applies all chain, mempool, and UTXO mutations
-- emits effects such as replies, relay actions, persistence, and mining updates
+- performs direct SQLite saves after successful mutating commands when a store is configured
+- emits effects such as replies, relay actions, persistence markers, and mining updates
 
 `PeerTask`
 - owns one live peer connection

@@ -1,14 +1,26 @@
-//! Minimal peer protocol handling above the raw TCP transport.
+//! Peer protocol and transport helpers for node-to-node communication.
 //!
 //! This module validates the initial handshake and handles a small set of
 //! protocol messages against local `NodeState`. The first version is
 //! intentionally conservative: it supports compatibility checks, tip queries,
 //! and block fetches before adding background relay loops or peer management.
+//! It also owns the low-level peer stream/session mechanics so `server`
+//! can stay focused on startup, event dispatch, and node-state policy.
+
+use std::{
+    io,
+    net::TcpStream,
+    time::Duration,
+};
 
 use crate::{
+    client::{ClientError, RequestError},
     mempool::MempoolError,
+    net,
     node_state::{NodeState, NodeStateError},
-    wire::{HelloMessage, MinedBlock, PROTOCOL_VERSION, WireMessage},
+    server::{RelayOrigin, ServerHandle},
+    types::{Block, BlockHash},
+    wire::{HelloMessage, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
 
 /// Local peer settings advertised during handshake.
@@ -58,6 +70,196 @@ pub fn local_hello(config: &PeerConfig, state: &NodeState) -> HelloMessage {
         height: tip.height,
     }
 }
+
+/// One reusable outbound peer session for sync and relay requests.
+#[derive(Debug)]
+pub(crate) struct PeerSession {
+    stream: TcpStream,
+    reader: io::BufReader<TcpStream>,
+    remote_hello: HelloMessage,
+}
+
+impl PeerSession {
+    /// Opens one outbound peer session and completes the protocol handshake.
+    pub(crate) fn connect(
+        peer_addr: &str,
+        config: &PeerConfig,
+        state: &NodeState,
+    ) -> Result<Self, ClientError> {
+        let tip = state.tip_summary();
+        let mut stream = net::connect(peer_addr).map_err(ClientError::Connect)?;
+        configure_outbound_peer_stream(&stream).map_err(ClientError::Connect)?;
+        let reader_stream = stream.try_clone().map_err(ClientError::Connect)?;
+        net::send_message(&mut stream, &WireMessage::Hello(HelloMessage {
+            network: config.network.clone(),
+            version: PROTOCOL_VERSION,
+            node_name: config.node_name.clone(),
+            advertised_addr: None,
+            tip: tip.tip,
+            height: tip.height,
+        }))
+        .map_err(ClientError::SendHello)?;
+        let remote_hello = net::receive_message_from_reader(io::BufReader::new(reader_stream))
+            .map_err(ClientError::ReceiveHello)?;
+        let WireMessage::Hello(remote_hello) = remote_hello else {
+            return Err(ClientError::UnexpectedHandshake(remote_hello));
+        };
+        let session_reader = io::BufReader::new(
+            stream
+                .try_clone()
+                .expect("connected peer stream should clone for session reader"),
+        );
+        Ok(Self {
+            stream,
+            reader: session_reader,
+            remote_hello,
+        })
+    }
+
+    /// Returns the remote peer identity learned during the outbound handshake.
+    pub(crate) fn remote_hello(&self) -> &HelloMessage {
+        &self.remote_hello
+    }
+
+    /// Requests the peer's current best-tip summary on an existing session.
+    pub(crate) fn request_tip(&mut self) -> Result<TipSummary, RequestError> {
+        net::send_message(&mut self.stream, &WireMessage::GetTip).map_err(RequestError::Send)?;
+        let reply =
+            net::receive_message_from_reader(&mut self.reader).map_err(RequestError::Receive)?;
+        let WireMessage::Tip(summary) = reply else {
+            return Err(RequestError::UnexpectedResponse(reply));
+        };
+        Ok(summary)
+    }
+
+    /// Requests one specific block from the connected peer.
+    pub(crate) fn request_block(
+        &mut self,
+        block_hash: BlockHash,
+    ) -> Result<Option<Block>, RequestError> {
+        net::send_message(&mut self.stream, &WireMessage::GetBlock { block_hash })
+            .map_err(RequestError::Send)?;
+        let reply =
+            net::receive_message_from_reader(&mut self.reader).map_err(RequestError::Receive)?;
+        let WireMessage::Block { block } = reply else {
+            return Err(RequestError::UnexpectedResponse(reply));
+        };
+        Ok(block)
+    }
+
+    /// Sends one announcement over the existing session without reopening it.
+    pub(crate) fn announce(&mut self, message: &WireMessage) -> io::Result<()> {
+        net::send_message(&mut self.stream, message)
+    }
+}
+
+/// Runs one async peer stream and forwards decoded messages into the server.
+pub(crate) async fn serve_peer_stream(
+    peer_id: String,
+    handle: ServerHandle,
+    stream: tokio::net::TcpStream,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut line = String::new();
+    let mut origin = RelayOrigin::default();
+
+    loop {
+        line.clear();
+        let bytes_read = match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        let message = match WireMessage::from_json_line(&line) {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+        if let WireMessage::Hello(remote_hello) = &message {
+            origin = RelayOrigin {
+                advertised_addr: remote_hello.advertised_addr.clone(),
+                node_name: remote_hello.node_name.clone(),
+            };
+        }
+        let replies = match handle
+            .request_peer_message(peer_id.clone(), Some(origin.clone()), message)
+            .await
+        {
+            Ok(Ok(replies)) => replies,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        for reply in replies {
+            let line = match reply.to_json_line() {
+                Ok(line) => line,
+                Err(_) => return,
+            };
+            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Opens a short-lived outbound relay connection, completes the handshake, and
+/// sends one announcement message.
+#[cfg(test)]
+pub(crate) fn relay_to_peer(
+    peer_addr: &str,
+    config: &PeerConfig,
+    state: &NodeState,
+    message: &WireMessage,
+) -> io::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..RELAY_CONNECT_ATTEMPTS {
+        match relay_to_peer_once(peer_addr, config, state, message) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt + 1 < RELAY_CONNECT_ATTEMPTS {
+                    std::thread::sleep(RELAY_CONNECT_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("relay attempts should record an error"))
+}
+
+#[cfg(test)]
+fn relay_to_peer_once(
+    peer_addr: &str,
+    config: &PeerConfig,
+    state: &NodeState,
+    message: &WireMessage,
+) -> io::Result<()> {
+    let mut stream = net::connect(peer_addr)?;
+    configure_outbound_peer_stream(&stream)?;
+    net::send_message(&mut stream, &WireMessage::Hello(local_hello(config, state)))?;
+    let _ = net::receive_message(&mut stream)?;
+    net::send_message(&mut stream, message)?;
+    Ok(())
+}
+
+/// Applies a short timeout to reusable outbound peer sessions.
+fn configure_outbound_peer_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
+    Ok(())
+}
+
+const OUTBOUND_PEER_IO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const RELAY_CONNECT_ATTEMPTS: usize = 3;
+#[cfg(test)]
+const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 /// Handles one incoming wire message and returns any immediate protocol replies.
 ///

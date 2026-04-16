@@ -23,10 +23,11 @@ use wobble::{
     crypto,
     home::{MiningSection, NodeConfig, NodeHome},
     logging, net,
+    mining::MiningConfig,
     node_state::{NodeState, build_payment_transaction},
     peer::PeerConfig,
     peers,
-    server::{MiningConfig, Server},
+    server::Server,
     sqlite_store::SqliteStore,
     tx_index::{IndexedTransaction, IndexedTransactionStatus, TransactionKeyRole},
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
@@ -517,13 +518,16 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     let config_file = home
         .load_config()
         .map_err(|err| format!("config load failed: {err:?}"))?;
-    let runtime = resolve_serve_runtime(&config_file, &command);
+    let serve_runtime = resolve_serve_runtime(&config_file, &command);
     let sqlite_path = home.state_path();
     let state = SqliteStore::open(&sqlite_path)
         .and_then(|store| store.load_node_state())
         .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
-    let config = PeerConfig::new(runtime.network.clone(), runtime.node_name.clone())
-        .with_advertised_addr(&runtime.listen_addr);
+    let config = PeerConfig::new(
+        serve_runtime.network.clone(),
+        serve_runtime.node_name.clone(),
+    )
+    .with_advertised_addr(&serve_runtime.listen_addr);
     let peer_path = command
         .peers_path
         .clone()
@@ -544,10 +548,11 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         command = "serve",
         home = %home.root().display(),
         sqlite_path = %sqlite_path.display(),
-        listen_addr = runtime.listen_addr,
-        network = runtime.network,
+        listen_addr = serve_runtime.listen_addr,
+        network = serve_runtime.network,
         peer_count = peer_endpoints.len(),
         mining = mining.is_some(),
+        serve_mode = "async",
         best_tip = %format_hash(server.state().chain().best_tip()),
         "starting server"
     );
@@ -556,9 +561,9 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     println!("bootstrap source: sqlite");
     println!("config: {}", home.config_path().display());
     println!("logs dir: {}", home.logs_dir().display());
-    println!("listen addr: {}", runtime.listen_addr);
+    println!("listen addr: {}", serve_runtime.listen_addr);
     println!("admin addr: {}", config_file.admin_addr);
-    println!("network: {}", runtime.network);
+    println!("network: {}", serve_runtime.network);
     if let Some(name) = server.config().node_name.as_deref() {
         println!("node name: {name}");
     }
@@ -583,8 +588,15 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         }
     }
 
+    println!("serve mode: async");
     server
-        .serve_with_admin(&runtime.listen_addr, &config_file.admin_addr)
+        .start(
+            &serve_runtime.listen_addr,
+            Some(&config_file.admin_addr),
+            64,
+            None,
+        )
+        .map(|_| ())
         .map_err(|err| format!("server failed: {err}"))
 }
 

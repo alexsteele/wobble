@@ -114,6 +114,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -121,16 +122,20 @@ mod tests {
 
     use super::{AliasBook, load_alias_book, save_alias_book};
 
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
     fn temp_alias_path() -> PathBuf {
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time is after unix epoch")
             .as_nanos();
+        let unique = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         path.push(format!(
-            "wobble-alias-test-{}-{}.json",
+            "wobble-alias-test-{}-{}-{}.json",
             std::process::id(),
-            nanos
+            nanos,
+            unique
         ));
         path
     }

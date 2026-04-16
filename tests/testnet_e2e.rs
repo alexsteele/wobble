@@ -13,16 +13,17 @@ use std::{
     fs,
     net::TcpListener,
     path::PathBuf,
-    sync::Mutex,
+    sync::{Mutex, mpsc},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use wobble::{
+    admin::{AdminRequest, AdminResponse, StatusSummary},
     crypto, net,
     node_state::NodeState,
     peer::PeerConfig,
-    server::{PeerEndpoint, Server},
+    server::{PeerEndpoint, Server, ServerHandle},
     sqlite_store::SqliteStore,
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
     wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
@@ -167,8 +168,13 @@ enum NodeBootstrap {
 }
 
 struct RunningNode {
-    control: wobble::server::ServerControl,
-    worker: thread::JoinHandle<Server>,
+    name: String,
+    control: ServerHandle,
+    worker: thread::JoinHandle<NodeState>,
+}
+
+struct StoppedNode {
+    state: NodeState,
 }
 
 impl TestNet {
@@ -231,6 +237,7 @@ impl TestNet {
         let peer_endpoints = self.peer_endpoints(name);
         let node = self.nodes.get_mut(name).unwrap();
         let listener = node.listener.take().unwrap();
+        drop(listener);
         let (state, sqlite_path) = match bootstrap {
             NodeBootstrap::State(state) => (state, None),
             NodeBootstrap::Persisted => {
@@ -246,7 +253,7 @@ impl TestNet {
             }
         };
         let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some(node.name.clone())).with_advertised_addr(addr),
+            PeerConfig::new("wobble-local", Some(node.name.clone())).with_advertised_addr(&addr),
             state,
         )
         .with_peers(peer_endpoints)
@@ -254,15 +261,15 @@ impl TestNet {
         if let Some(sqlite_path) = sqlite_path.as_deref() {
             server = server.with_sqlite_path(sqlite_path);
         }
-        let control = server.control();
+        let (control_tx, control_rx) = mpsc::channel();
 
-        RunningNode {
-            control,
-            worker: thread::spawn(move || {
-                server.serve_listener(listener).unwrap();
-                server
-            }),
-        }
+        let running = RunningNode {
+            name: name.to_string(),
+            worker: thread::spawn(move || server.start(&addr, None, 64, Some(control_tx)).unwrap()),
+            control: control_rx.recv().unwrap(),
+        };
+        self.wait_until_serving(name);
+        running
     }
 
     fn restart(&mut self, name: &str) -> RunningNode {
@@ -280,6 +287,7 @@ impl TestNet {
         let mut client = connect_and_handshake(self.addr(node_name), "submitter");
         net::send_message(&mut client, &WireMessage::AnnounceTx { transaction }).unwrap();
         drop(client);
+        thread::sleep(Duration::from_millis(500));
     }
 
     fn mine_pending(&self, node_name: &str, miner: &ed25519_dalek::SigningKey) -> BlockHash {
@@ -303,15 +311,78 @@ impl TestNet {
         block_hash
     }
 
-    fn sync_delay(&self) {
-        thread::sleep(Duration::from_millis(100));
+    /// Waits until one node has completed async startup and is serving.
+    ///
+    /// Async startup now includes bootstrap sync before the listener enters its
+    /// main accept loop, so a successful tip request means the node is ready
+    /// for the rest of the scenario.
+    fn wait_until_serving(&self, node_name: &str) {
+        let addr = self.addr(node_name).to_string();
+        for _ in 0..40 {
+            if let Ok(mut stream) = net::connect(&addr) {
+                if net::send_message(&mut stream, &WireMessage::GetTip).is_ok()
+                    && net::receive_message(&mut stream).is_ok()
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("node {node_name} did not start serving in time");
     }
 }
 
 impl RunningNode {
-    fn stop(self) -> Server {
+    /// Returns the current admin status from the running async server.
+    fn status(&self) -> StatusSummary {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            match self.control.request_admin(AdminRequest::GetStatus).await.unwrap() {
+                AdminResponse::Status(status) => status,
+                other => panic!("unexpected admin response: {other:?}"),
+            }
+        })
+    }
+
+    /// Waits until the running node reports one specific best tip.
+    fn wait_until_tip(&self, expected_tip: BlockHash) {
+        for _ in 0..120 {
+            if self.status().tip == Some(expected_tip) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("node {} did not reach expected tip {expected_tip}", self.name);
+    }
+
+    /// Waits until the running node reports one specific mempool size.
+    fn wait_until_mempool_size(&self, expected_size: usize) {
+        for _ in 0..120 {
+            if self.status().mempool_size == expected_size {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "node {} did not reach expected mempool size {expected_size}",
+            self.name
+        );
+    }
+
+    fn stop(self) -> StoppedNode {
         self.control.stop();
-        self.worker.join().unwrap()
+        StoppedNode {
+            state: self.worker.join().unwrap(),
+        }
+    }
+}
+
+impl StoppedNode {
+    fn state(&self) -> &NodeState {
+        &self.state
     }
 }
 
@@ -347,9 +418,10 @@ fn proposer_transaction_reaches_miner_and_returns_as_a_block() {
     let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state));
 
     testnet.submit_payment("proposer", payment.clone());
-    testnet.sync_delay();
+    miner_server.wait_until_mempool_size(1);
     let block_hash = testnet.mine_pending("miner", &miner);
-    testnet.sync_delay();
+    proposer.wait_until_tip(block_hash);
+    miner_server.wait_until_tip(block_hash);
 
     let proposer = proposer.stop();
     let miner_server = miner_server.stop();
@@ -456,9 +528,10 @@ fn restarted_proposer_loads_persisted_payment_and_accepts_relayed_block() {
 
     let restarted_proposer = testnet.restart("proposer");
 
-    testnet.sync_delay();
+    miner_server.wait_until_mempool_size(1);
     let block_hash = testnet.mine_pending("miner", &miner);
-    testnet.sync_delay();
+    restarted_proposer.wait_until_tip(block_hash);
+    miner_server.wait_until_tip(block_hash);
 
     let restarted_proposer = restarted_proposer.stop();
     let miner_server = miner_server.stop();
@@ -531,9 +604,12 @@ fn multi_hop_relay_carries_payment_to_miner_and_block_back_to_proposer() {
     let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state));
 
     testnet.submit_payment("proposer", payment.clone());
-    testnet.sync_delay();
+    relay_server.wait_until_mempool_size(1);
+    miner_server.wait_until_mempool_size(1);
     let block_hash = testnet.mine_pending("miner", &miner);
-    testnet.sync_delay();
+    proposer.wait_until_tip(block_hash);
+    relay_server.wait_until_tip(block_hash);
+    miner_server.wait_until_tip(block_hash);
 
     let proposer = proposer.stop();
     let relay_server = relay_server.stop();
@@ -688,9 +764,10 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
     let miner_server = testnet.start("miner", NodeBootstrap::State(miner_state));
 
     testnet.submit_payment("proposer", payment.clone());
-    testnet.sync_delay();
+    miner_server.wait_until_mempool_size(1);
     let block_hash = testnet.mine_pending("miner", &miner);
-    testnet.sync_delay();
+    proposer.wait_until_tip(block_hash);
+    miner_server.wait_until_tip(block_hash);
 
     let observer =
         testnet.start_with_sync("observer", NodeBootstrap::State(observer_state), true);
@@ -760,9 +837,10 @@ fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
     let observer = testnet.start("observer", NodeBootstrap::State(observer_state));
 
     testnet.submit_payment("proposer", payment.clone());
-    testnet.sync_delay();
+    miner_server.wait_until_mempool_size(1);
     let block_hash = testnet.mine_pending("miner", &miner);
-    testnet.sync_delay();
+    proposer.wait_until_tip(block_hash);
+    miner_server.wait_until_tip(block_hash);
 
     let reply = send_hello(
         testnet.addr("observer"),
@@ -775,6 +853,7 @@ fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
             height: Some(1),
         },
     );
+    observer.wait_until_tip(block_hash);
     let proposer = proposer.stop();
     let observer = observer.stop();
     let miner_server = miner_server.stop();
