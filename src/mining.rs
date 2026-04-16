@@ -2,15 +2,20 @@
 //!
 //! This module keeps the simple testnet mining configuration separate from the
 //! server's startup and event-dispatch logic. The server still owns node state
-//! and decides how mined blocks are applied, but mining cadence and request
-//! construction live here.
+//! and decides how mined blocks are applied, but mining cadence, request
+//! construction, and block assembly live here.
 
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
 use tokio::task::JoinHandle;
 
-use crate::{consensus::BLOCK_SUBSIDY, server::ServerHandle};
+use crate::{
+    consensus::{self, BLOCK_SUBSIDY},
+    crypto,
+    server::ServerHandle,
+    types::{Block, BlockHash, BlockHeader, Transaction, TxOut},
+};
 
 /// Background testnet mining configuration for a serving node.
 #[derive(Debug, Clone)]
@@ -85,4 +90,67 @@ pub(crate) fn spawn_mining_loop(
             }
         }
     }))
+}
+
+/// Builds a coinbase transaction paying `reward` to `miner_verifying_key`.
+///
+/// `uniqueness` is stored in `lock_time` so locally mined coinbases stay
+/// distinct even when they otherwise have the same shape.
+fn coinbase_transaction(
+    reward: u64,
+    miner_verifying_key: &VerifyingKey,
+    uniqueness: u32,
+) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: Vec::new(),
+        outputs: vec![TxOut {
+            value: reward,
+            locking_data: crypto::verifying_key_bytes(miner_verifying_key).to_vec(),
+        }],
+        lock_time: uniqueness,
+    }
+}
+
+/// Builds and mines one block by searching nonces until the header satisfies `bits`.
+///
+/// The caller supplies the parent hash, total coinbase reward, miner key, and
+/// already-selected non-coinbase transactions. This helper prepends the
+/// coinbase, computes the Merkle root, and then increments the nonce until the
+/// block passes proof-of-work validation.
+pub fn mine_block(
+    prev_blockhash: BlockHash,
+    reward: u64,
+    miner_verifying_key: &VerifyingKey,
+    uniqueness: u32,
+    bits: u32,
+    mut transactions: Vec<Transaction>,
+) -> Block {
+    let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
+    full_transactions.push(coinbase_transaction(
+        reward,
+        miner_verifying_key,
+        uniqueness,
+    ));
+    full_transactions.append(&mut transactions);
+
+    let mut block = Block {
+        header: BlockHeader {
+            version: 1,
+            prev_blockhash,
+            merkle_root: [0; 32],
+            time: 1,
+            bits,
+            nonce: 0,
+        },
+        transactions: full_transactions,
+    };
+    block.header.merkle_root = block.merkle_root();
+
+    loop {
+        if consensus::validate_block(&block).is_ok() {
+            return block;
+        }
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
 }

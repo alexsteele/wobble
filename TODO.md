@@ -2,23 +2,21 @@
 
 ## Async Runtime
 
-- Wrap a real Tokio `TcpStream` with `PeerTransport`.
-- Port one inbound peer connection path onto the async runtime while keeping the synchronous server as the fallback path.
-- Teach the runtime coordinator to own live peer registrations instead of tests wiring them manually.
-- Route persistence from `StateEffect::Persist` into the incremental SQLite save path.
-- Hook the miner thread into `StartMiningJob` / `StopMining` instead of mining through the synchronous serve loop.
-- Reduce hello chatter once long-lived async peer sessions are in place.
+- Clean up the remaining server/runtime naming now that async transport is the only path.
+- Add explicit peer lifecycle state around connect, backoff, and shutdown.
+- Reduce hello chatter further by preferring already-connected peers for sync and relay.
 
 ## Protocol And Sync
 
-- Persistent peer connections
 - Move from one-shot sync triggers toward a more continuous background sync loop.
+- Prefer connected peers by advertised height before dialing a fresh peer.
+- Add a simple peer inventory / announcement policy so we do less full-object gossip over time.
 - Add block and transaction import/export formats for easier testing.
 
 ## State
 
 - Owner-to-UTXO index for balance operations
-- Incremental saves. No huge snapshots.
+- Finish incremental saves so sync/reorg paths do not fall back to full node snapshots.
 
 ## CLI Ergonomics
 
@@ -28,7 +26,7 @@
 
 ## Observability
 
-- Post-transition state logging (tip/mempool size)
+- Add richer peer lifecycle logging around connect, disconnect, sync start, and sync backoff.
 - Log file rotation
 
 ## Testing

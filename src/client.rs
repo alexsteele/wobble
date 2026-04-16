@@ -11,7 +11,7 @@ use std::{io, net::TcpStream, time::Duration};
 
 use crate::{
     net,
-    peer::PeerConfig,
+    server::ServerConfig,
     types::Transaction,
     wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
@@ -49,7 +49,7 @@ pub enum RequestError {
 /// accept inbound relay connections.
 pub fn connect_and_handshake(
     peer_addr: &str,
-    config: &PeerConfig,
+    config: &ServerConfig,
 ) -> Result<(TcpStream, HelloMessage), ClientError> {
     let mut stream = net::connect(peer_addr).map_err(ClientError::Connect)?;
     configure_outbound_stream(&stream).map_err(ClientError::Connect)?;
@@ -80,7 +80,7 @@ fn configure_outbound_stream(stream: &TcpStream) -> io::Result<()> {
 
 /// Opens a one-shot connection, asks the peer for its current best tip, and
 /// returns the advertised summary.
-pub fn request_tip(peer_addr: &str, config: &PeerConfig) -> Result<TipSummary, RequestError> {
+pub fn request_tip(peer_addr: &str, config: &ServerConfig) -> Result<TipSummary, RequestError> {
     let (mut stream, _) =
         connect_and_handshake(peer_addr, config).map_err(RequestError::Handshake)?;
     net::send_message(&mut stream, &WireMessage::GetTip).map_err(RequestError::Send)?;
@@ -95,7 +95,7 @@ pub fn request_tip(peer_addr: &str, config: &PeerConfig) -> Result<TipSummary, R
 /// the remote response, which may be `None` when the peer does not know it.
 pub fn request_block(
     peer_addr: &str,
-    config: &PeerConfig,
+    config: &ServerConfig,
     block_hash: crate::types::BlockHash,
 ) -> Result<Option<crate::types::Block>, RequestError> {
     let (mut stream, _) =
@@ -116,7 +116,7 @@ pub fn request_block(
 /// the transaction was delivered over a successful protocol session.
 pub fn announce_transaction(
     peer_addr: &str,
-    config: &PeerConfig,
+    config: &ServerConfig,
     transaction: Transaction,
 ) -> Result<(), RequestError> {
     let (mut stream, _) =
@@ -136,7 +136,7 @@ mod tests {
             connect_and_handshake, request_block, request_tip,
         },
         net,
-        peer::PeerConfig,
+        server::ServerConfig,
         types::{Block, BlockHash, BlockHeader, Transaction},
         wire::{HelloMessage, TipSummary, WireMessage},
     };
@@ -190,7 +190,11 @@ mod tests {
 
         let (stream, remote) = connect_and_handshake(
             &addr,
-            &PeerConfig::new("wobble-local", Some("client".to_string())),
+            &ServerConfig::new(
+                "wobble-local",
+                Some("client".to_string()),
+                "127.0.0.1:9000",
+            ),
         )
         .unwrap();
         drop(stream);
@@ -210,7 +214,9 @@ mod tests {
             net::send_message(&mut stream, &WireMessage::GetTip).unwrap();
         });
 
-        let err = connect_and_handshake(&addr, &PeerConfig::new("wobble-local", None)).unwrap_err();
+        let err =
+            connect_and_handshake(&addr, &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"))
+                .unwrap_err();
         worker.join().unwrap();
 
         assert!(matches!(
@@ -231,7 +237,9 @@ mod tests {
             ));
         });
 
-        let err = connect_and_handshake(&addr, &PeerConfig::new("wobble-local", None)).unwrap_err();
+        let err =
+            connect_and_handshake(&addr, &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"))
+                .unwrap_err();
         worker.join().unwrap();
 
         assert!(matches!(
@@ -272,7 +280,8 @@ mod tests {
             .unwrap();
         });
 
-        let summary = request_tip(&addr, &PeerConfig::new("wobble-local", None)).unwrap();
+        let summary = request_tip(&addr, &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"))
+            .unwrap();
         worker.join().unwrap();
 
         assert_eq!(summary.tip, Some(BlockHash::new([0x55; 32])));
@@ -307,7 +316,12 @@ mod tests {
         });
 
         let fetched =
-            request_block(&addr, &PeerConfig::new("wobble-local", None), block_hash).unwrap();
+            request_block(
+                &addr,
+                &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"),
+                block_hash,
+            )
+            .unwrap();
         worker.join().unwrap();
 
         assert_eq!(fetched, Some(expected));
@@ -336,7 +350,9 @@ mod tests {
             net::send_message(&mut stream, &WireMessage::GetTip).unwrap();
         });
 
-        let err = request_tip(&addr, &PeerConfig::new("wobble-local", None)).unwrap_err();
+        let err =
+            request_tip(&addr, &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"))
+                .unwrap_err();
         worker.join().unwrap();
 
         assert!(matches!(
@@ -378,7 +394,12 @@ mod tests {
             }
         });
 
-        announce_transaction(&addr, &PeerConfig::new("wobble-local", None), expected).unwrap();
+        announce_transaction(
+            &addr,
+            &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"),
+            expected,
+        )
+        .unwrap();
         worker.join().unwrap();
     }
 }

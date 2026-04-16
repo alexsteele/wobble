@@ -13,10 +13,10 @@ use crate::{
     consensus::{self, ConsensusError},
     crypto,
     mempool::{Mempool, MempoolError},
+    mining,
     state::{UtxoSet, ValidationError},
     types::{
-        Amount, Block, BlockHash, BlockHeader, BlockHeight, OutPoint, Transaction, TxIn, TxOut,
-        Txid,
+        Amount, Block, BlockHash, BlockHeight, OutPoint, Transaction, TxIn, TxOut, Txid,
     },
     wire::TipSummary,
 };
@@ -179,7 +179,7 @@ impl NodeState {
                 })
             })
             .map_err(NodeStateError::ConsensusFee)?;
-        let block = mine_block_from_transactions(
+        let block = mining::mine_block(
             prev,
             subsidy + total_fees,
             miner_verifying_key,
@@ -353,59 +353,6 @@ pub fn build_payment_transaction(
     }
 
     Ok(tx)
-}
-
-fn coinbase_transaction(
-    reward: u64,
-    miner_verifying_key: &VerifyingKey,
-    uniqueness: u32,
-) -> Transaction {
-    Transaction {
-        version: 1,
-        inputs: Vec::new(),
-        outputs: vec![TxOut {
-            value: reward,
-            locking_data: crypto::verifying_key_bytes(miner_verifying_key).to_vec(),
-        }],
-        lock_time: uniqueness,
-    }
-}
-
-fn mine_block_from_transactions(
-    prev_blockhash: BlockHash,
-    reward: u64,
-    miner_verifying_key: &VerifyingKey,
-    uniqueness: u32,
-    bits: u32,
-    mut transactions: Vec<Transaction>,
-) -> Block {
-    let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
-    full_transactions.push(coinbase_transaction(
-        reward,
-        miner_verifying_key,
-        uniqueness,
-    ));
-    full_transactions.append(&mut transactions);
-
-    let mut block = Block {
-        header: BlockHeader {
-            version: 1,
-            prev_blockhash,
-            merkle_root: [0; 32],
-            time: 1,
-            bits,
-            nonce: 0,
-        },
-        transactions: full_transactions,
-    };
-    block.header.merkle_root = block.merkle_root();
-
-    loop {
-        if consensus::validate_block(&block).is_ok() {
-            return block;
-        }
-        block.header.nonce = block.header.nonce.wrapping_add(1);
-    }
 }
 
 #[cfg(test)]

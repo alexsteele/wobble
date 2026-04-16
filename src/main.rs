@@ -25,9 +25,8 @@ use wobble::{
     logging, net,
     mining::MiningConfig,
     node_state::{NodeState, build_payment_transaction},
-    peer::PeerConfig,
     peers,
-    server::Server,
+    server::{Server, ServerConfig},
     sqlite_store::SqliteStore,
     tx_index::{IndexedTransaction, IndexedTransactionStatus, TransactionKeyRole},
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
@@ -523,9 +522,10 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     let state = SqliteStore::open(&sqlite_path)
         .and_then(|store| store.load_node_state())
         .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
-    let config = PeerConfig::new(
+    let server_config = ServerConfig::new(
         serve_runtime.network.clone(),
         serve_runtime.node_name.clone(),
+        serve_runtime.listen_addr.clone(),
     )
     .with_advertised_addr(&serve_runtime.listen_addr);
     let peer_path = command
@@ -536,7 +536,7 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         .map_err(|err| format!("peer config load failed: {err:?}"))?;
     let mining_runtime = resolve_mining_runtime(&home, &config_file.mining, &command)?;
     let mining = build_mining_config(&mining_runtime)?;
-    let mut server = Server::new(config, state)
+    let mut server = Server::new(server_config.clone(), state)
         .with_peers(peer_endpoints.clone())
         .with_sqlite_path(&sqlite_path)
         .with_bootstrap_sync(true);
@@ -591,9 +591,9 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     println!("serve mode: async");
     server
         .start(
-            &serve_runtime.listen_addr,
-            Some(&config_file.admin_addr),
-            64,
+            server_config
+                .with_admin_addr(config_file.admin_addr.clone())
+                .with_channel_capacity(64),
             None,
         )
         .map(|_| ())
@@ -888,7 +888,7 @@ fn run_inspect(command: InspectCommand) -> Result<(), String> {
             Ok(())
         }
         InspectCommand::Tip(command) => {
-            let config = PeerConfig::new(command.network, command.node_name);
+            let config = ServerConfig::new(command.network, command.node_name, "0.0.0.0:0");
             let (mut stream, remote_hello) =
                 client::connect_and_handshake(&command.peer_addr, &config)
                     .map_err(|err| format!("handshake failed: {err:?}"))?;
@@ -1070,7 +1070,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
                 command.sender_wallet.as_deref(),
             )?;
             let recipient_verifying_key = parse_public_key_or_alias(&command.recipient)?;
-            let config = PeerConfig::new(command.network, command.node_name);
+            let config = ServerConfig::new(command.network, command.node_name, "0.0.0.0:0");
             let sender_wallet = wallet::load_wallet(&sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let mut local_state = load_sqlite_state(&sqlite_path)?;
@@ -1099,7 +1099,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
         DebugCommand::MinePendingRemote(command) => {
             let miner_wallet_path =
                 resolve_wallet_path(command.home.as_deref(), command.miner_wallet.as_deref())?;
-            let config = PeerConfig::new(command.network, command.node_name);
+            let config = ServerConfig::new(command.network, command.node_name, "0.0.0.0:0");
             let miner_wallet = wallet::load_wallet(&miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let (mut stream, _) = client::connect_and_handshake(&command.peer_addr, &config)

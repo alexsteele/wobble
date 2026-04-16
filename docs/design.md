@@ -146,30 +146,33 @@ Non-goals for v1:
 
 ## Runtime Semantics
 
-The current server runtime is still mostly synchronous.
+The runtime is split into two layers:
+
+- Tokio owns inbound peer listeners, the localhost admin listener, and each live
+  peer socket task
+- one dedicated server event-loop thread owns `NodeState`, persistence, sync
+  policy, relay policy, and mining decisions
 
 Important implications:
-- one inbound peer stream is handled at a time
-- inbound connections are accepted sequentially
-- this keeps mutation and reasoning simple, but it limits how aggressively the
-  node can hold open peer sockets today
+- inbound peers are handled concurrently at the transport layer
+- chain and mempool mutation still happen in one place, which keeps state
+  transitions easy to reason about
+- outbound peer traffic now also runs through async tasks, but the server talks
+  to those peers through simple request/reply handles
 
-Current outbound session policy:
-- sync may reuse one short-lived outbound session for `get_tip` plus any needed
-  `get_block` requests in that sync pass
-- relay is still effectively one-shot per high-level announcement
-
-Why relay is not yet long-lived:
-- with the current single-stream serve loop, a long-lived inbound relay socket
-  can monopolize the remote node's stream handler
-- that blocks later inbound peer or client connections until the relay socket closes
+Current outbound connection policy:
+- sync reuses one connected outbound peer for `get_tip` plus any needed
+  `get_block` requests
+- relay currently reconnects per announcement because the protocol does not yet
+  have an explicit ack or liveness signal for one-way relay messages
+- broken outbound connections are dropped and re-established on demand
 
 Lifecycle controls:
-- `disconnect()` drops cached outbound peer sessions without stopping the server
-- `stop()` ends the serve loop and closes outbound sessions during shutdown
+- `disconnect()` drops cached outbound peer connections without stopping the server
+- `stop()` ends the serve loop and closes outbound peers during shutdown
 
-These controls now drive the local TCP integration harness instead of relying
-on guessed connection counts.
+This keeps the concurrency boundary at the edges while the core server logic
+still reads like a single authoritative event loop.
 
 ## Mining
 

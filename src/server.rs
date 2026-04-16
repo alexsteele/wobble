@@ -1,19 +1,4 @@
-//! Minimal peer server that owns node state and protocol configuration.
-//!
-//! This module ties together the raw TCP transport in `net`, the message
-//! semantics in `peer`, and the mutable blockchain state in `NodeState`.
-//! The first version is intentionally single-threaded and handles one stream at
-//! a time so the protocol loop stays easy to reason about during early
-//! networking work. It now also supports an optional bootstrap sync pass that
-//! can pull missing blocks from configured peers before the main accept loop.
-//!
-//! When integrated mining is enabled, the server reuses the existing
-//! `MinePending` message path instead of maintaining a separate mining engine.
-//! The serve loop polls for inbound connections, and during idle intervals it
-//! builds an internal `MinePending` request from `MiningConfig` and feeds that
-//! request back through normal message handling. That keeps mining,
-//! persistence, relay, and logging behavior aligned with externally triggered
-//! `mine_pending` requests.
+//! Server manages the chain, sync protocol, and mining (if enabled).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -29,6 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::{
+    runtime::Handle as TokioHandle,
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
@@ -42,7 +28,7 @@ use crate::{
     mempool::MempoolError,
     mining::{MiningConfig, spawn_mining_loop},
     node_state::{NodeState, NodeStateError},
-    peer::{self, PeerConfig, PeerError},
+    peer::{self, PeerError},
     peers::{PeerSource, StoredPeer},
     sqlite_store::{self, SqliteStoreError},
     types::{Block, BlockHash, Txid},
@@ -65,6 +51,54 @@ impl PeerEndpoint {
             addr: addr.into(),
             node_name,
         }
+    }
+}
+
+/// Server settings for one running node instance.
+///
+/// This is the single config object for the server. It carries both the local
+/// protocol identity advertised to peers and the runtime listener settings used
+/// when the process starts serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub network: String,
+    pub node_name: Option<String>,
+    pub advertised_addr: Option<String>,
+    pub listen_addr: String,
+    pub admin_addr: Option<String>,
+    pub channel_capacity: usize,
+}
+
+impl ServerConfig {
+    pub fn new(
+        network: impl Into<String>,
+        node_name: Option<String>,
+        listen_addr: impl Into<String>,
+    ) -> Self {
+        Self {
+            network: network.into(),
+            node_name,
+            advertised_addr: None,
+            listen_addr: listen_addr.into(),
+            admin_addr: None,
+            channel_capacity: 64,
+        }
+    }
+
+    /// Records the listener address this node should advertise during handshake.
+    pub fn with_advertised_addr(mut self, advertised_addr: impl Into<String>) -> Self {
+        self.advertised_addr = Some(advertised_addr.into());
+        self
+    }
+
+    pub fn with_admin_addr(mut self, admin_addr: impl Into<String>) -> Self {
+        self.admin_addr = Some(admin_addr.into());
+        self
+    }
+
+    pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
+        self.channel_capacity = channel_capacity;
+        self
     }
 }
 
@@ -174,6 +208,17 @@ impl ServerHandle {
             .map_err(|_| ServerHandleError::SubmitClosed)
     }
 
+    /// Requests one follow-up sync check after a peer hello has been answered.
+    pub(crate) async fn notify_hello_sync(
+        &self,
+        remote_hello: HelloMessage,
+    ) -> Result<(), ServerHandleError> {
+        self.command_tx
+            .send(ServerEvent::HelloSync { remote_hello })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
+
     /// Requests server shutdown.
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::Relaxed);
@@ -186,11 +231,12 @@ impl ServerHandle {
 
 #[derive(Debug)]
 pub struct Server {
-    config: PeerConfig,
+    config: ServerConfig,
     state: NodeState,
     peers: HashMap<String, RuntimePeer>,
     connected_peers: HashSet<String>,
     sqlite_store: Option<sqlite_store::SqliteStore>,
+    runtime_handle: Option<TokioHandle>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
     control: ServerControl,
@@ -253,17 +299,20 @@ enum ServerEvent {
         request: AdminRequest,
         reply: oneshot::Sender<AdminResponse>,
     },
+    HelloSync {
+        remote_hello: HelloMessage,
+    },
     MineTick,
     Stop,
 }
 
 /// One runtime peer record combining endpoint identity, learned metadata, and
-/// any future live session state.
+/// any future live outbound connection state.
 #[derive(Debug)]
 struct RuntimePeer {
     endpoint: PeerEndpoint,
     stored: StoredPeer,
-    session: Option<peer::PeerSession>,
+    connection: Option<peer::PeerHandle>,
 }
 
 /// One spawned async peer transport task.
@@ -280,13 +329,14 @@ const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const CONFIGURED_PEER_SYNC_COOLDOWN: Duration = Duration::from_secs(5);
 
 impl Server {
-    pub fn new(config: PeerConfig, state: NodeState) -> Self {
+    pub fn new(config: ServerConfig, state: NodeState) -> Self {
         Self {
             config,
             state,
             peers: HashMap::new(),
             connected_peers: HashSet::new(),
             sqlite_store: None,
+            runtime_handle: None,
             bootstrap_sync: false,
             mining: None,
             control: ServerControl::default(),
@@ -303,7 +353,7 @@ impl Server {
                     RuntimePeer {
                         endpoint: peer.clone(),
                         stored: StoredPeer::from_endpoint(peer, PeerSource::Seed),
-                        session: None,
+                        connection: None,
                     },
                 )
             })
@@ -343,43 +393,30 @@ impl Server {
         self
     }
 
-    /// Starts the async peer/admin server and runs it until shutdown.
+    /// Starts the server and runs it until shutdown.
     ///
-    /// This is the high-level entry point: it creates the Tokio runtime,
-    /// binds the requested listeners, starts the server event loop, and
-    /// optionally sends the cloneable `ServerHandle` back to the caller once
-    /// startup has completed.
+    /// - creates tokio runtime
+    /// - binds socket listeners
+    /// - starts mining
+    /// - runs the server event loop
     pub fn start(
         self,
-        listen_addr: &str,
-        admin_addr: Option<&str>,
-        channel_capacity: usize,
+        config: ServerConfig,
         ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
     ) -> io::Result<NodeState> {
-        let listen_addr = listen_addr.to_string();
-        let admin_addr = admin_addr.map(str::to_string);
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        info!(listen_addr = config.listen_addr, "Server::start");
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|err| io::Error::other(format!("async runtime init failed: {err}")))?;
-        runtime.block_on(async move {
-            let peer_listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-            match admin_addr.as_deref() {
-                Some(admin_addr) => {
-                    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-                    self.serve_with_admin_listener_async(
-                        &peer_listener,
-                        &admin_listener,
-                        channel_capacity,
-                        ready,
-                    )
-                    .await
-                }
-                None => {
-                    self.serve_listener_async(&peer_listener, channel_capacity, ready)
-                        .await
-                }
-            }
+        tokio_runtime.block_on(async move {
+            self.serve_inner(
+                &config.listen_addr,
+                config.admin_addr.as_deref(),
+                config.channel_capacity,
+                ready,
+            )
+                .await
         })
     }
 
@@ -388,39 +425,25 @@ impl Server {
         self.control.clone()
     }
 
-    /// Serves one async peer listener and returns the final node state on shutdown.
+    /// Binds the peer listener and optional admin listener, then runs the
+    /// server until shutdown.
     ///
     /// The listener, peer tasks, and optional mining timer run asynchronously,
     /// while this consumed `Server` instance continues to own all blockchain
     /// state and persistence on one dedicated event loop thread.
-    pub async fn serve_listener_async(
-        self,
-        listener: &tokio::net::TcpListener,
+    async fn serve_inner(
+        mut self,
+        listen_addr: &str,
+        admin_addr: Option<&str>,
         _channel_capacity: usize,
         ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
     ) -> io::Result<NodeState> {
-        self.serve_async_inner(listener, None, ready).await
-    }
-
-    /// Serves async peer and admin listeners and returns the final node state on shutdown.
-    pub async fn serve_with_admin_listener_async(
-        self,
-        peer_listener: &tokio::net::TcpListener,
-        admin_listener: &tokio::net::TcpListener,
-        _channel_capacity: usize,
-        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
-    ) -> io::Result<NodeState> {
-        self.serve_async_inner(peer_listener, Some(admin_listener), ready)
-            .await
-    }
-
-    /// Runs the async transport shell around the single-threaded server event loop.
-    async fn serve_async_inner(
-        self,
-        peer_listener: &tokio::net::TcpListener,
-        admin_listener: Option<&tokio::net::TcpListener>,
-        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
-    ) -> io::Result<NodeState> {
+        let peer_listener = tokio::net::TcpListener::bind(listen_addr).await?;
+        let admin_listener = match admin_addr {
+            Some(admin_addr) => Some(tokio::net::TcpListener::bind(admin_addr).await?),
+            None => None,
+        };
+        self.runtime_handle = Some(tokio::runtime::Handle::current());
         let mining_interval = self.mining.as_ref().map(|config| config.interval);
         let bootstrap_pending = self.bootstrap_sync;
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -456,7 +479,7 @@ impl Server {
                     let peer_id = format!("peer-{next_inbound_peer_id}");
                     spawn_peer_task(&mut peers, handle.clone(), peer_id, stream);
                 }
-                accept_result = accept_optional_admin(admin_listener) => {
+                accept_result = accept_optional_admin(admin_listener.as_ref()) => {
                     if let Some(stream) = accept_result? {
                         spawn_admin_task(handle.clone(), stream);
                     }
@@ -536,6 +559,10 @@ impl Server {
                 let _ = reply.send(response);
                 true
             }
+            ServerEvent::HelloSync { remote_hello } => {
+                self.handle_hello_sync(remote_hello);
+                true
+            }
             ServerEvent::MineTick => {
                 if let Err(err) = self.mine_pending_best_effort() {
                     warn!(error = %err, "integrated mining tick failed");
@@ -556,7 +583,7 @@ impl Server {
         self.handle_peer_message(origin, message)
     }
 
-    pub fn config(&self) -> &PeerConfig {
+    pub fn config(&self) -> &ServerConfig {
         &self.config
     }
 
@@ -645,21 +672,31 @@ impl Server {
                 remote_hello.version,
             )));
         }
-        let local_hello = WireMessage::Hello(peer::local_hello(&self.config, &self.state));
-        if should_log_info {
-            let origin = RelayOrigin {
-                advertised_addr: remote_hello.advertised_addr.clone(),
-                node_name: remote_hello.node_name.clone(),
-            };
-            for block in self.sync_from_hello_best_effort(&remote_hello) {
-                info!(
-                    block_hash = %format_hash(Some(block.header.block_hash())),
-                    "relaying block learned during hello-triggered sync"
-                );
-                self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
-            }
+        Ok(vec![WireMessage::Hello(peer::local_hello(
+            &self.config,
+            &self.state,
+        ))])
+    }
+
+    /// Runs one follow-up sync after the peer hello reply has already been sent.
+    ///
+    /// This avoids a handshake deadlock where both sides wait on hello-related
+    /// work before either side can continue with the next protocol message.
+    fn handle_hello_sync(&mut self, remote_hello: HelloMessage) {
+        if !self.hello_advances_local_state(&remote_hello) {
+            return;
         }
-        Ok(vec![local_hello])
+        let origin = RelayOrigin {
+            advertised_addr: remote_hello.advertised_addr.clone(),
+            node_name: remote_hello.node_name.clone(),
+        };
+        for block in self.sync_from_hello_best_effort(&remote_hello) {
+            info!(
+                block_hash = %format_hash(Some(block.header.block_hash())),
+                "relaying block learned during hello-triggered sync"
+            );
+            self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
+        }
     }
 
     /// Handles one `get_tip` query by returning the current best-tip summary.
@@ -708,6 +745,10 @@ impl Server {
 
     /// Handles one `mine_pending` request by mining a block from the current
     /// mempool and relaying the accepted block back out to peers.
+    ///
+    /// TODO: keep `mine_pending` as a debug/admin-oriented hook only. Real
+    /// production mining policy should stay server-owned rather than exposed as
+    /// a normal peer message.
     fn handle_peer_mine_pending(
         &mut self,
         request: crate::wire::MinePendingRequest,
@@ -1061,10 +1102,10 @@ impl Server {
     /// parent-first until this node reaches a known ancestor.
     ///
     /// If the remote tip is already indexed locally, this is a no-op. Current
-    /// behavior reuses one session for the tip poll and any needed block
-    /// requests in this sync pass, then closes that session when the sync walk
-    /// completes. That keeps hello chatter low within one catch-up operation
-    /// without yet requiring concurrent multi-stream server handling.
+    /// behavior reuses one outbound connection for the tip poll and any needed
+    /// block requests in this sync pass. That keeps hello chatter low within
+    /// one catch-up operation and also lets later relay traffic reuse the same
+    /// connected peer when it stays healthy.
     fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
         info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
         let remote_tip_summary = self.request_tip_from_peer(peer)?;
@@ -1072,7 +1113,7 @@ impl Server {
             peer_addr = %peer.addr,
             remote_tip = %format_hash(remote_tip_summary.tip),
             remote_height = ?remote_tip_summary.height,
-            "sync session ready"
+            "sync connection ready"
         );
         let Some(remote_tip) = remote_tip_summary.tip else {
             warn!(
@@ -1137,8 +1178,6 @@ impl Server {
             new_best_tip = %format_hash(self.state.chain().best_tip()),
             "completed sync from peer"
         );
-        self.clear_peer_session(&peer.addr);
-
         Ok(accepted_blocks)
     }
 
@@ -1416,7 +1455,7 @@ impl Server {
             .or_insert_with(|| RuntimePeer {
                 endpoint: peer.endpoint(),
                 stored: peer.clone(),
-                session: None,
+                connection: None,
             });
         store.save_peer(&peer)
     }
@@ -1449,35 +1488,40 @@ impl Server {
             .or_insert_with(|| RuntimePeer {
                 endpoint: endpoint.clone(),
                 stored: StoredPeer::from_endpoint(endpoint.clone(), source),
-                session: None,
+                connection: None,
             });
     }
 
-    /// Opens and caches one outbound session if no reusable session is live.
+    /// Opens and caches one outbound async peer connection if none is live.
     ///
-    /// On success the session stays attached to the runtime peer record for
+    /// On success the connection stays attached to the runtime peer record for
     /// later relay and sync requests. Failed connects still update peer
     /// metadata so selection logic can back off noisy peers.
-    fn ensure_peer_session(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
+    fn ensure_peer_connection(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
         self.ensure_runtime_peer(peer, PeerSource::Seed);
         if self
             .peers
             .get(&peer.addr)
-            .and_then(|runtime| runtime.session.as_ref())
+            .and_then(|runtime| runtime.connection.as_ref())
             .is_some()
         {
             return Ok(());
         }
         let _ = self.record_peer_connect_attempt(peer);
-        match peer::PeerSession::connect(&peer.addr, &self.config, &self.state) {
-            Ok(session) => {
-                let remote_hello = session.remote_hello().clone();
+        let runtime = self
+            .runtime_handle
+            .as_ref()
+            .expect("async runtime handle should exist before outbound peer use")
+            .clone();
+        let local_hello = peer::local_hello(&self.config, &self.state);
+        match peer::connect_peer(&runtime, peer.addr.clone(), local_hello) {
+            Ok((connection, remote_hello)) => {
                 self.record_peer_connect_success(peer, &remote_hello)
                     .map_err(SyncError::SqlitePersist)?;
                 self.peers
                     .get_mut(&peer.addr)
-                    .expect("runtime peer should exist before caching session")
-                    .session = Some(session);
+                    .expect("runtime peer should exist before caching connection")
+                    .connection = Some(connection);
                 Ok(())
             }
             Err(err) => {
@@ -1488,25 +1532,27 @@ impl Server {
         }
     }
 
-    /// Drops one cached outbound session after a transport error so the next
+    /// Drops one cached outbound connection after a transport error so the next
     /// request can reconnect cleanly.
-    fn clear_peer_session(&mut self, peer_addr: &str) {
+    fn clear_peer_connection(&mut self, peer_addr: &str) {
         if let Some(runtime_peer) = self.peers.get_mut(peer_addr) {
-            runtime_peer.session = None;
+            if let Some(connection) = runtime_peer.connection.take() {
+                connection.shutdown();
+            }
         }
     }
 
-    /// Sends one `get_tip` request, reconnecting once if a cached session died.
+    /// Sends one `get_tip` request, reconnecting once if a cached connection died.
     fn request_tip_from_peer(&mut self, peer: &PeerEndpoint) -> Result<TipSummary, SyncError> {
         for attempt in 0..2 {
-            self.ensure_peer_session(peer)?;
+            self.ensure_peer_connection(peer)?;
             let request = {
-                let session = self
+                let connection = self
                     .peers
                     .get_mut(&peer.addr)
-                    .and_then(|runtime| runtime.session.as_mut())
-                    .expect("session should exist after ensure_peer_session");
-                session.request_tip()
+                    .and_then(|runtime| runtime.connection.as_ref())
+                    .expect("connection should exist after ensure_peer_connection");
+                connection.request_tip()
             };
             match request {
                 Ok(summary) => {
@@ -1526,14 +1572,14 @@ impl Server {
                     }
                     return Ok(summary);
                 }
-                Err(_err) if attempt == 0 => self.clear_peer_session(&peer.addr),
+                Err(_err) if attempt == 0 => self.clear_peer_connection(&peer.addr),
                 Err(err) => return Err(SyncError::Request(err)),
             }
         }
         unreachable!("peer tip request should return or error within bounded retries");
     }
 
-    /// Requests one block from a cached session, reconnecting once after a
+    /// Requests one block from a cached connection, reconnecting once after a
     /// broken transport so long sync walks do not redial for every block.
     fn request_block_from_peer(
         &mut self,
@@ -1541,31 +1587,30 @@ impl Server {
         block_hash: BlockHash,
     ) -> Result<Option<Block>, SyncError> {
         for attempt in 0..2 {
-            self.ensure_peer_session(peer)?;
+            self.ensure_peer_connection(peer)?;
             let request = {
-                let session = self
+                let connection = self
                     .peers
                     .get_mut(&peer.addr)
-                    .and_then(|runtime| runtime.session.as_mut())
-                    .expect("session should exist after ensure_peer_session");
-                session.request_block(block_hash)
+                    .and_then(|runtime| runtime.connection.as_ref())
+                    .expect("connection should exist after ensure_peer_connection");
+                connection.request_block(block_hash)
             };
             match request {
                 Ok(block) => return Ok(block),
-                Err(_err) if attempt == 0 => self.clear_peer_session(&peer.addr),
+                Err(_err) if attempt == 0 => self.clear_peer_connection(&peer.addr),
                 Err(err) => return Err(SyncError::Request(err)),
             }
         }
         unreachable!("peer block request should return or error within bounded retries");
     }
 
-    /// Announces one object to a peer, reconnecting once if the cached stream
-    /// was already closed.
+    /// Announces one object to a peer, reconnecting once if needed.
     ///
-    /// Relay still closes the outbound session after each announcement because
-    /// the current server processes one inbound stream at a time. Keeping relay
-    /// sockets open would monopolize the remote node's serve loop until the
-    /// transport was explicitly closed.
+    /// Relay currently closes the outbound connection after each announcement.
+    /// `announce_tx` and `announce_block` are one-way messages, so without an
+    /// explicit ack there is no strong liveness signal that a reused socket is
+    /// still attached to the remote server after a restart.
     fn announce_to_peer_best_effort(
         &mut self,
         peer: &PeerEndpoint,
@@ -1575,12 +1620,12 @@ impl Server {
         for attempt in 0..RELAY_CONNECT_ATTEMPTS {
             match self.announce_to_peer_once(peer, message) {
                 Ok(()) => {
-                    self.clear_peer_session(&peer.addr);
+                    self.clear_peer_connection(&peer.addr);
                     return Ok(());
                 }
                 Err(err) => {
                     last_error = Some(err);
-                    self.clear_peer_session(&peer.addr);
+                    self.clear_peer_connection(&peer.addr);
                     if attempt + 1 < RELAY_CONNECT_ATTEMPTS {
                         thread::sleep(RELAY_CONNECT_RETRY_DELAY);
                     }
@@ -1590,20 +1635,20 @@ impl Server {
         Err(last_error.expect("relay attempts should record an error"))
     }
 
-    /// Sends one announcement over the peer's cached session.
+    /// Sends one announcement over the peer's cached outbound connection.
     fn announce_to_peer_once(
         &mut self,
         peer: &PeerEndpoint,
         message: &WireMessage,
     ) -> io::Result<()> {
-        self.ensure_peer_session(peer)
+        self.ensure_peer_connection(peer)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
-        let session = self
+        let connection = self
             .peers
             .get_mut(&peer.addr)
-            .and_then(|runtime| runtime.session.as_mut())
-            .expect("session should exist after ensure_peer_session");
-        session.announce(message)
+            .and_then(|runtime| runtime.connection.as_ref())
+            .expect("connection should exist after ensure_peer_connection");
+        connection.announce(message)
     }
 
     /// Returns the configured peer endpoints in a stable address order.
@@ -1624,13 +1669,15 @@ impl Server {
     /// harness uses it to make multi-node teardown deterministic.
     pub fn disconnect(&mut self) {
         for runtime_peer in self.peers.values_mut() {
-            runtime_peer.session = None;
+            if let Some(connection) = runtime_peer.connection.take() {
+                connection.shutdown();
+            }
         }
     }
 }
 
 /// Runs one async admin transport and forwards requests into the server event loop.
-async fn run_async_admin(handle: ServerHandle, stream: tokio::net::TcpStream) -> io::Result<()> {
+async fn run_admin(handle: ServerHandle, stream: tokio::net::TcpStream) -> io::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
     let mut line = String::new();
@@ -1686,7 +1733,7 @@ fn spawn_peer_task(
 /// Spawns one async admin transport task owned by the active server runtime.
 fn spawn_admin_task(handle: ServerHandle, stream: tokio::net::TcpStream) {
     tokio::spawn(async move {
-        let _ = run_async_admin(handle, stream).await;
+        let _ = run_admin(handle, stream).await;
     });
 }
 
@@ -1790,7 +1837,8 @@ fn mined_block_hash(replies: &[WireMessage]) -> Option<BlockHash> {
 /// - `GenesisHasParent`, when an empty node hears about a child block before
 ///   learning the remote genesis
 fn announced_block_needs_ancestor_sync(err: &NodeStateError, parent_hash: BlockHash) -> bool {
-    matches!(err, NodeStateError::Chain(ChainError::MissingParent(_)))
+    (matches!(err, NodeStateError::Chain(ChainError::MissingParent(_)))
+        && parent_hash != BlockHash::default())
         || (matches!(err, NodeStateError::Chain(ChainError::GenesisHasParent))
             && parent_hash != BlockHash::default())
 }
@@ -1884,9 +1932,9 @@ mod tests {
         mining::MiningConfig,
         net,
         node_state::{NodeState, NodeStateError},
-        peer::{PeerConfig, relay_to_peer},
+        peer::relay_to_peer,
         peers::{PeerSource, StoredPeer},
-        server::{PeerEndpoint, Server},
+        server::{PeerEndpoint, Server, ServerConfig},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
@@ -1906,6 +1954,55 @@ mod tests {
             nanos
         ));
         path
+    }
+
+    fn server_config(node_name: Option<&str>) -> ServerConfig {
+        server_config_at(node_name, "127.0.0.1:9000")
+    }
+
+    fn server_config_at(node_name: Option<&str>, listen_addr: &str) -> ServerConfig {
+        ServerConfig::new(
+            "wobble-local",
+            node_name.map(|name| name.to_string()),
+            listen_addr,
+        )
+    }
+
+    struct TestRuntime {
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for TestRuntime {
+        fn drop(&mut self) {
+            if let Some(shutdown_tx) = self.shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn attach_runtime(server: &mut Server) -> TestRuntime {
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let handle = runtime.handle().clone();
+            handle_tx.send(handle).unwrap();
+            runtime.block_on(async {
+                let _ = shutdown_rx.await;
+            });
+        });
+        server.runtime_handle = Some(handle_rx.recv().unwrap());
+        TestRuntime {
+            shutdown_tx: Some(shutdown_tx),
+            thread: Some(thread),
+        }
     }
 
     fn coinbase(value: u64, owner: &ed25519_dalek::VerifyingKey, uniqueness: u32) -> Transaction {
@@ -2023,10 +2120,13 @@ mod tests {
 
         let remote_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote_addr = remote_listener.local_addr().unwrap();
-        let server_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server_listener.local_addr().unwrap();
+        let server_addr = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string()))
+            server_config(Some("alpha"))
                 .with_advertised_addr(server_addr.to_string()),
             state,
         )
@@ -2037,7 +2137,7 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let serve_task = tokio::spawn(async move {
             server
-                .serve_listener_async(&server_listener, 4, Some(ready_tx))
+                .serve_inner(&server_addr.to_string(), None, 4, Some(ready_tx))
                 .await
                 .unwrap()
         });
@@ -2071,7 +2171,12 @@ mod tests {
             WireMessage::from_json_line(&tx_line).unwrap()
         });
 
-        let mut client = TokioTcpStream::connect(server_addr).await.unwrap();
+        let mut client = loop {
+            match TokioTcpStream::connect(server_addr).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
         let hello = WireMessage::Hello(HelloMessage {
             network: "wobble-local".to_string(),
             version: PROTOCOL_VERSION,
@@ -2121,7 +2226,7 @@ mod tests {
     fn bootstrap_uniqueness_advances_with_existing_height() {
         let owner = crypto::signing_key_from_bytes([8; 32]);
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new());
+        let mut server = Server::new(server_config(None), NodeState::new());
         server.state_mut().accept_block(genesis).unwrap();
 
         let response = server.handle_admin_request(AdminRequest::Bootstrap {
@@ -2162,7 +2267,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), state)
+        let mut server = Server::new(server_config(None), state)
             .with_sqlite_path(&sqlite_path);
 
         server
@@ -2186,7 +2291,7 @@ mod tests {
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
         let genesis_hash = genesis.header.block_hash();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+        let mut server = Server::new(server_config(None), NodeState::new())
             .with_sqlite_path(&sqlite_path);
 
         server
@@ -2228,7 +2333,7 @@ mod tests {
         let harder_child = mine_block(genesis_hash, 0x201f_ffff, &miner_b.verifying_key(), 2);
         let harder_child_hash = harder_child.header.block_hash();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+        let mut server = Server::new(server_config(None), NodeState::new())
             .with_sqlite_path(&sqlite_path);
 
         server
@@ -2297,7 +2402,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(pending.clone()).unwrap();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), state)
+        let mut server = Server::new(server_config(None), state)
             .with_sqlite_path(&sqlite_path);
         server.save_full_state().unwrap();
 
@@ -2338,7 +2443,7 @@ mod tests {
             ))
             .unwrap();
         let mut server =
-            Server::new(PeerConfig::new("wobble-local", None), state).with_peers(vec![
+            Server::new(server_config(None), state).with_peers(vec![
                 PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
                 PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
                 PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
@@ -2386,7 +2491,7 @@ mod tests {
 
     #[test]
     fn select_sync_peers_falls_back_to_first_configured_peer_without_tip_metadata() {
-        let server = Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
+        let server = Server::new(server_config(None), NodeState::new())
             .with_peers(vec![
                 PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
                 PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
@@ -2402,7 +2507,7 @@ mod tests {
     #[test]
     fn select_sync_peers_skips_recently_contacted_unknown_peer() {
         let mut server =
-            Server::new(PeerConfig::new("wobble-local", None), NodeState::new()).with_peers(vec![
+            Server::new(server_config(None), NodeState::new()).with_peers(vec![
                 PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
             ]);
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
@@ -2436,7 +2541,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction.clone()).unwrap();
-        let server = Server::new(PeerConfig::new("wobble-local", None), state);
+        let server = Server::new(server_config(None), state);
 
         let relay = server.relay_message_before_handle(&WireMessage::AnnounceTx { transaction });
 
@@ -2445,10 +2550,7 @@ mod tests {
 
     #[test]
     fn relay_best_effort_skips_origin_peer_by_node_name() {
-        let server = Server::new(
-            PeerConfig::new("wobble-local", Some("alpha".to_string())),
-            NodeState::new(),
-        )
+        let server = Server::new(server_config(Some("alpha")), NodeState::new())
         .with_peers(vec![
             PeerEndpoint::new("127.0.0.1:1", Some("beta".to_string())),
             PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string())),
@@ -2495,7 +2597,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction.clone()).unwrap();
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), state);
+        let mut server = Server::new(server_config(None), state);
 
         let replies = server
             .handle_message(WireMessage::MinePending(crate::wire::MinePendingRequest {
@@ -2582,10 +2684,8 @@ mod tests {
 
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some("local".to_string())),
-            state,
-        );
+        let mut server = Server::new(server_config(Some("local")), state);
+        let _runtime = attach_runtime(&mut server);
 
         server
             .sync_from_peer(&PeerEndpoint::new(peer_addr, Some("remote".to_string())))
@@ -2646,10 +2746,8 @@ mod tests {
 
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some("local".to_string())),
-            state,
-        );
+        let mut server = Server::new(server_config(Some("local")), state);
+        let _runtime = attach_runtime(&mut server);
 
         let err = server
             .sync_from_peer(&PeerEndpoint::new(peer_addr, Some("remote".to_string())))
@@ -2696,7 +2794,7 @@ mod tests {
             assert_eq!(
                 request,
                 WireMessage::GetTip,
-                "ancestor sync first polls the advertised tip on the reused session"
+                "ancestor sync first polls the advertised tip on the reused connection"
             );
             net::send_message(
                 &mut stream,
@@ -2732,10 +2830,8 @@ mod tests {
             .unwrap();
         });
 
-        let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some("local".to_string())),
-            NodeState::new(),
-        );
+        let mut server = Server::new(server_config(Some("local")), NodeState::new());
+        let _runtime = attach_runtime(&mut server);
         let origin = RelayOrigin {
             advertised_addr: Some(peer_addr),
             node_name: Some("remote".to_string()),
@@ -2780,10 +2876,7 @@ mod tests {
         );
         let mut state = NodeState::new();
         state.accept_block(local_genesis).unwrap();
-        let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some("local".to_string())),
-            state,
-        );
+        let mut server = Server::new(server_config(Some("local")), state);
         let origin = RelayOrigin {
             advertised_addr: Some("127.0.0.1:9999".to_string()),
             node_name: Some("remote".to_string()),
@@ -2843,7 +2936,7 @@ mod tests {
 
         relay_to_peer(
             &addr,
-            &PeerConfig::new("wobble-local", Some("local".to_string())),
+            &server_config(Some("local")),
             &state,
             &WireMessage::GetTip,
         )
@@ -2852,51 +2945,53 @@ mod tests {
     }
 
     #[test]
-    fn relay_best_effort_closes_outbound_session_after_announcement() {
+    fn relay_best_effort_reconnects_for_each_announcement() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let reader_stream = stream.try_clone().unwrap();
+                let mut reader = io::BufReader::new(reader_stream);
+                let hello = net::receive_message_from_reader(&mut reader).unwrap();
+                let WireMessage::Hello(_) = hello else {
+                    panic!("expected hello");
+                };
+                net::send_message(
+                    &mut stream,
+                    &WireMessage::Hello(HelloMessage {
+                        network: "wobble-local".to_string(),
+                        version: PROTOCOL_VERSION,
+                        node_name: Some("remote".to_string()),
+                        advertised_addr: None,
+                        tip: None,
+                        height: None,
+                    }),
+                )
                 .unwrap();
-            let reader_stream = stream.try_clone().unwrap();
-            let mut reader = io::BufReader::new(reader_stream);
-            let hello = net::receive_message_from_reader(&mut reader).unwrap();
-            let WireMessage::Hello(_) = hello else {
-                panic!("expected hello");
-            };
-            net::send_message(
-                &mut stream,
-                &WireMessage::Hello(HelloMessage {
-                    network: "wobble-local".to_string(),
-                    version: PROTOCOL_VERSION,
-                    node_name: Some("remote".to_string()),
-                    advertised_addr: None,
-                    tip: None,
-                    height: None,
-                }),
-            )
-            .unwrap();
-            assert_eq!(
-                net::receive_message_from_reader(&mut reader).unwrap(),
-                WireMessage::GetTip
-            );
-            assert!(matches!(
-                net::receive_message_from_reader(&mut reader)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::UnexpectedEof
-            ));
+                assert!(matches!(
+                    net::receive_message_from_reader(&mut reader).unwrap(),
+                    WireMessage::AnnounceTx { .. }
+                ));
+            }
         });
 
-        let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some("local".to_string())),
-            NodeState::new(),
-        )
+        let mut server = Server::new(server_config(Some("local")), NodeState::new())
         .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]);
+        let _runtime = attach_runtime(&mut server);
+        let transaction = coinbase(
+            50,
+            &crypto::signing_key_from_bytes([19; 32]).verifying_key(),
+            0,
+        );
 
-        server.relay_best_effort(&WireMessage::GetTip, None);
+        server.relay_best_effort(
+            &WireMessage::AnnounceTx {
+                transaction: transaction.clone(),
+            },
+            None,
+        );
+        server.relay_best_effort(&WireMessage::AnnounceTx { transaction }, None);
 
         worker.join().unwrap();
     }
@@ -2923,7 +3018,7 @@ mod tests {
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction).unwrap();
 
-        let mut server = Server::new(PeerConfig::new("wobble-local", None), state).with_mining(
+        let mut server = Server::new(server_config(None), state).with_mining(
             MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
         );
 
@@ -2940,8 +3035,11 @@ mod tests {
     fn start_stops_when_handle_requests_shutdown() {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            Server::new(PeerConfig::new("wobble-local", None), NodeState::new())
-                .start("127.0.0.1:0", None, 4, Some(ready_tx))
+            Server::new(server_config_at(None, "127.0.0.1:0"), NodeState::new())
+                .start(
+                    server_config_at(None, "127.0.0.1:0").with_channel_capacity(4),
+                    Some(ready_tx),
+                )
                 .unwrap()
         });
 

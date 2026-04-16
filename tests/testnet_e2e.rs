@@ -22,8 +22,7 @@ use wobble::{
     admin::{AdminRequest, AdminResponse, StatusSummary},
     crypto, net,
     node_state::NodeState,
-    peer::PeerConfig,
-    server::{PeerEndpoint, Server, ServerHandle},
+    server::{PeerEndpoint, Server, ServerConfig, ServerHandle},
     sqlite_store::SqliteStore,
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
     wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
@@ -253,7 +252,8 @@ impl TestNet {
             }
         };
         let mut server = Server::new(
-            PeerConfig::new("wobble-local", Some(node.name.clone())).with_advertised_addr(&addr),
+            ServerConfig::new("wobble-local", Some(node.name.clone()), addr.clone())
+                .with_advertised_addr(&addr),
             state,
         )
         .with_peers(peer_endpoints)
@@ -262,10 +262,19 @@ impl TestNet {
             server = server.with_sqlite_path(sqlite_path);
         }
         let (control_tx, control_rx) = mpsc::channel();
+        let server_name = name.to_string();
 
         let running = RunningNode {
             name: name.to_string(),
-            worker: thread::spawn(move || server.start(&addr, None, 64, Some(control_tx)).unwrap()),
+            worker: thread::spawn(move || {
+                server
+                    .start(
+                        ServerConfig::new("wobble-local", Some(server_name), addr)
+                            .with_channel_capacity(64),
+                        Some(control_tx),
+                    )
+                    .unwrap()
+            }),
             control: control_rx.recv().unwrap(),
         };
         self.wait_until_serving(name);
@@ -349,13 +358,20 @@ impl RunningNode {
 
     /// Waits until the running node reports one specific best tip.
     fn wait_until_tip(&self, expected_tip: BlockHash) {
+        let mut last_status = None;
         for _ in 0..120 {
-            if self.status().tip == Some(expected_tip) {
+            let status = self.status();
+            if status.tip == Some(expected_tip) {
                 return;
             }
+            last_status = Some(status);
             thread::sleep(Duration::from_millis(25));
         }
-        panic!("node {} did not reach expected tip {expected_tip}", self.name);
+        panic!(
+            "node {} did not reach expected tip {expected_tip}; last status: {:?}",
+            self.name,
+            last_status
+        );
     }
 
     /// Waits until the running node reports one specific mempool size.

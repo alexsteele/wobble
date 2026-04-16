@@ -4,32 +4,30 @@
 //! protocol messages against local `NodeState`. The first version is
 //! intentionally conservative: it supports compatibility checks, tip queries,
 //! and block fetches before adding background relay loops or peer management.
-//! It also owns the low-level peer stream/session mechanics so `server`
+//! It also owns the low-level peer stream and outbound connection mechanics so `server`
 //! can stay focused on startup, event dispatch, and node-state policy.
 
 use std::{
     io,
-    net::TcpStream,
+    sync::mpsc,
     time::Duration,
 };
 
 use crate::{
     client::{ClientError, RequestError},
     mempool::MempoolError,
-    net,
     node_state::{NodeState, NodeStateError},
-    server::{RelayOrigin, ServerHandle},
+    server::{RelayOrigin, ServerConfig, ServerHandle},
     types::{Block, BlockHash},
     wire::{HelloMessage, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
-
-/// Local peer settings advertised during handshake.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerConfig {
-    pub network: String,
-    pub node_name: Option<String>,
-    pub advertised_addr: Option<String>,
-}
+#[cfg(test)]
+use crate::net;
+use tokio::{
+    net::TcpStream,
+    runtime::Handle,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 
 /// Reasons a remote peer message was rejected at the protocol layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,24 +40,8 @@ pub enum PeerError {
     MiningRejected(NodeStateError),
 }
 
-impl PeerConfig {
-    pub fn new(network: impl Into<String>, node_name: Option<String>) -> Self {
-        Self {
-            network: network.into(),
-            node_name,
-            advertised_addr: None,
-        }
-    }
-
-    /// Records the listener address this node should advertise during handshake.
-    pub fn with_advertised_addr(mut self, advertised_addr: impl Into<String>) -> Self {
-        self.advertised_addr = Some(advertised_addr.into());
-        self
-    }
-}
-
 /// Builds the local `hello` payload from configuration and current node state.
-pub fn local_hello(config: &PeerConfig, state: &NodeState) -> HelloMessage {
+pub fn local_hello(config: &ServerConfig, state: &NodeState) -> HelloMessage {
     let tip = state.tip_summary();
     HelloMessage {
         network: config.network.clone(),
@@ -71,86 +53,240 @@ pub fn local_hello(config: &PeerConfig, state: &NodeState) -> HelloMessage {
     }
 }
 
-/// One reusable outbound peer session for sync and relay requests.
+/// One live peer handle owned by an async transport task.
 #[derive(Debug)]
-pub(crate) struct PeerSession {
-    stream: TcpStream,
-    reader: io::BufReader<TcpStream>,
-    remote_hello: HelloMessage,
+pub(crate) struct PeerHandle {
+    command_tx: UnboundedSender<PeerCommand>,
 }
 
-impl PeerSession {
-    /// Opens one outbound peer session and completes the protocol handshake.
-    pub(crate) fn connect(
-        peer_addr: &str,
-        config: &PeerConfig,
-        state: &NodeState,
-    ) -> Result<Self, ClientError> {
-        let tip = state.tip_summary();
-        let mut stream = net::connect(peer_addr).map_err(ClientError::Connect)?;
-        configure_outbound_peer_stream(&stream).map_err(ClientError::Connect)?;
-        let reader_stream = stream.try_clone().map_err(ClientError::Connect)?;
-        net::send_message(&mut stream, &WireMessage::Hello(HelloMessage {
-            network: config.network.clone(),
-            version: PROTOCOL_VERSION,
-            node_name: config.node_name.clone(),
-            advertised_addr: None,
-            tip: tip.tip,
-            height: tip.height,
-        }))
-        .map_err(ClientError::SendHello)?;
-        let remote_hello = net::receive_message_from_reader(io::BufReader::new(reader_stream))
-            .map_err(ClientError::ReceiveHello)?;
-        let WireMessage::Hello(remote_hello) = remote_hello else {
-            return Err(ClientError::UnexpectedHandshake(remote_hello));
-        };
-        let session_reader = io::BufReader::new(
-            stream
-                .try_clone()
-                .expect("connected peer stream should clone for session reader"),
-        );
-        Ok(Self {
-            stream,
-            reader: session_reader,
-            remote_hello,
-        })
+impl PeerHandle {
+    /// Requests the peer's current best tip over the live async connection.
+    pub(crate) fn request_tip(&self) -> Result<TipSummary, RequestError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(PeerCommand::RequestTip { reply: reply_tx })
+            .map_err(|_| RequestError::Receive(io::Error::new(io::ErrorKind::BrokenPipe, "outbound peer closed")))?;
+        reply_rx
+            .recv_timeout(OUTBOUND_PEER_IO_TIMEOUT)
+            .map_err(|_| RequestError::Receive(io::Error::new(io::ErrorKind::TimedOut, "outbound peer tip request timed out")))?
     }
 
-    /// Returns the remote peer identity learned during the outbound handshake.
-    pub(crate) fn remote_hello(&self) -> &HelloMessage {
-        &self.remote_hello
-    }
-
-    /// Requests the peer's current best-tip summary on an existing session.
-    pub(crate) fn request_tip(&mut self) -> Result<TipSummary, RequestError> {
-        net::send_message(&mut self.stream, &WireMessage::GetTip).map_err(RequestError::Send)?;
-        let reply =
-            net::receive_message_from_reader(&mut self.reader).map_err(RequestError::Receive)?;
-        let WireMessage::Tip(summary) = reply else {
-            return Err(RequestError::UnexpectedResponse(reply));
-        };
-        Ok(summary)
-    }
-
-    /// Requests one specific block from the connected peer.
+    /// Requests one block over the live async connection.
     pub(crate) fn request_block(
-        &mut self,
+        &self,
         block_hash: BlockHash,
     ) -> Result<Option<Block>, RequestError> {
-        net::send_message(&mut self.stream, &WireMessage::GetBlock { block_hash })
-            .map_err(RequestError::Send)?;
-        let reply =
-            net::receive_message_from_reader(&mut self.reader).map_err(RequestError::Receive)?;
-        let WireMessage::Block { block } = reply else {
-            return Err(RequestError::UnexpectedResponse(reply));
-        };
-        Ok(block)
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(PeerCommand::RequestBlock {
+                block_hash,
+                reply: reply_tx,
+            })
+            .map_err(|_| RequestError::Receive(io::Error::new(io::ErrorKind::BrokenPipe, "outbound peer closed")))?;
+        reply_rx
+            .recv_timeout(OUTBOUND_PEER_IO_TIMEOUT)
+            .map_err(|_| RequestError::Receive(io::Error::new(io::ErrorKind::TimedOut, "outbound peer block request timed out")))?
     }
 
-    /// Sends one announcement over the existing session without reopening it.
-    pub(crate) fn announce(&mut self, message: &WireMessage) -> io::Result<()> {
-        net::send_message(&mut self.stream, message)
+    /// Sends one announcement over the live async connection.
+    pub(crate) fn announce(&self, message: &WireMessage) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(PeerCommand::Announce {
+                message: message.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "outbound peer closed"))?;
+        reply_rx
+            .recv_timeout(OUTBOUND_PEER_IO_TIMEOUT)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound peer announce timed out"))?
     }
+
+    /// Requests that the owned outbound peer task stop.
+    pub(crate) fn shutdown(&self) {
+        let _ = self.command_tx.send(PeerCommand::Shutdown);
+    }
+}
+
+/// Opens one persistent outbound peer connection and returns a synchronous handle
+/// plus the remote hello learned during handshake.
+pub(crate) fn connect_peer(
+    runtime: &Handle,
+    peer_addr: String,
+    local_hello: HelloMessage,
+) -> Result<(PeerHandle, HelloMessage), ClientError> {
+    let (command_tx, command_rx) = unbounded_channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let ready = open_peer_connection(peer_addr, local_hello).await;
+        match ready {
+            Ok((remote_hello, reader, writer)) => {
+                let _ = ready_tx.send(Ok(remote_hello));
+                run_peer_task(reader, writer, command_rx).await;
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+            }
+        }
+    });
+    let remote_hello = ready_rx
+        .recv_timeout(OUTBOUND_PEER_IO_TIMEOUT)
+        .map_err(|_| ClientError::ReceiveHello(io::Error::new(io::ErrorKind::TimedOut, "outbound peer handshake timed out")))??;
+    Ok((PeerHandle { command_tx }, remote_hello))
+}
+
+/// Commands sent from the server thread into one live outbound peer task.
+enum PeerCommand {
+    RequestTip {
+        reply: mpsc::SyncSender<Result<TipSummary, RequestError>>,
+    },
+    RequestBlock {
+        block_hash: BlockHash,
+        reply: mpsc::SyncSender<Result<Option<Block>, RequestError>>,
+    },
+    Announce {
+        message: WireMessage,
+        reply: mpsc::SyncSender<io::Result<()>>,
+    },
+    Shutdown,
+}
+
+/// Connects and completes the outbound peer handshake.
+async fn open_peer_connection(
+    peer_addr: String,
+    local_hello: HelloMessage,
+)-> Result<
+    (
+        HelloMessage,
+        tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    ),
+    ClientError,
+> {
+    let stream =
+        timeout_io(TcpStream::connect(&peer_addr))
+            .await
+            .map_err(ClientError::Connect)?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
+
+    send_async_message(&mut writer, &WireMessage::Hello(local_hello))
+        .await
+        .map_err(ClientError::SendHello)?;
+    let remote_hello_message = receive_async_message(&mut reader)
+        .await
+        .map_err(ClientError::ReceiveHello)?;
+    let WireMessage::Hello(remote_hello) = remote_hello_message else {
+        return Err(ClientError::UnexpectedHandshake(remote_hello_message));
+    };
+
+    Ok((remote_hello, reader, writer))
+}
+
+/// Runs one persistent outbound peer connection for sync and relay traffic.
+async fn run_peer_task(
+    mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut command_rx: UnboundedReceiver<PeerCommand>,
+) {
+    while let Some(command) = command_rx.recv().await {
+        let keep_running = match command {
+            PeerCommand::RequestTip { reply } => {
+                let result = handle_outbound_request_tip(&mut writer, &mut reader).await;
+                let _ = reply.send(result);
+                true
+            }
+            PeerCommand::RequestBlock { block_hash, reply } => {
+                let result = handle_outbound_request_block(&mut writer, &mut reader, block_hash).await;
+                let _ = reply.send(result);
+                true
+            }
+            PeerCommand::Announce { message, reply } => {
+                let result = send_async_message(&mut writer, &message).await;
+                let keep_running = result.is_ok();
+                let _ = reply.send(result);
+                keep_running
+            }
+            PeerCommand::Shutdown => false,
+        };
+        if !keep_running {
+            break;
+        }
+    }
+}
+
+/// Executes one `get_tip` request over an established async outbound stream.
+async fn handle_outbound_request_tip(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<TipSummary, RequestError> {
+    send_async_message(writer, &WireMessage::GetTip)
+        .await
+        .map_err(RequestError::Send)?;
+    let reply = receive_async_message(reader)
+        .await
+        .map_err(RequestError::Receive)?;
+    let WireMessage::Tip(summary) = reply else {
+        return Err(RequestError::UnexpectedResponse(reply));
+    };
+    Ok(summary)
+}
+
+/// Executes one `get_block` request over an established async outbound stream.
+async fn handle_outbound_request_block(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    block_hash: BlockHash,
+) -> Result<Option<Block>, RequestError> {
+    send_async_message(writer, &WireMessage::GetBlock { block_hash })
+        .await
+        .map_err(RequestError::Send)?;
+    let reply = receive_async_message(reader)
+        .await
+        .map_err(RequestError::Receive)?;
+    let WireMessage::Block { block } = reply else {
+        return Err(RequestError::UnexpectedResponse(reply));
+    };
+    Ok(block)
+}
+
+/// Sends one wire message over an async writer with the standard peer timeout.
+async fn send_async_message(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    message: &WireMessage,
+) -> io::Result<()> {
+    let line = message
+        .to_json_line()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    timeout_io(tokio::io::AsyncWriteExt::write_all(writer, line.as_bytes())).await?;
+    timeout_io(tokio::io::AsyncWriteExt::flush(writer)).await?;
+    Ok(())
+}
+
+/// Receives one wire message from an async buffered reader with the standard peer timeout.
+async fn receive_async_message(
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> io::Result<WireMessage> {
+    let mut line = String::new();
+    let bytes_read = timeout_io(tokio::io::AsyncBufReadExt::read_line(reader, &mut line)).await?;
+    if bytes_read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection",
+        ));
+    }
+    WireMessage::from_json_line(&line)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Applies one standard timeout around an async peer I/O operation.
+async fn timeout_io<F, T>(future: F) -> io::Result<T>
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
+    tokio::time::timeout(OUTBOUND_PEER_IO_TIMEOUT, future)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer I/O timed out"))?
 }
 
 /// Runs one async peer stream and forwards decoded messages into the server.
@@ -177,11 +313,13 @@ pub(crate) async fn serve_peer_stream(
             Ok(message) => message,
             Err(_) => break,
         };
+        let mut hello_for_follow_up_sync = None;
         if let WireMessage::Hello(remote_hello) = &message {
             origin = RelayOrigin {
                 advertised_addr: remote_hello.advertised_addr.clone(),
                 node_name: remote_hello.node_name.clone(),
             };
+            hello_for_follow_up_sync = Some(remote_hello.clone());
         }
         let replies = match handle
             .request_peer_message(peer_id.clone(), Some(origin.clone()), message)
@@ -205,6 +343,9 @@ pub(crate) async fn serve_peer_stream(
                 return;
             }
         }
+        if let Some(remote_hello) = hello_for_follow_up_sync {
+            let _ = handle.notify_hello_sync(remote_hello).await;
+        }
     }
 }
 
@@ -213,7 +354,7 @@ pub(crate) async fn serve_peer_stream(
 #[cfg(test)]
 pub(crate) fn relay_to_peer(
     peer_addr: &str,
-    config: &PeerConfig,
+    config: &ServerConfig,
     state: &NodeState,
     message: &WireMessage,
 ) -> io::Result<()> {
@@ -236,22 +377,16 @@ pub(crate) fn relay_to_peer(
 #[cfg(test)]
 fn relay_to_peer_once(
     peer_addr: &str,
-    config: &PeerConfig,
+    config: &ServerConfig,
     state: &NodeState,
     message: &WireMessage,
 ) -> io::Result<()> {
     let mut stream = net::connect(peer_addr)?;
-    configure_outbound_peer_stream(&stream)?;
+    stream.set_read_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
     net::send_message(&mut stream, &WireMessage::Hello(local_hello(config, state)))?;
     let _ = net::receive_message(&mut stream)?;
     net::send_message(&mut stream, message)?;
-    Ok(())
-}
-
-/// Applies a short timeout to reusable outbound peer sessions.
-fn configure_outbound_peer_stream(stream: &TcpStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
     Ok(())
 }
 
@@ -275,7 +410,7 @@ const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// Gap: this does not yet fan accepted objects out to other peers, track peer
 /// state, or request missing parents automatically.
 pub fn handle_message(
-    config: &PeerConfig,
+    config: &ServerConfig,
     state: &mut NodeState,
     message: WireMessage,
 ) -> Result<Vec<WireMessage>, PeerError> {
@@ -333,7 +468,8 @@ pub fn handle_message(
 mod tests {
     use crate::{
         node_state::NodeState,
-        peer::{PeerConfig, PeerError, handle_message, local_hello},
+        peer::{PeerError, handle_message, local_hello},
+        server::ServerConfig,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{
             HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage,
@@ -410,7 +546,11 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = PeerConfig::new("wobble-local", Some("alpha".to_string()))
+        let config = ServerConfig::new(
+            "wobble-local",
+            Some("alpha".to_string()),
+            "127.0.0.1:9000",
+        )
             .with_advertised_addr("127.0.0.1:9000");
 
         let hello = local_hello(&config, &state);
@@ -430,7 +570,7 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(&config, &mut state, WireMessage::GetTip).unwrap();
 
@@ -450,7 +590,7 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis.clone()).unwrap();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(
             &config,
@@ -472,7 +612,7 @@ mod tests {
     #[test]
     fn hello_rejects_network_mismatch() {
         let mut state = NodeState::new();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let err = handle_message(
             &config,
@@ -500,7 +640,7 @@ mod tests {
     #[test]
     fn hello_rejects_unsupported_version() {
         let mut state = NodeState::new();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let err = handle_message(
             &config,
@@ -537,7 +677,7 @@ mod tests {
         let txid = tx.txid();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(
             &config,
@@ -563,7 +703,7 @@ mod tests {
         let child_hash = child.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(
             &config,
@@ -595,7 +735,7 @@ mod tests {
         let txid = tx.txid();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = PeerConfig::new("wobble-local", None);
+        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         handle_message(
             &config,
