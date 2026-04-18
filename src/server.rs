@@ -332,6 +332,8 @@ struct RuntimePeer {
     endpoint: PeerEndpoint,
     stored: StoredPeer,
     connection: Option<peer::PeerHandle>,
+    /// Last pushed tip hint this node already acted on for follow-up sync.
+    last_tip_sync_hint: Option<TipSummary>,
     sync_in_progress: bool,
 }
 
@@ -374,6 +376,7 @@ impl Server {
                         endpoint: peer.clone(),
                         stored: StoredPeer::from_endpoint(peer, PeerSource::Seed),
                         connection: None,
+                        last_tip_sync_hint: None,
                         sync_in_progress: false,
                     },
                 )
@@ -720,10 +723,20 @@ impl Server {
         let Some(peer) = self.sync_peer_from_origin(&origin) else {
             return;
         };
+        if self.peer_tip_sync_is_duplicate(&peer.addr, &summary) {
+            debug!(
+                peer_addr = %peer.addr,
+                remote_tip = %format_hash(summary.tip),
+                remote_height = ?summary.height,
+                "ignoring duplicate tip announcement"
+            );
+            return;
+        }
         if self.peer_sync_in_progress(&peer.addr) {
             debug!(peer_addr = %peer.addr, "skipping duplicate tip-triggered sync");
             return;
         }
+        self.remember_tip_sync_hint(&peer.addr, &summary);
         info!(
             peer_addr = %peer.addr,
             remote_tip = %format_hash(summary.tip),
@@ -1617,6 +1630,7 @@ impl Server {
                 endpoint: peer.endpoint(),
                 stored: peer.clone(),
                 connection: None,
+                last_tip_sync_hint: None,
                 sync_in_progress: false,
             });
         store.save_peer(&peer)
@@ -1651,6 +1665,7 @@ impl Server {
                 endpoint: endpoint.clone(),
                 stored: StoredPeer::from_endpoint(endpoint.clone(), source),
                 connection: None,
+                last_tip_sync_hint: None,
                 sync_in_progress: false,
             });
     }
@@ -1661,6 +1676,22 @@ impl Server {
             .get(peer_addr)
             .map(|peer| peer.sync_in_progress)
             .unwrap_or(false)
+    }
+
+    /// Returns whether this peer already announced the same tip hint and this
+    /// node already acted on it.
+    fn peer_tip_sync_is_duplicate(&self, peer_addr: &str, summary: &TipSummary) -> bool {
+        self.peers
+            .get(peer_addr)
+            .and_then(|peer| peer.last_tip_sync_hint.as_ref())
+            == Some(summary)
+    }
+
+    /// Remembers the latest pushed tip hint this node acted on for one peer.
+    fn remember_tip_sync_hint(&mut self, peer_addr: &str, summary: &TipSummary) {
+        if let Some(peer) = self.peers.get_mut(peer_addr) {
+            peer.last_tip_sync_hint = Some(summary.clone());
+        }
     }
 
     /// Opens and caches one outbound async peer connection if none is live.
@@ -2428,6 +2459,31 @@ mod tests {
         let stored = &server.peers.get("127.0.0.1:9001").unwrap().stored;
         assert_eq!(stored.advertised_tip_hash, Some(remote_tip));
         assert_eq!(stored.advertised_height, Some(3));
+    }
+
+    #[test]
+    fn duplicate_tip_sync_hint_is_ignored_for_same_peer() {
+        let summary = TipSummary {
+            tip: Some(BlockHash::new([0x88; 32])),
+            height: Some(5),
+        };
+        let mut server = Server::new(server_config(Some("local")), NodeState::new()).with_peers(
+            vec![PeerEndpoint::new(
+                "127.0.0.1:9001",
+                Some("remote".to_string()),
+            )],
+        );
+
+        server.remember_tip_sync_hint("127.0.0.1:9001", &summary);
+
+        assert!(server.peer_tip_sync_is_duplicate("127.0.0.1:9001", &summary));
+        assert!(!server.peer_tip_sync_is_duplicate(
+            "127.0.0.1:9001",
+            &TipSummary {
+                tip: summary.tip,
+                height: Some(6),
+            }
+        ));
     }
 
     #[test]
