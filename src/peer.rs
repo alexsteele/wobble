@@ -314,12 +314,15 @@ pub(crate) async fn serve_peer_stream(
             Err(_) => break,
         };
         let mut hello_for_follow_up_sync = None;
+        let mut tip_for_follow_up_sync = None;
         if let WireMessage::Hello(remote_hello) = &message {
             origin = RelayOrigin {
                 advertised_addr: remote_hello.advertised_addr.clone(),
                 node_name: remote_hello.node_name.clone(),
             };
             hello_for_follow_up_sync = Some(remote_hello.clone());
+        } else if let WireMessage::AnnounceTip(summary) = &message {
+            tip_for_follow_up_sync = Some(summary.clone());
         }
         let replies = match handle
             .request_peer_message(peer_id.clone(), Some(origin.clone()), message)
@@ -345,6 +348,9 @@ pub(crate) async fn serve_peer_stream(
         }
         if let Some(remote_hello) = hello_for_follow_up_sync {
             let _ = handle.notify_hello_sync(remote_hello).await;
+        }
+        if let Some(summary) = tip_for_follow_up_sync {
+            let _ = handle.notify_tip_sync(origin.clone(), summary).await;
         }
     }
 }
@@ -429,6 +435,7 @@ pub fn handle_message(
             Ok(vec![WireMessage::Hello(local_hello(config, state))])
         }
         WireMessage::GetTip => Ok(vec![WireMessage::Tip(state.tip_summary())]),
+        WireMessage::AnnounceTip(_) => Ok(Vec::new()),
         WireMessage::GetBlock { block_hash } => Ok(vec![WireMessage::Block {
             block: state.get_block(&block_hash).cloned(),
         }]),

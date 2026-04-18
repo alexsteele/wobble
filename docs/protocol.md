@@ -231,12 +231,14 @@ The first version should keep sync logic simple.
 Suggested flow:
 1. connect to a peer
 2. exchange `hello`
-3. send `get_tip`
+3. use the advertised `tip` from `hello` when present
 4. if the remote tip is unknown locally, request that tip with `get_block`
 5. if the received block has an unknown parent, request the parent
 6. repeat until the missing chain segment is filled
 
 Current implementation notes:
+- startup sync may still poll `get_tip` when the node does not yet have useful peer metadata
+- hello-triggered and tip-triggered sync use the peer's advertised tip directly
 - the sync walk may reuse one outbound session per selected peer
 - the node requests only one peer at a time
 - a successful sync closes that short-lived sync session when the walk completes
@@ -247,6 +249,37 @@ This is deliberately naive:
 - it does not separate headers from bodies
 
 That is acceptable for local development.
+
+## Next Sync Step
+
+The next protocol improvement should make sync more push-driven and less dependent
+on periodic polling.
+
+Planned additions:
+- add an explicit `announce_tip` message carrying `tip` and `height`
+- let peers send `announce_tip` on an existing live connection whenever their best tip changes
+- keep small per-peer sync state in memory, including advertised tip, advertised height, whether a sync is already in progress, and recent sync success or failure times
+
+Planned receiver behavior:
+- when a peer announces a better tip, update the stored peer metadata
+- if the announced tip is unknown locally and that peer is ahead, schedule one follow-up sync attempt from that peer
+- avoid starting duplicate sync attempts while one is already active for the same peer
+
+Planned sync walk:
+1. receive `announce_tip { tip, height }`
+2. connect or reuse the live peer session
+3. request the advertised tip block
+4. if that block's parent is missing, keep walking backward until a known ancestor is found
+5. apply the missing segment forward in order
+
+Intended policy:
+- push-based tip announcements should become the normal trigger for catch-up
+- periodic configured-peer sync should remain only as a slow background repair path
+
+Why this is the next step:
+- it reduces repeated `hello` chatter
+- it avoids blind polling when peers already know they advanced
+- it gives the server a clearer boundary between peer metadata updates and actual sync work
 
 ## Relay Rules
 

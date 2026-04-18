@@ -53,6 +53,7 @@ pub enum WireMessage {
     Hello(HelloMessage),
     GetTip,
     Tip(TipSummary),
+    AnnounceTip(TipSummary),
     AnnounceTx { transaction: Transaction },
     AnnounceBlock { block: Block },
     GetBlock { block_hash: BlockHash },
@@ -148,6 +149,19 @@ mod tests {
         let message = WireMessage::Tip(TipSummary {
             tip: Some(BlockHash::new([0x44; 32])),
             height: Some(99),
+        });
+
+        let line = message.to_json_line().unwrap();
+        let decoded = WireMessage::from_json_line(&line).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_tip_announcement() {
+        let message = WireMessage::AnnounceTip(TipSummary {
+            tip: Some(BlockHash::new([0x66; 32])),
+            height: Some(100),
         });
 
         let line = message.to_json_line().unwrap();

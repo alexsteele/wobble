@@ -219,6 +219,21 @@ impl ServerHandle {
             .map_err(|_| ServerHandleError::SubmitClosed)
     }
 
+    /// Requests one follow-up sync check after a peer announces a better tip.
+    pub(crate) async fn notify_tip_sync(
+        &self,
+        origin: RelayOrigin,
+        summary: TipSummary,
+    ) -> Result<(), ServerHandleError> {
+        self.command_tx
+            .send(ServerEvent::TipSync {
+                origin,
+                summary,
+            })
+            .await
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
+
     /// Requests server shutdown.
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::Relaxed);
@@ -302,6 +317,10 @@ enum ServerEvent {
     HelloSync {
         remote_hello: HelloMessage,
     },
+    TipSync {
+        origin: RelayOrigin,
+        summary: TipSummary,
+    },
     MineTick,
     Stop,
 }
@@ -313,6 +332,7 @@ struct RuntimePeer {
     endpoint: PeerEndpoint,
     stored: StoredPeer,
     connection: Option<peer::PeerHandle>,
+    sync_in_progress: bool,
 }
 
 /// One spawned async peer transport task.
@@ -354,6 +374,7 @@ impl Server {
                         endpoint: peer.clone(),
                         stored: StoredPeer::from_endpoint(peer, PeerSource::Seed),
                         connection: None,
+                        sync_in_progress: false,
                     },
                 )
             })
@@ -547,6 +568,10 @@ impl Server {
                 self.handle_hello_sync(remote_hello);
                 true
             }
+            ServerEvent::TipSync { origin, summary } => {
+                self.handle_tip_sync(origin, summary);
+                true
+            }
             ServerEvent::MineTick => {
                 if let Err(err) = self.mine_pending_best_effort() {
                     warn!(error = %err, "integrated mining tick failed");
@@ -605,6 +630,7 @@ impl Server {
             WireMessage::Hello(remote_hello) => self.handle_peer_hello(remote_hello),
             WireMessage::GetTip => self.handle_peer_get_tip(),
             WireMessage::GetBlock { block_hash } => self.handle_peer_get_block(block_hash),
+            WireMessage::AnnounceTip(summary) => self.handle_peer_announce_tip(summary, origin),
             WireMessage::AnnounceTx { transaction } => {
                 self.handle_peer_announce_tx(transaction, origin)
             }
@@ -683,6 +709,41 @@ impl Server {
         }
     }
 
+    /// Runs one follow-up sync after a peer announces a better tip.
+    ///
+    /// This keeps `announce_tip` lightweight on the wire while still letting
+    /// peers push catch-up hints promptly over long-lived connections.
+    fn handle_tip_sync(&mut self, origin: RelayOrigin, summary: TipSummary) {
+        if !self.tip_summary_advances_local_state(&summary) {
+            return;
+        }
+        let Some(peer) = self.sync_peer_from_origin(&origin) else {
+            return;
+        };
+        if self.peer_sync_in_progress(&peer.addr) {
+            debug!(peer_addr = %peer.addr, "skipping duplicate tip-triggered sync");
+            return;
+        }
+        info!(
+            peer_addr = %peer.addr,
+            remote_tip = %format_hash(summary.tip),
+            remote_height = ?summary.height,
+            "starting tip-triggered sync"
+        );
+        let previous_best_tip = self.state.chain().best_tip();
+        if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
+            runtime_peer.sync_in_progress = true;
+        }
+        let accepted_blocks = self.sync_to_advertised_tip(&peer, &summary).unwrap_or_default();
+        if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
+            runtime_peer.sync_in_progress = false;
+        }
+        for block in accepted_blocks {
+            self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
+        }
+        self.relay_new_best_tip_if_advanced(previous_best_tip, Some(&origin));
+    }
+
     /// Handles one `get_tip` query by returning the current best-tip summary.
     fn handle_peer_get_tip(&self) -> Result<Vec<WireMessage>, ServerError> {
         Ok(vec![WireMessage::Tip(self.state.tip_summary())])
@@ -696,6 +757,26 @@ impl Server {
         Ok(vec![WireMessage::Block {
             block: self.state.get_block(&block_hash).cloned(),
         }])
+    }
+
+    /// Handles one announced best-tip update from a connected peer.
+    ///
+    /// This updates the peer's advertised chain metadata immediately. The
+    /// actual catch-up attempt is scheduled as a follow-up event so one peer
+    /// message does not block normal stream handling.
+    fn handle_peer_announce_tip(
+        &mut self,
+        summary: TipSummary,
+        origin: Option<&RelayOrigin>,
+    ) -> Result<Vec<WireMessage>, ServerError> {
+        debug!(
+            remote_tip = %format_hash(summary.tip),
+            remote_height = ?summary.height,
+            "handling announced tip"
+        );
+        self.record_inbound_tip(origin, &summary)
+            .map_err(ServerError::SqlitePersist)?;
+        Ok(Vec::new())
     }
 
     /// Handles one announced transaction, persists mempool changes, and relays
@@ -770,6 +851,7 @@ impl Server {
         if let Some(relay) = self.relay_message_from_replies(&replies) {
             self.relay_best_effort(&relay, origin);
         }
+        self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
         Ok(replies)
     }
 
@@ -816,6 +898,7 @@ impl Server {
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
         }
+        self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
         Ok(replies)
     }
 
@@ -861,6 +944,7 @@ impl Server {
                 if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
                     self.relay_best_effort(&relay, origin);
                 }
+                self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
                 return Ok(Some(replies));
             }
             Err(PeerError::BlockRejected(err))
@@ -909,6 +993,7 @@ impl Server {
         if let Some(relay) = relay.or_else(|| self.relay_message_from_replies(&replies)) {
             self.relay_best_effort(&relay, origin);
         }
+        self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
         Ok(Some(replies))
     }
 
@@ -1082,17 +1167,39 @@ impl Server {
             .collect()
     }
 
-    /// Fetches a missing remote tip segment from `peer` and applies it
+    /// Polls `peer` for its current tip, then fetches the missing segment.
+    ///
+    /// Startup and manual sync still use the explicit `get_tip` poll. Push
+    /// flows such as `hello` and `announce_tip` can skip this extra round trip
+    /// and call the direct advertised-tip sync path instead.
+    fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
+        if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
+            runtime_peer.sync_in_progress = true;
+        }
+        info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
+        let result = self.sync_from_peer_inner(peer);
+        if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
+            runtime_peer.sync_in_progress = false;
+        }
+        result
+    }
+
+    /// Executes one sync walk after the caller marked the peer as active.
+    fn sync_from_peer_inner(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
+        let remote_tip_summary = self.request_tip_from_peer(peer)?;
+        self.sync_to_advertised_tip(peer, &remote_tip_summary)
+    }
+
+    /// Fetches a missing advertised tip segment from `peer` and applies it
     /// parent-first until this node reaches a known ancestor.
     ///
-    /// If the remote tip is already indexed locally, this is a no-op. Current
-    /// behavior reuses one outbound connection for the tip poll and any needed
-    /// block requests in this sync pass. That keeps hello chatter low within
-    /// one catch-up operation and also lets later relay traffic reuse the same
-    /// connected peer when it stays healthy.
-    fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
-        info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
-        let remote_tip_summary = self.request_tip_from_peer(peer)?;
+    /// This direct path is used when the remote peer has already told us the
+    /// exact tip to chase, such as after `hello` or `announce_tip`.
+    fn sync_to_advertised_tip(
+        &mut self,
+        peer: &PeerEndpoint,
+        remote_tip_summary: &TipSummary,
+    ) -> Result<Vec<Block>, SyncError> {
         debug!(
             peer_addr = %peer.addr,
             remote_tip = %format_hash(remote_tip_summary.tip),
@@ -1172,7 +1279,11 @@ impl Server {
     /// This is best effort by design. A failed catch-up should not reject the
     /// handshake or stop normal message handling on the current stream.
     fn sync_from_hello_best_effort(&mut self, remote_hello: &HelloMessage) -> Vec<Block> {
-        let Some(remote_tip) = remote_hello.tip else {
+        let summary = TipSummary {
+            tip: remote_hello.tip,
+            height: remote_hello.height,
+        };
+        let Some(remote_tip) = summary.tip else {
             return Vec::new();
         };
         if self.state.get_block(&remote_tip).is_some() {
@@ -1189,17 +1300,26 @@ impl Server {
             "starting hello-triggered sync"
         );
         let peer = PeerEndpoint::new(peer_addr.to_string(), remote_hello.node_name.clone());
-        self.sync_from_peer(&peer).unwrap_or_default()
+        self.sync_to_advertised_tip(&peer, &summary).unwrap_or_default()
     }
 
     /// Returns whether one inbound hello advertises chain data this node does
     /// not already know, which makes it worth logging at info level and trying
     /// a follow-up sync.
     fn hello_advances_local_state(&self, remote_hello: &HelloMessage) -> bool {
-        remote_hello
+        self.tip_summary_advances_local_state(&TipSummary {
+            tip: remote_hello.tip,
+            height: remote_hello.height,
+        })
+    }
+
+    /// Returns whether one tip summary advertises chain data this node does not
+    /// already know.
+    fn tip_summary_advances_local_state(&self, summary: &TipSummary) -> bool {
+        summary
             .tip
             .is_some_and(|tip| self.state.get_block(&tip).is_none())
-            || remote_hello.height.unwrap_or(0) > self.state.tip_summary().height.unwrap_or(0)
+            || summary.height.unwrap_or(0) > self.state.tip_summary().height.unwrap_or(0)
     }
 
     /// Applies one fetched block if it is not already indexed locally.
@@ -1295,6 +1415,13 @@ impl Server {
                     Some(message.clone())
                 }
             }
+            WireMessage::AnnounceTip(summary) => {
+                if self.tip_summary_advances_local_state(summary) {
+                    Some(message.clone())
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -1313,6 +1440,18 @@ impl Server {
                 .map(|block| WireMessage::AnnounceBlock { block }),
             _ => None,
         })
+    }
+
+    /// Announces the current best tip when this handler advanced the local tip.
+    fn relay_new_best_tip_if_advanced(
+        &mut self,
+        previous_best_tip: Option<BlockHash>,
+        origin: Option<&RelayOrigin>,
+    ) {
+        if self.state.chain().best_tip() == previous_best_tip {
+            return;
+        }
+        self.relay_best_effort(&WireMessage::AnnounceTip(self.state.tip_summary()), origin);
     }
 
     /// Resolves the best peer address to call back when an inbound stream
@@ -1356,6 +1495,44 @@ impl Server {
                 peer.last_seen_at = Some(now_timestamp_string());
             },
         )
+    }
+
+    /// Records peer metadata learned from one inbound `announce_tip`.
+    fn record_inbound_tip(
+        &mut self,
+        origin: Option<&RelayOrigin>,
+        summary: &TipSummary,
+    ) -> Result<(), SqliteStoreError> {
+        let Some(endpoint) = origin
+            .and_then(|origin| self.sync_peer_from_origin(origin))
+            .or_else(|| {
+                origin.and_then(|origin| {
+                    origin
+                        .advertised_addr
+                        .clone()
+                        .map(|addr| PeerEndpoint::new(addr, origin.node_name.clone()))
+                })
+            })
+        else {
+            return Ok(());
+        };
+
+        let now = now_timestamp_string();
+        if self.sqlite_store.is_some() {
+            return self.update_persisted_peer(&endpoint, PeerSource::Hello, |peer| {
+                peer.advertised_tip_hash = summary.tip;
+                peer.advertised_height = summary.height;
+                peer.last_seen_at = Some(now.clone());
+            });
+        }
+
+        self.ensure_runtime_peer(&endpoint, PeerSource::Hello);
+        if let Some(runtime) = self.peers.get_mut(&endpoint.addr) {
+            runtime.stored.advertised_tip_hash = summary.tip;
+            runtime.stored.advertised_height = summary.height;
+            runtime.stored.last_seen_at = Some(now);
+        }
+        Ok(())
     }
 
     /// Records the start of one outbound sync attempt to a configured peer.
@@ -1440,6 +1617,7 @@ impl Server {
                 endpoint: peer.endpoint(),
                 stored: peer.clone(),
                 connection: None,
+                sync_in_progress: false,
             });
         store.save_peer(&peer)
     }
@@ -1473,7 +1651,16 @@ impl Server {
                 endpoint: endpoint.clone(),
                 stored: StoredPeer::from_endpoint(endpoint.clone(), source),
                 connection: None,
+                sync_in_progress: false,
             });
+    }
+
+    /// Returns whether a sync attempt is already active for one runtime peer.
+    fn peer_sync_in_progress(&self, peer_addr: &str) -> bool {
+        self.peers
+            .get(peer_addr)
+            .map(|peer| peer.sync_in_progress)
+            .unwrap_or(false)
     }
 
     /// Opens and caches one outbound async peer connection if none is live.
@@ -1849,6 +2036,11 @@ fn log_inbound_message(message: &WireMessage, state: &NodeState) {
             tx_count = block.transactions.len(),
             "handling announced block"
         ),
+        WireMessage::AnnounceTip(summary) => info!(
+            tip = %format_hash(summary.tip),
+            height = ?summary.height,
+            "handling announced tip"
+        ),
         WireMessage::MinePending(request) => info!(
             reward = request.reward,
             max_transactions = request.max_transactions,
@@ -1880,6 +2072,7 @@ fn wire_message_name(message: &WireMessage) -> &'static str {
         WireMessage::Hello(_) => "hello",
         WireMessage::GetTip => "get_tip",
         WireMessage::Tip(_) => "tip",
+        WireMessage::AnnounceTip(_) => "announce_tip",
         WireMessage::AnnounceTx { .. } => "announce_tx",
         WireMessage::AnnounceBlock { .. } => "announce_block",
         WireMessage::GetBlock { .. } => "get_block",
@@ -2205,6 +2398,87 @@ mod tests {
         stop_handle.stop();
         let final_state = serve_task.await.unwrap();
         assert!(final_state.mempool().get(&transaction.txid()).is_some());
+    }
+
+    #[test]
+    fn announced_tip_updates_runtime_peer_metadata() {
+        let remote_tip = BlockHash::new([0x77; 32]);
+        let mut server = Server::new(server_config(Some("local")), NodeState::new()).with_peers(
+            vec![PeerEndpoint::new(
+                "127.0.0.1:9001",
+                Some("remote".to_string()),
+            )],
+        );
+        let origin = RelayOrigin {
+            advertised_addr: Some("127.0.0.1:9001".to_string()),
+            node_name: Some("remote".to_string()),
+        };
+
+        let replies = server
+            .handle_peer_message(
+                Some(&origin),
+                WireMessage::AnnounceTip(TipSummary {
+                    tip: Some(remote_tip),
+                    height: Some(3),
+                }),
+            )
+            .unwrap();
+
+        assert!(replies.is_empty());
+        let stored = &server.peers.get("127.0.0.1:9001").unwrap().stored;
+        assert_eq!(stored.advertised_tip_hash, Some(remote_tip));
+        assert_eq!(stored.advertised_height, Some(3));
+    }
+
+    #[test]
+    fn relay_new_best_tip_announces_tip_summary_to_configured_peer() {
+        let miner = crypto::signing_key_from_bytes([73; 32]);
+        let genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &miner.verifying_key(),
+            0,
+        );
+        let expected_tip = genesis.header.block_hash();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut stream).unwrap();
+            let WireMessage::Hello(_) = hello else {
+                panic!("expected hello");
+            };
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: None,
+                    tip: None,
+                    height: None,
+                }),
+            )
+            .unwrap();
+            net::receive_message(&mut stream).unwrap()
+        });
+
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        let mut server = Server::new(server_config(Some("local")), state)
+            .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]);
+        let _runtime = attach_runtime(&mut server);
+
+        server.relay_new_best_tip_if_advanced(None, None);
+
+        let relayed = worker.join().unwrap();
+        assert_eq!(
+            relayed,
+            WireMessage::AnnounceTip(TipSummary {
+                tip: Some(expected_tip),
+                height: Some(0),
+            })
+        );
     }
 
     #[test]
@@ -2639,7 +2913,7 @@ mod tests {
             assert_eq!(
                 request,
                 WireMessage::GetTip,
-                "sync sessions poll the current remote tip before fetching blocks"
+                "explicit sync still polls the current remote tip before fetching blocks"
             );
             net::send_message(
                 &mut stream,
@@ -2707,7 +2981,7 @@ mod tests {
             assert_eq!(
                 request,
                 WireMessage::GetTip,
-                "sync sessions poll the current remote tip before fetching blocks"
+                "explicit sync still polls the current remote tip before fetching blocks"
             );
             net::send_message(
                 &mut stream,
@@ -2775,7 +3049,7 @@ mod tests {
             assert_eq!(
                 request,
                 WireMessage::GetTip,
-                "ancestor sync first polls the advertised tip on the reused connection"
+                "ancestor sync still polls the current remote tip on the reused connection"
             );
             net::send_message(
                 &mut stream,
