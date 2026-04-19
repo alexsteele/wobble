@@ -1,4 +1,10 @@
 //! Server manages the chain, sync protocol, and mining (if enabled).
+//!
+//! A running server owns the authoritative `NodeState`, optional SQLite store,
+//! known peers, and integrated miner. Async listeners and peer transport tasks
+//! forward decoded events into the single-threaded server event loop so sync,
+//! relay, persistence, and chain mutation policy stay centralized in one
+//! place.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -328,15 +334,80 @@ enum ServerEvent {
 }
 
 /// One runtime peer record combining endpoint identity, learned metadata, and
-/// any future live outbound connection state.
+/// any live outbound session state.
+///
+/// This is the server's single runtime record for one known peer address. It
+/// carries persisted metadata, the optional live session handle used for
+/// long-lived sync and relay traffic, and the sync bookkeeping that suppresses
+/// duplicate catch-up work.
 #[derive(Debug)]
 struct RuntimePeer {
     endpoint: PeerEndpoint,
     stored: StoredPeer,
-    connection: Option<peer::PeerHandle>,
+    session: Option<PeerSession>,
     /// Last pushed tip hint this node already acted on for follow-up sync.
     last_tip_sync_hint: Option<TipSummary>,
-    sync_in_progress: bool,
+    sync_state: PeerSyncState,
+}
+
+/// One active outbound peer session owned by the server runtime.
+///
+/// The underlying async peer task owns the TCP stream itself. The server keeps
+/// this higher-level session record so protocol code can reuse one live peer
+/// handle across sync and relay operations without reopening sockets.
+#[derive(Debug)]
+struct PeerSession {
+    handle: peer::PeerHandle,
+}
+
+/// Sync lifecycle for one runtime peer.
+///
+/// `Idle` means no catch-up work is currently active. `Syncing` suppresses
+/// overlapping hello- and tip-triggered sync walks against the same peer until
+/// the current attempt finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSyncState {
+    Idle,
+    Syncing,
+}
+
+impl RuntimePeer {
+    /// Returns the active outbound session for this peer, if connected.
+    fn session(&self) -> Option<&PeerSession> {
+        self.session.as_ref()
+    }
+
+    /// Returns the active outbound session for this peer, if connected.
+    fn session_mut(&mut self) -> Option<&mut PeerSession> {
+        self.session.as_mut()
+    }
+
+    /// Attaches one newly connected outbound session to this peer.
+    fn attach_session(&mut self, session: PeerSession) {
+        self.session = Some(session);
+    }
+
+    /// Disconnects the active outbound session, if any.
+    fn disconnect(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.handle.shutdown();
+        }
+    }
+
+    /// Returns whether this peer is already serving one active sync walk.
+    fn sync_in_progress(&self) -> bool {
+        self.sync_state == PeerSyncState::Syncing
+    }
+
+    /// Marks this peer as actively serving one sync walk.
+    fn begin_sync(&mut self) {
+        self.sync_state = PeerSyncState::Syncing;
+    }
+
+    /// Marks this peer as idle again after one sync walk completes.
+    fn finish_sync(&mut self) {
+        self.sync_state = PeerSyncState::Idle;
+    }
 }
 
 /// One spawned async peer transport task.
@@ -378,9 +449,9 @@ impl Server {
                     RuntimePeer {
                         endpoint: peer.clone(),
                         stored: StoredPeer::from_endpoint(peer, PeerSource::Seed),
-                        connection: None,
+                        session: None,
                         last_tip_sync_hint: None,
-                        sync_in_progress: false,
+                        sync_state: PeerSyncState::Idle,
                     },
                 )
             })
@@ -749,11 +820,11 @@ impl Server {
         let previous_best_tip = self.state.chain().best_tip();
         let previous_mempool_txids = mempool_txids(self.state.mempool());
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
-            runtime_peer.sync_in_progress = true;
+            runtime_peer.begin_sync();
         }
         let accepted_blocks = self.sync_to_advertised_tip(&peer, &summary).unwrap_or_default();
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
-            runtime_peer.sync_in_progress = false;
+            runtime_peer.finish_sync();
         }
         for block in accepted_blocks {
             self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
@@ -1235,12 +1306,12 @@ impl Server {
     /// and call the direct advertised-tip sync path instead.
     fn sync_from_peer(&mut self, peer: &PeerEndpoint) -> Result<Vec<Block>, SyncError> {
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
-            runtime_peer.sync_in_progress = true;
+            runtime_peer.begin_sync();
         }
         info!(peer_addr = %peer.addr, peer_node = ?peer.node_name, "starting sync from peer");
         let result = self.sync_from_peer_inner(peer);
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
-            runtime_peer.sync_in_progress = false;
+            runtime_peer.finish_sync();
         }
         result
     }
@@ -1691,9 +1762,9 @@ impl Server {
             .or_insert_with(|| RuntimePeer {
                 endpoint: peer.endpoint(),
                 stored: peer.clone(),
-                connection: None,
+                session: None,
                 last_tip_sync_hint: None,
-                sync_in_progress: false,
+                sync_state: PeerSyncState::Idle,
             });
         store.save_peer(&peer)
     }
@@ -1726,9 +1797,9 @@ impl Server {
             .or_insert_with(|| RuntimePeer {
                 endpoint: endpoint.clone(),
                 stored: StoredPeer::from_endpoint(endpoint.clone(), source),
-                connection: None,
+                session: None,
                 last_tip_sync_hint: None,
-                sync_in_progress: false,
+                sync_state: PeerSyncState::Idle,
             });
     }
 
@@ -1736,7 +1807,7 @@ impl Server {
     fn peer_sync_in_progress(&self, peer_addr: &str) -> bool {
         self.peers
             .get(peer_addr)
-            .map(|peer| peer.sync_in_progress)
+            .map(RuntimePeer::sync_in_progress)
             .unwrap_or(false)
     }
 
@@ -1756,17 +1827,17 @@ impl Server {
         }
     }
 
-    /// Opens and caches one outbound async peer connection if none is live.
+    /// Opens and caches one outbound peer session if none is live.
     ///
-    /// On success the connection stays attached to the runtime peer record for
+    /// On success the session stays attached to the runtime peer record for
     /// later relay and sync requests. Failed connects still update peer
     /// metadata so selection logic can back off noisy peers.
-    fn ensure_peer_connection(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
+    fn ensure_peer_session(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
         self.ensure_runtime_peer(peer, PeerSource::Seed);
         if self
             .peers
             .get(&peer.addr)
-            .and_then(|runtime| runtime.connection.as_ref())
+            .and_then(RuntimePeer::session)
             .is_some()
         {
             return Ok(());
@@ -1779,13 +1850,15 @@ impl Server {
             .clone();
         let local_hello = peer::local_hello(&self.config, &self.state);
         match peer::connect_peer(&runtime, peer.addr.clone(), local_hello) {
-            Ok((connection, remote_hello)) => {
+            Ok((handle, remote_hello)) => {
                 self.record_peer_connect_success(peer, &remote_hello)
                     .map_err(SyncError::SqlitePersist)?;
                 self.peers
                     .get_mut(&peer.addr)
-                    .expect("runtime peer should exist before caching connection")
-                    .connection = Some(connection);
+                    .expect("runtime peer should exist before caching session")
+                    .attach_session(PeerSession {
+                        handle,
+                    });
                 Ok(())
             }
             Err(err) => {
@@ -1796,28 +1869,41 @@ impl Server {
         }
     }
 
-    /// Drops one cached outbound connection after a transport error so the next
-    /// request can reconnect cleanly.
-    fn clear_peer_connection(&mut self, peer_addr: &str) {
+    /// Disconnects one cached outbound session so the next request can
+    /// reconnect cleanly.
+    fn disconnect_peer(&mut self, peer_addr: &str) {
         if let Some(runtime_peer) = self.peers.get_mut(peer_addr) {
-            if let Some(connection) = runtime_peer.connection.take() {
-                connection.shutdown();
-            }
+            runtime_peer.disconnect();
         }
     }
 
-    /// Sends one `get_tip` request, reconnecting once if a cached connection died.
+    /// Returns the cached outbound session for `peer`.
+    ///
+    /// Callers should first ensure the session exists with
+    /// `ensure_peer_session`.
+    fn peer_session(&self, peer: &PeerEndpoint) -> &PeerSession {
+        self.peers
+            .get(&peer.addr)
+            .and_then(RuntimePeer::session)
+            .expect("peer session should exist after ensure_peer_session")
+    }
+
+    /// Returns the cached outbound session for `peer`.
+    ///
+    /// Callers should first ensure the session exists with
+    /// `ensure_peer_session`.
+    fn peer_session_mut(&mut self, peer: &PeerEndpoint) -> &mut PeerSession {
+        self.peers
+            .get_mut(&peer.addr)
+            .and_then(RuntimePeer::session_mut)
+            .expect("peer session should exist after ensure_peer_session")
+    }
+
+    /// Sends one `get_tip` request, reconnecting once if a cached session died.
     fn request_tip_from_peer(&mut self, peer: &PeerEndpoint) -> Result<TipSummary, SyncError> {
         for attempt in 0..2 {
-            self.ensure_peer_connection(peer)?;
-            let request = {
-                let connection = self
-                    .peers
-                    .get_mut(&peer.addr)
-                    .and_then(|runtime| runtime.connection.as_ref())
-                    .expect("connection should exist after ensure_peer_connection");
-                connection.request_tip()
-            };
+            self.ensure_peer_session(peer)?;
+            let request = self.peer_session(peer).handle.request_tip();
             match request {
                 Ok(summary) => {
                     if self.sqlite_store.is_some() {
@@ -1836,14 +1922,14 @@ impl Server {
                     }
                     return Ok(summary);
                 }
-                Err(_err) if attempt == 0 => self.clear_peer_connection(&peer.addr),
+                Err(_err) if attempt == 0 => self.disconnect_peer(&peer.addr),
                 Err(err) => return Err(SyncError::Request(err)),
             }
         }
         unreachable!("peer tip request should return or error within bounded retries");
     }
 
-    /// Requests one block from a cached connection, reconnecting once after a
+    /// Requests one block from a cached session, reconnecting once after a
     /// broken transport so long sync walks do not redial for every block.
     fn request_block_from_peer(
         &mut self,
@@ -1851,30 +1937,19 @@ impl Server {
         block_hash: BlockHash,
     ) -> Result<Option<Block>, SyncError> {
         for attempt in 0..2 {
-            self.ensure_peer_connection(peer)?;
-            let request = {
-                let connection = self
-                    .peers
-                    .get_mut(&peer.addr)
-                    .and_then(|runtime| runtime.connection.as_ref())
-                    .expect("connection should exist after ensure_peer_connection");
-                connection.request_block(block_hash)
-            };
+            self.ensure_peer_session(peer)?;
+            let request = self.peer_session(peer).handle.request_block(block_hash);
             match request {
                 Ok(block) => return Ok(block),
-                Err(_err) if attempt == 0 => self.clear_peer_connection(&peer.addr),
+                Err(_err) if attempt == 0 => self.disconnect_peer(&peer.addr),
                 Err(err) => return Err(SyncError::Request(err)),
             }
         }
         unreachable!("peer block request should return or error within bounded retries");
     }
 
-    /// Announces one object to a peer, reconnecting once if needed.
-    ///
-    /// Relay currently closes the outbound connection after each announcement.
-    /// `announce_tx` and `announce_block` are one-way messages, so without an
-    /// explicit ack there is no strong liveness signal that a reused socket is
-    /// still attached to the remote server after a restart.
+    /// Announces one object to a peer, reconnecting when the cached session
+    /// has gone stale.
     fn announce_to_peer_best_effort(
         &mut self,
         peer: &PeerEndpoint,
@@ -1884,12 +1959,11 @@ impl Server {
         for attempt in 0..RELAY_CONNECT_ATTEMPTS {
             match self.announce_to_peer_once(peer, message) {
                 Ok(()) => {
-                    self.clear_peer_connection(&peer.addr);
                     return Ok(());
                 }
                 Err(err) => {
                     last_error = Some(err);
-                    self.clear_peer_connection(&peer.addr);
+                    self.disconnect_peer(&peer.addr);
                     if attempt + 1 < RELAY_CONNECT_ATTEMPTS {
                         thread::sleep(RELAY_CONNECT_RETRY_DELAY);
                     }
@@ -1899,20 +1973,16 @@ impl Server {
         Err(last_error.expect("relay attempts should record an error"))
     }
 
-    /// Sends one announcement over the peer's cached outbound connection.
+    /// Sends one announcement over the peer's cached outbound session.
     fn announce_to_peer_once(
         &mut self,
         peer: &PeerEndpoint,
         message: &WireMessage,
     ) -> io::Result<()> {
-        self.ensure_peer_connection(peer)
+        self.ensure_peer_session(peer)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
-        let connection = self
-            .peers
-            .get_mut(&peer.addr)
-            .and_then(|runtime| runtime.connection.as_ref())
-            .expect("connection should exist after ensure_peer_connection");
-        connection.announce(message)
+        let session = self.peer_session_mut(peer);
+        session.handle.announce(message)
     }
 
     /// Returns the configured peer endpoints in a stable address order.
@@ -1936,9 +2006,7 @@ impl Server {
             let _ = miner.stop();
         }
         for runtime_peer in self.peers.values_mut() {
-            if let Some(connection) = runtime_peer.connection.take() {
-                connection.shutdown();
-            }
+            runtime_peer.disconnect();
         }
     }
 }
