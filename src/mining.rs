@@ -1,14 +1,21 @@
-//! Integrated local mining policy and background mining loop.
+//! Integrated local mining policy and cancellable mining worker.
 //!
-//! This module keeps the simple testnet mining configuration separate from the
-//! server's startup and event-dispatch logic. The server still owns node state
-//! and decides how mined blocks are applied, but mining cadence, request
-//! construction, and block assembly live here.
+//! This module owns the mining-side runtime concerns: candidate solving,
+//! cancellation, and background worker lifecycle. The server still owns chain
+//! state, mempool policy, and candidate selection, then submits unsolved block
+//! candidates here for proof-of-work search.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 use ed25519_dalek::VerifyingKey;
-use tokio::task::JoinHandle;
 
 use crate::{
     consensus::{self, BLOCK_SUBSIDY},
@@ -76,20 +83,86 @@ impl MiningConfig {
     }
 }
 
-/// Spawns the integrated mining tick loop when mining is configured.
-pub(crate) fn spawn_mining_loop(
-    handle: ServerHandle,
-    interval: Option<Duration>,
-) -> Option<JoinHandle<()>> {
-    let interval = interval?;
-    Some(tokio::spawn(async move {
-        while !handle.is_stopped() {
-            tokio::time::sleep(interval).await;
-            if handle.notify_mine_tick().await.is_err() {
-                break;
-            }
+/// Unsolved block candidate assembled by the server and submitted to the miner.
+pub type Candidate = Block;
+
+/// Handle for one background miner worker.
+///
+/// The server submits already-assembled block candidates here. Each submit
+/// replaces current work. The worker solves at most one candidate at a time
+/// and sends solved blocks back to the server event loop.
+#[derive(Debug)]
+pub struct Miner {
+    command_tx: mpsc::Sender<MinerCommand>,
+    generation: Arc<AtomicU64>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Miner {
+    /// Starts one background miner that returns solved blocks through `handle`.
+    pub fn start(handle: ServerHandle) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = generation.clone();
+        let worker = thread::spawn(move || run_miner_worker(command_rx, worker_generation, handle));
+        Self {
+            command_tx,
+            generation,
+            worker: Some(worker),
         }
-    }))
+    }
+
+    /// Replaces current work with `candidate`.
+    pub fn submit(&self, candidate: Candidate) -> Result<(), MinerError> {
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.command_tx
+            .send(MinerCommand::Submit {
+                generation,
+                candidate,
+            })
+            .map_err(|_| MinerError::SubmitClosed)
+    }
+
+    /// Cancels the current attempt but leaves the miner running.
+    pub fn cancel(&self) -> Result<(), MinerError> {
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.command_tx
+            .send(MinerCommand::Cancel { generation })
+            .map_err(|_| MinerError::SubmitClosed)
+    }
+
+    /// Cancels current work and stops the miner thread.
+    pub fn stop(mut self) -> Result<(), MinerError> {
+        let _ = self.generation.fetch_add(1, Ordering::Relaxed);
+        let _ = self.command_tx.send(MinerCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| MinerError::WorkerPanicked)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum MinerError {
+    SubmitClosed,
+    WorkerPanicked,
+}
+
+enum MinerCommand {
+    Submit {
+        generation: u64,
+        candidate: Candidate,
+    },
+    Cancel {
+        generation: u64,
+    },
+    Stop,
 }
 
 /// Builds a coinbase transaction paying `reward` to `miner_verifying_key`.
@@ -112,20 +185,18 @@ fn coinbase_transaction(
     }
 }
 
-/// Builds and mines one block by searching nonces until the header satisfies `bits`.
+/// Builds one unsolved candidate block from the selected transactions.
 ///
-/// The caller supplies the parent hash, total coinbase reward, miner key, and
-/// already-selected non-coinbase transactions. This helper prepends the
-/// coinbase, computes the Merkle root, and then increments the nonce until the
-/// block passes proof-of-work validation.
-pub fn mine_block(
+/// The server owns transaction selection and parent-tip choice. This helper
+/// just assembles the candidate block shape the miner will solve.
+pub fn build_candidate(
     prev_blockhash: BlockHash,
     reward: u64,
     miner_verifying_key: &VerifyingKey,
     uniqueness: u32,
     bits: u32,
     mut transactions: Vec<Transaction>,
-) -> Block {
+) -> Candidate {
     let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
     full_transactions.push(coinbase_transaction(
         reward,
@@ -147,10 +218,106 @@ pub fn mine_block(
     };
     block.header.merkle_root = block.merkle_root();
 
+    block
+}
+
+/// Solves one candidate by searching nonces until the header satisfies `bits`.
+pub fn solve_candidate(mut candidate: Candidate) -> Block {
     loop {
-        if consensus::validate_block(&block).is_ok() {
-            return block;
+        if consensus::validate_block(&candidate).is_ok() {
+            return candidate;
         }
-        block.header.nonce = block.header.nonce.wrapping_add(1);
+        candidate.header.nonce = candidate.header.nonce.wrapping_add(1);
+    }
+}
+
+/// Builds and mines one block by searching nonces until the header satisfies `bits`.
+///
+/// This remains as the synchronous convenience helper used by existing tests
+/// and direct state-mutating paths.
+pub fn mine_block(
+    prev_blockhash: BlockHash,
+    reward: u64,
+    miner_verifying_key: &VerifyingKey,
+    uniqueness: u32,
+    bits: u32,
+    transactions: Vec<Transaction>,
+) -> Block {
+    solve_candidate(build_candidate(
+        prev_blockhash,
+        reward,
+        miner_verifying_key,
+        uniqueness,
+        bits,
+        transactions,
+    ))
+}
+
+const CANCEL_CHECK_INTERVAL: u32 = 4096;
+
+fn run_miner_worker(
+    command_rx: mpsc::Receiver<MinerCommand>,
+    generation: Arc<AtomicU64>,
+    handle: ServerHandle,
+) {
+    let mut current: Option<(u64, Candidate)> = None;
+
+    loop {
+        if current.is_none() {
+            match command_rx.recv() {
+                Ok(MinerCommand::Submit {
+                    generation,
+                    candidate,
+                }) => current = Some((generation, candidate)),
+                Ok(MinerCommand::Cancel { .. }) => {}
+                Ok(MinerCommand::Stop) | Err(_) => break,
+            }
+            continue;
+        }
+
+        let mut replace_current = false;
+        {
+            let (candidate_generation, candidate) =
+                current.as_mut().expect("current candidate should exist while mining");
+            loop {
+                if generation.load(Ordering::Relaxed) != *candidate_generation {
+                    replace_current = true;
+                    break;
+                }
+                if consensus::validate_block(candidate).is_ok() {
+                    let solved = candidate.clone();
+                    let _ = handle.notify_mined_block(solved);
+                    current = None;
+                    replace_current = false;
+                    break;
+                }
+                candidate.header.nonce = candidate.header.nonce.wrapping_add(1);
+                if candidate.header.nonce % CANCEL_CHECK_INTERVAL == 0 {
+                    break;
+                }
+            }
+        }
+
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                MinerCommand::Submit {
+                    generation,
+                    candidate,
+                } => {
+                    current = Some((generation, candidate));
+                    replace_current = false;
+                }
+                MinerCommand::Cancel { generation } => {
+                    let _ = generation;
+                    current = None;
+                    replace_current = false;
+                }
+                MinerCommand::Stop => return,
+            }
+        }
+
+        if replace_current {
+            current = None;
+        }
     }
 }

@@ -26,7 +26,7 @@ use crate::{
     client::{ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
     mempool::MempoolError,
-    mining::{MiningConfig, spawn_mining_loop},
+    mining::{self, MiningConfig, Miner},
     node_state::{NodeState, NodeStateError},
     peer::{self, PeerError},
     peers::{PeerSource, StoredPeer},
@@ -200,14 +200,6 @@ impl ServerHandle {
             .map_err(|_| ServerHandleError::SubmitClosed)
     }
 
-    /// Triggers one mining poll against the owned server state.
-    pub(crate) async fn notify_mine_tick(&self) -> Result<(), ServerHandleError> {
-        self.command_tx
-            .send(ServerEvent::MineTick)
-            .await
-            .map_err(|_| ServerHandleError::SubmitClosed)
-    }
-
     /// Requests one follow-up sync check after a peer hello has been answered.
     pub(crate) async fn notify_hello_sync(
         &self,
@@ -242,6 +234,13 @@ impl ServerHandle {
     pub(crate) fn is_stopped(&self) -> bool {
         self.stop_requested.load(Ordering::Relaxed)
     }
+
+    /// Submits one solved block back into the server event loop.
+    pub(crate) fn notify_mined_block(&self, block: Block) -> Result<(), ServerHandleError> {
+        self.command_tx
+            .blocking_send(ServerEvent::MinedCandidate { block })
+            .map_err(|_| ServerHandleError::SubmitClosed)
+    }
 }
 
 #[derive(Debug)]
@@ -254,6 +253,7 @@ pub struct Server {
     runtime_handle: Option<TokioHandle>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
+    miner: Option<Miner>,
     control: ServerControl,
 }
 
@@ -321,7 +321,9 @@ enum ServerEvent {
         origin: RelayOrigin,
         summary: TipSummary,
     },
-    MineTick,
+    MinedCandidate {
+        block: Block,
+    },
     Stop,
 }
 
@@ -361,6 +363,7 @@ impl Server {
             runtime_handle: None,
             bootstrap_sync: false,
             mining: None,
+            miner: None,
             control: ServerControl::default(),
         }
     }
@@ -453,7 +456,6 @@ impl Server {
             None => None,
         };
         self.runtime_handle = Some(tokio::runtime::Handle::current());
-        let mining_interval = self.mining.as_ref().map(|config| config.interval);
         let bootstrap_pending = self.bootstrap_sync;
         let stop_requested = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel(self.config.channel_capacity);
@@ -461,6 +463,9 @@ impl Server {
             command_tx,
             stop_requested: stop_requested.clone(),
         };
+        if self.mining.is_some() {
+            self.miner = Some(Miner::start(handle.clone()));
+        }
         let worker = std::thread::spawn(move || self.run_event_loop(command_rx, stop_requested));
 
         if bootstrap_pending {
@@ -473,7 +478,6 @@ impl Server {
             let _ = ready.send(handle.clone());
         }
 
-        let mining_task = spawn_mining_loop(handle.clone(), mining_interval);
         let mut peers: HashMap<String, LivePeerTask> = HashMap::new();
         let mut next_inbound_peer_id = 0_u64;
 
@@ -499,9 +503,6 @@ impl Server {
         }
 
         let _ = handle.command_tx.try_send(ServerEvent::Stop);
-        if let Some(task) = mining_task {
-            task.abort();
-        }
         peers.clear();
 
         let server = worker
@@ -541,6 +542,7 @@ impl Server {
                     self.sync_configured_peers_best_effort();
                     self.bootstrap_sync = false;
                 }
+                self.refresh_mining_candidate();
                 let _ = reply.send(());
                 true
             }
@@ -575,10 +577,8 @@ impl Server {
                 self.handle_tip_sync(origin, summary);
                 true
             }
-            ServerEvent::MineTick => {
-                if let Err(err) = self.mine_pending_best_effort() {
-                    warn!(error = %err, "integrated mining tick failed");
-                }
+            ServerEvent::MinedCandidate { block } => {
+                self.handle_mined_candidate(block);
                 true
             }
             ServerEvent::Stop => false,
@@ -699,6 +699,8 @@ impl Server {
         if !self.hello_advances_local_state(&remote_hello) {
             return;
         }
+        let previous_best_tip = self.state.chain().best_tip();
+        let previous_mempool_txids = mempool_txids(self.state.mempool());
         let origin = RelayOrigin {
             advertised_addr: remote_hello.advertised_addr.clone(),
             node_name: remote_hello.node_name.clone(),
@@ -710,6 +712,7 @@ impl Server {
             );
             self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
         }
+        self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
     }
 
     /// Runs one follow-up sync after a peer announces a better tip.
@@ -744,6 +747,7 @@ impl Server {
             "starting tip-triggered sync"
         );
         let previous_best_tip = self.state.chain().best_tip();
+        let previous_mempool_txids = mempool_txids(self.state.mempool());
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
             runtime_peer.sync_in_progress = true;
         }
@@ -755,6 +759,7 @@ impl Server {
             self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
         }
         self.relay_new_best_tip_if_advanced(previous_best_tip, Some(&origin));
+        self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
     }
 
     /// Handles one `get_tip` query by returning the current best-tip summary.
@@ -865,6 +870,7 @@ impl Server {
             self.relay_best_effort(&relay, origin);
         }
         self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
+        self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
         Ok(replies)
     }
 
@@ -912,6 +918,7 @@ impl Server {
             self.relay_best_effort(&relay, origin);
         }
         self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
+        self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
         Ok(replies)
     }
 
@@ -958,6 +965,7 @@ impl Server {
                     self.relay_best_effort(&relay, origin);
                 }
                 self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
+                self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
                 return Ok(Some(replies));
             }
             Err(PeerError::BlockRejected(err))
@@ -1007,6 +1015,7 @@ impl Server {
             self.relay_best_effort(&relay, origin);
         }
         self.relay_new_best_tip_if_advanced(previous_best_tip, origin);
+        self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
         Ok(Some(replies))
     }
 
@@ -1091,37 +1100,76 @@ impl Server {
     /// Mines one block from the current mempool when integrated mining is
     /// enabled and there is pending work to confirm.
     ///
-    /// This intentionally skips coinbase-only blocks so a quiet testnet node
-    /// does not produce an endless stream of empty blocks.
-    fn mine_pending_best_effort(&mut self) -> io::Result<()> {
-        let Some(mining) = self.mining.as_mut() else {
-            return Ok(());
+    /// The server owns candidate selection from the current tip and mempool,
+    /// then hands that candidate to the background miner. Empty mempools cancel
+    /// any active attempt so the node does not keep solving stale work.
+    fn refresh_mining_candidate(&mut self) {
+        if self.mining.is_none() {
+            return;
+        }
+        let candidate = self.build_mining_candidate();
+        let Some(miner) = self.miner.as_ref() else {
+            return;
         };
+        let Some(candidate) = candidate else {
+            debug!("mining candidate refresh found no work; cancelling current attempt");
+            let _ = miner.cancel();
+            return;
+        };
+        let _ = miner.submit(candidate);
+    }
+
+    /// Builds one candidate block from the current best tip and valid mempool transactions.
+    fn build_mining_candidate(&mut self) -> Option<mining::Candidate> {
+        let mining = self.mining.as_mut()?;
         if self.state.mempool().is_empty() {
-            debug!("mine_pending skipped because mempool is empty");
-            return Ok(());
+            return None;
         }
 
         let request = mining.next_request();
-        debug!(
-            uniqueness = request.uniqueness,
-            reward = request.reward,
-            max_transactions = request.max_transactions,
-            bits = format_args!("{:#010x}", request.bits),
-            mempool_size = self.state.mempool().len(),
-            "mine_pending: submitting internal mine_pending request"
-        );
-        let replies = self
-            .handle_message(WireMessage::MinePending(request))
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
-        if let Some(WireMessage::MinedBlock(result)) = replies.first() {
-            info!(
-                block_hash = %format_hash(Some(result.block_hash)),
-                best_tip = %format_hash(self.state.chain().best_tip()),
-                "mine_pending accepted block"
-            );
+        let prev = self.state.chain().best_tip().unwrap_or_default();
+        let (pending, _included_ids) = self
+            .state
+            .mempool()
+            .collect_valid(self.state.active_utxos(), request.max_transactions);
+        if pending.is_empty() {
+            return None;
         }
-        Ok(())
+        let total_fees = pending
+            .iter()
+            .try_fold(0_u64, |total, tx| {
+                self.state.active_utxos().transaction_fee(tx).and_then(|fee| {
+                    total
+                        .checked_add(fee)
+                        .ok_or(crate::state::ValidationError::InputValueOverflow)
+                })
+            })
+            .ok()?;
+        let miner_key = crate::crypto::parse_verifying_key(&request.miner_public_key)?;
+        Some(crate::mining::build_candidate(
+            prev,
+            request.reward + total_fees,
+            &miner_key,
+            request.uniqueness,
+            request.bits,
+            pending,
+        ))
+    }
+
+    /// Accepts one solved block returned by the background miner when it is still current.
+    fn handle_mined_candidate(&mut self, block: Block) {
+        let expected_parent = self.state.chain().best_tip().unwrap_or_default();
+        if block.header.prev_blockhash != expected_parent {
+            debug!(
+                candidate_parent = %format_hash(Some(block.header.prev_blockhash)),
+                current_tip = %format_hash(self.state.chain().best_tip()),
+                "discarding stale mined candidate"
+            );
+            return;
+        }
+        if let Err(err) = self.handle_peer_announce_block(block, None) {
+            warn!(error = ?err, "mined candidate acceptance failed");
+        }
     }
 
     /// Attempts a one-time startup sync from each configured peer.
@@ -1465,6 +1513,20 @@ impl Server {
             return;
         }
         self.relay_best_effort(&WireMessage::AnnounceTip(self.state.tip_summary()), origin);
+    }
+
+    /// Updates background mining only when tip or mempool contents changed.
+    fn maybe_refresh_mining(
+        &mut self,
+        previous_best_tip: Option<BlockHash>,
+        previous_mempool_txids: &HashSet<Txid>,
+    ) {
+        if self.state.chain().best_tip() == previous_best_tip
+            && mempool_txids(self.state.mempool()) == *previous_mempool_txids
+        {
+            return;
+        }
+        self.refresh_mining_candidate();
     }
 
     /// Resolves the best peer address to call back when an inbound stream
@@ -1870,6 +1932,9 @@ impl Server {
     /// sessions without relying on server drop timing. The current testnet
     /// harness uses it to make multi-node teardown deterministic.
     pub fn disconnect(&mut self) {
+        if let Some(miner) = self.miner.take() {
+            let _ = miner.stop();
+        }
         for runtime_peer in self.peers.values_mut() {
             if let Some(connection) = runtime_peer.connection.take() {
                 connection.shutdown();
@@ -3333,7 +3398,11 @@ mod tests {
             MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
         );
 
-        server.mine_pending_best_effort().unwrap();
+        let candidate = server
+            .build_mining_candidate()
+            .expect("mempool-backed candidate should exist");
+        let solved = crate::mining::solve_candidate(candidate);
+        server.handle_mined_candidate(solved);
 
         assert!(server.state().mempool().is_empty());
         let tip = server.state().chain().best_tip().unwrap();
