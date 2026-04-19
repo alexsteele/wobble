@@ -257,6 +257,7 @@ pub struct Server {
     connected_peers: HashSet<String>,
     sqlite_store: Option<sqlite_store::SqliteStore>,
     runtime_handle: Option<TokioHandle>,
+    server_handle: Option<ServerHandle>,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
     miner: Option<Miner>,
@@ -377,11 +378,6 @@ impl RuntimePeer {
         self.session.as_ref()
     }
 
-    /// Returns the active outbound session for this peer, if connected.
-    fn session_mut(&mut self) -> Option<&mut PeerSession> {
-        self.session.as_mut()
-    }
-
     /// Attaches one newly connected outbound session to this peer.
     fn attach_session(&mut self, session: PeerSession) {
         self.session = Some(session);
@@ -432,6 +428,7 @@ impl Server {
             connected_peers: HashSet::new(),
             sqlite_store: None,
             runtime_handle: None,
+            server_handle: None,
             bootstrap_sync: false,
             mining: None,
             miner: None,
@@ -534,6 +531,7 @@ impl Server {
             command_tx,
             stop_requested: stop_requested.clone(),
         };
+        self.server_handle = Some(handle.clone());
         if self.mining.is_some() {
             self.miner = Some(Miner::start(handle.clone()));
         }
@@ -1827,43 +1825,63 @@ impl Server {
         }
     }
 
-    /// Opens and caches one outbound peer session if none is live.
+    /// Ensures `peer` has one live outbound connection and returns its current
+    /// transport handle.
     ///
     /// On success the session stays attached to the runtime peer record for
     /// later relay and sync requests. Failed connects still update peer
     /// metadata so selection logic can back off noisy peers.
-    fn ensure_peer_session(&mut self, peer: &PeerEndpoint) -> Result<(), SyncError> {
-        self.ensure_runtime_peer(peer, PeerSource::Seed);
+    fn ensure_peer_connected(
+        &mut self,
+        endpoint: &PeerEndpoint,
+    ) -> Result<&peer::PeerHandle, SyncError> {
+        self.ensure_runtime_peer(endpoint, PeerSource::Seed);
         if self
             .peers
-            .get(&peer.addr)
+            .get(&endpoint.addr)
             .and_then(RuntimePeer::session)
             .is_some()
         {
-            return Ok(());
+            let peer = &self
+                .peers
+                .get(&endpoint.addr)
+                .and_then(RuntimePeer::session)
+                .expect("peer session should exist after connection check")
+                .handle;
+            return Ok(peer);
         }
-        let _ = self.record_peer_connect_attempt(peer);
+        let _ = self.record_peer_connect_attempt(endpoint);
         let runtime = self
             .runtime_handle
             .as_ref()
             .expect("async runtime handle should exist before outbound peer use")
             .clone();
+        let server = self.server_handle.clone();
         let local_hello = peer::local_hello(&self.config, &self.state);
-        match peer::connect_peer(&runtime, peer.addr.clone(), local_hello) {
+        match peer::connect_peer(
+            &runtime,
+            endpoint.addr.clone(),
+            endpoint.addr.clone(),
+            local_hello,
+            server,
+        ) {
             Ok((handle, remote_hello)) => {
-                self.record_peer_connect_success(peer, &remote_hello)
+                self.record_peer_connect_success(endpoint, &remote_hello)
                     .map_err(SyncError::SqlitePersist)?;
                 self.peers
-                    .get_mut(&peer.addr)
+                    .get_mut(&endpoint.addr)
                     .expect("runtime peer should exist before caching session")
-                    .attach_session(PeerSession {
-                        handle,
-                    });
-                Ok(())
+                    .attach_session(PeerSession { handle });
+                Ok(&self
+                    .peers
+                    .get(&endpoint.addr)
+                    .and_then(RuntimePeer::session)
+                    .expect("peer session should exist after successful connect")
+                    .handle)
             }
             Err(err) => {
                 let sync_err = SyncError::Handshake(err);
-                let _ = self.record_peer_connect_failure(peer, &sync_err);
+                let _ = self.record_peer_connect_failure(endpoint, &sync_err);
                 Err(sync_err)
             }
         }
@@ -1877,33 +1895,10 @@ impl Server {
         }
     }
 
-    /// Returns the cached outbound session for `peer`.
-    ///
-    /// Callers should first ensure the session exists with
-    /// `ensure_peer_session`.
-    fn peer_session(&self, peer: &PeerEndpoint) -> &PeerSession {
-        self.peers
-            .get(&peer.addr)
-            .and_then(RuntimePeer::session)
-            .expect("peer session should exist after ensure_peer_session")
-    }
-
-    /// Returns the cached outbound session for `peer`.
-    ///
-    /// Callers should first ensure the session exists with
-    /// `ensure_peer_session`.
-    fn peer_session_mut(&mut self, peer: &PeerEndpoint) -> &mut PeerSession {
-        self.peers
-            .get_mut(&peer.addr)
-            .and_then(RuntimePeer::session_mut)
-            .expect("peer session should exist after ensure_peer_session")
-    }
-
     /// Sends one `get_tip` request, reconnecting once if a cached session died.
     fn request_tip_from_peer(&mut self, peer: &PeerEndpoint) -> Result<TipSummary, SyncError> {
         for attempt in 0..2 {
-            self.ensure_peer_session(peer)?;
-            let request = self.peer_session(peer).handle.request_tip();
+            let request = self.ensure_peer_connected(peer)?.request_tip();
             match request {
                 Ok(summary) => {
                     if self.sqlite_store.is_some() {
@@ -1937,8 +1932,7 @@ impl Server {
         block_hash: BlockHash,
     ) -> Result<Option<Block>, SyncError> {
         for attempt in 0..2 {
-            self.ensure_peer_session(peer)?;
-            let request = self.peer_session(peer).handle.request_block(block_hash);
+            let request = self.ensure_peer_connected(peer)?.request_block(block_hash);
             match request {
                 Ok(block) => return Ok(block),
                 Err(_err) if attempt == 0 => self.disconnect_peer(&peer.addr),
@@ -1979,10 +1973,10 @@ impl Server {
         peer: &PeerEndpoint,
         message: &WireMessage,
     ) -> io::Result<()> {
-        self.ensure_peer_session(peer)
+        let peer = self
+            .ensure_peer_connected(peer)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
-        let session = self.peer_session_mut(peer);
-        session.handle.announce(message)
+        peer.announce(message)
     }
 
     /// Returns the configured peer endpoints in a stable address order.
@@ -2056,12 +2050,7 @@ fn spawn_peer_task(
     peer_id: String,
     stream: tokio::net::TcpStream,
 ) {
-    let peer_id_for_task = peer_id.clone();
-    let worker = tokio::spawn(async move {
-        let _ = handle.notify_peer_connected(peer_id_for_task.clone()).await;
-        peer::serve_peer_stream(peer_id_for_task.clone(), handle.clone(), stream).await;
-        let _ = handle.notify_peer_disconnected(peer_id_for_task).await;
-    });
+    let worker = tokio::spawn(peer::serve_peer_stream(peer_id.clone(), handle, stream));
     peers.insert(peer_id, LivePeerTask { worker });
 }
 
@@ -3389,35 +3378,37 @@ mod tests {
     }
 
     #[test]
-    fn relay_best_effort_reconnects_for_each_announcement() {
+    fn relay_best_effort_reuses_connected_session_for_multiple_announcements() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let worker = thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let reader_stream = stream.try_clone().unwrap();
-                let mut reader = io::BufReader::new(reader_stream);
-                let hello = net::receive_message_from_reader(&mut reader).unwrap();
-                let WireMessage::Hello(_) = hello else {
-                    panic!("expected hello");
-                };
-                net::send_message(
-                    &mut stream,
-                    &WireMessage::Hello(HelloMessage {
-                        network: "wobble-local".to_string(),
-                        version: PROTOCOL_VERSION,
-                        node_name: Some("remote".to_string()),
-                        advertised_addr: None,
-                        tip: None,
-                        height: None,
-                    }),
-                )
-                .unwrap();
-                assert!(matches!(
-                    net::receive_message_from_reader(&mut reader).unwrap(),
-                    WireMessage::AnnounceTx { .. }
-                ));
-            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let reader_stream = stream.try_clone().unwrap();
+            let mut reader = io::BufReader::new(reader_stream);
+            let hello = net::receive_message_from_reader(&mut reader).unwrap();
+            let WireMessage::Hello(_) = hello else {
+                panic!("expected hello");
+            };
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: None,
+                    tip: None,
+                    height: None,
+                }),
+            )
+            .unwrap();
+            assert!(matches!(
+                net::receive_message_from_reader(&mut reader).unwrap(),
+                WireMessage::AnnounceTx { .. }
+            ));
+            assert!(matches!(
+                net::receive_message_from_reader(&mut reader).unwrap(),
+                WireMessage::AnnounceTx { .. }
+            ));
         });
 
         let mut server = Server::new(server_config(Some("local")), NodeState::new())

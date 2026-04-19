@@ -1,11 +1,14 @@
 //! Peer protocol and transport helpers for node-to-node communication.
 //!
-//! This module validates the initial handshake and handles a small set of
-//! protocol messages against local `NodeState`. The first version is
-//! intentionally conservative: it supports compatibility checks, tip queries,
-//! and block fetches before adding background relay loops or peer management.
-//! It also owns the low-level peer stream and outbound connection mechanics so `server`
-//! can stay focused on startup, event dispatch, and node-state policy.
+//! This module validates peer handshakes, handles wire-message protocol rules,
+//! and owns the low-level peer transport tasks. `server` remains the sole
+//! authority for chain state and sync policy, while `peer` owns the duplex
+//! socket loops that:
+//! - complete the initial handshake
+//! - read unsolicited peer messages
+//! - write outbound requests and announcements
+//! - forward inbound activity back into the server event queue
+//! - match one in-flight request/response at a time for sync operations
 
 use std::{
     io,
@@ -27,6 +30,7 @@ use tokio::{
     net::TcpStream,
     runtime::Handle,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    time::Instant,
 };
 
 /// Reasons a remote peer message was rejected at the protocol layer.
@@ -112,8 +116,10 @@ impl PeerHandle {
 /// plus the remote hello learned during handshake.
 pub(crate) fn connect_peer(
     runtime: &Handle,
+    peer_id: String,
     peer_addr: String,
     local_hello: HelloMessage,
+    server: Option<ServerHandle>,
 ) -> Result<(PeerHandle, HelloMessage), ClientError> {
     let (command_tx, command_rx) = unbounded_channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -121,8 +127,19 @@ pub(crate) fn connect_peer(
         let ready = open_peer_connection(peer_addr, local_hello).await;
         match ready {
             Ok((remote_hello, reader, writer)) => {
-                let _ = ready_tx.send(Ok(remote_hello));
-                run_peer_task(reader, writer, command_rx).await;
+                let _ = ready_tx.send(Ok(remote_hello.clone()));
+                run_peer_task(
+                    peer_id,
+                    server,
+                    reader,
+                    writer,
+                    Some(command_rx),
+                    RelayOrigin {
+                        advertised_addr: remote_hello.advertised_addr.clone(),
+                        node_name: remote_hello.node_name.clone(),
+                    },
+                )
+                .await;
             }
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
@@ -149,6 +166,20 @@ enum PeerCommand {
         reply: mpsc::SyncSender<io::Result<()>>,
     },
     Shutdown,
+}
+
+/// One outstanding request waiting for the next matching peer response.
+///
+/// We intentionally allow only one in-flight request at a time per live peer
+/// session. That keeps response matching simple while still supporting the
+/// current sync flow of serialized `get_tip`/`get_block` walks.
+enum PendingRequest {
+    Tip {
+        reply: mpsc::SyncSender<Result<TipSummary, RequestError>>,
+    },
+    Block {
+        reply: mpsc::SyncSender<Result<Option<Block>, RequestError>>,
+    },
 }
 
 /// Connects and completes the outbound peer handshake.
@@ -183,71 +214,277 @@ async fn open_peer_connection(
     Ok((remote_hello, reader, writer))
 }
 
-/// Runs one persistent outbound peer connection for sync and relay traffic.
+/// Runs one persistent peer session for sync, relay, and unsolicited inbound
+/// messages on the same socket.
+///
+/// The session owns the low-level duplex transport. It forwards inbound peer
+/// messages into the server event loop and also serves one in-flight
+/// request/response at a time for sync operations.
 async fn run_peer_task(
+    peer_id: String,
+    handle: Option<ServerHandle>,
     mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
-    mut command_rx: UnboundedReceiver<PeerCommand>,
+    mut command_rx: Option<UnboundedReceiver<PeerCommand>>,
+    mut origin: RelayOrigin,
 ) {
-    while let Some(command) = command_rx.recv().await {
-        let keep_running = match command {
-            PeerCommand::RequestTip { reply } => {
-                let result = handle_outbound_request_tip(&mut writer, &mut reader).await;
-                let _ = reply.send(result);
-                true
+    if let Some(handle) = handle.as_ref() {
+        let _ = handle.notify_peer_connected(peer_id.clone()).await;
+    }
+    let mut pending_request = None;
+    let mut pending_deadline = None;
+    loop {
+        tokio::select! {
+            command = recv_peer_command(&mut command_rx), if command_rx.is_some() => {
+                match command {
+                    Some(command) => {
+                        let keep_running = handle_peer_command(
+                            &mut writer,
+                            command,
+                            &mut pending_request,
+                            &mut pending_deadline,
+                        ).await;
+                        if !keep_running {
+                            break;
+                        }
+                    }
+                    None => {
+                        command_rx = None;
+                    }
+                }
             }
-            PeerCommand::RequestBlock { block_hash, reply } => {
-                let result = handle_outbound_request_block(&mut writer, &mut reader, block_hash).await;
-                let _ = reply.send(result);
-                true
+            read = receive_async_message(&mut reader) => {
+                let message = match read {
+                    Ok(message) => message,
+                    Err(err) => {
+                        fail_pending_request(&mut pending_request, err, None);
+                        break;
+                    }
+                };
+                if handle_inbound_message(
+                    &peer_id,
+                    handle.as_ref(),
+                    &mut writer,
+                    &mut pending_request,
+                    &mut pending_deadline,
+                    &mut origin,
+                    message,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
             }
-            PeerCommand::Announce { message, reply } => {
-                let result = send_async_message(&mut writer, &message).await;
-                let keep_running = result.is_ok();
-                let _ = reply.send(result);
-                keep_running
+            _ = sleep_until_deadline(pending_deadline), if pending_deadline.is_some() => {
+                fail_pending_request_with_error(
+                    &mut pending_request,
+                    RequestError::Receive(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "peer request timed out",
+                    )),
+                );
+                pending_deadline = None;
             }
-            PeerCommand::Shutdown => false,
+        }
+    }
+    fail_pending_request(
+        &mut pending_request,
+        io::Error::new(io::ErrorKind::BrokenPipe, "peer session closed"),
+        Some(io::ErrorKind::BrokenPipe),
+    );
+    if let Some(handle) = handle.as_ref() {
+        let _ = handle.notify_peer_disconnected(peer_id).await;
+    }
+}
+
+/// Sends one outbound peer command onto the live session writer.
+///
+/// Request commands install a single pending waiter so the next matching
+/// inbound response can be delivered back to the caller.
+async fn handle_peer_command(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    command: PeerCommand,
+    pending_request: &mut Option<PendingRequest>,
+    pending_deadline: &mut Option<Instant>,
+) -> bool {
+    match command {
+        PeerCommand::RequestTip { reply } => {
+            if pending_request.is_some() {
+                let _ = reply.send(Err(RequestError::Receive(io::Error::other(
+                    "peer already has a pending request",
+                ))));
+                return true;
+            }
+            match send_async_message(writer, &WireMessage::GetTip).await {
+                Ok(()) => {
+                    *pending_request = Some(PendingRequest::Tip { reply });
+                    *pending_deadline = Some(Instant::now() + OUTBOUND_PEER_IO_TIMEOUT);
+                    true
+                }
+                Err(err) => {
+                    let _ = reply.send(Err(RequestError::Send(err)));
+                    false
+                }
+            }
+        }
+        PeerCommand::RequestBlock { block_hash, reply } => {
+            if pending_request.is_some() {
+                let _ = reply.send(Err(RequestError::Receive(io::Error::other(
+                    "peer already has a pending request",
+                ))));
+                return true;
+            }
+            match send_async_message(writer, &WireMessage::GetBlock { block_hash }).await {
+                Ok(()) => {
+                    *pending_request = Some(PendingRequest::Block { reply });
+                    *pending_deadline = Some(Instant::now() + OUTBOUND_PEER_IO_TIMEOUT);
+                    true
+                }
+                Err(err) => {
+                    let _ = reply.send(Err(RequestError::Send(err)));
+                    false
+                }
+            }
+        }
+        PeerCommand::Announce { message, reply } => {
+            let result = send_async_message(writer, &message).await;
+            let keep_running = result.is_ok();
+            let _ = reply.send(result);
+            keep_running
+        }
+        PeerCommand::Shutdown => false,
+    }
+}
+
+/// Handles one inbound wire message on a live peer session.
+///
+/// Matching request responses are delivered to the waiting caller. All other
+/// peer messages are forwarded into the server event loop so `Server` remains
+/// the only protocol/state authority.
+async fn handle_inbound_message(
+    peer_id: &str,
+    handle: Option<&ServerHandle>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    pending_request: &mut Option<PendingRequest>,
+    pending_deadline: &mut Option<Instant>,
+    origin: &mut RelayOrigin,
+    message: WireMessage,
+) -> io::Result<()> {
+    if try_complete_pending_request(pending_request, message.clone()) {
+        *pending_deadline = None;
+        return Ok(());
+    }
+
+    let mut hello_for_follow_up_sync = None;
+    let mut tip_for_follow_up_sync = None;
+    if let WireMessage::Hello(remote_hello) = &message {
+        *origin = RelayOrigin {
+            advertised_addr: remote_hello.advertised_addr.clone(),
+            node_name: remote_hello.node_name.clone(),
         };
-        if !keep_running {
-            break;
+        hello_for_follow_up_sync = Some(remote_hello.clone());
+    } else if let WireMessage::AnnounceTip(summary) = &message {
+        tip_for_follow_up_sync = Some(summary.clone());
+    }
+
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+
+    let replies = handle
+        .request_peer_message(peer_id.to_string(), Some(origin.clone()), message)
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, format!("{err:?}")))?
+        .map_err(|err| io::Error::other(format!("{err:?}")))?;
+    for reply in replies {
+        send_async_message(writer, &reply).await?;
+    }
+    if let Some(remote_hello) = hello_for_follow_up_sync {
+        let _ = handle.notify_hello_sync(remote_hello).await;
+    }
+    if let Some(summary) = tip_for_follow_up_sync {
+        let _ = handle.notify_tip_sync(origin.clone(), summary).await;
+    }
+    Ok(())
+}
+
+/// Attempts to match one inbound response against the current pending request.
+///
+/// Returns `true` when the message was consumed as a request response and
+/// should not also be forwarded into the server event loop.
+fn try_complete_pending_request(
+    pending_request: &mut Option<PendingRequest>,
+    message: WireMessage,
+) -> bool {
+    let Some(pending) = pending_request.take() else {
+        return false;
+    };
+    match (pending, message) {
+        (PendingRequest::Tip { reply }, WireMessage::Tip(summary)) => {
+            let _ = reply.send(Ok(summary));
+            true
+        }
+        (PendingRequest::Block { reply }, WireMessage::Block { block }) => {
+            let _ = reply.send(Ok(block));
+            true
+        }
+        (pending, message) => {
+            *pending_request = Some(pending);
+            let _ = message;
+            false
         }
     }
 }
 
-/// Executes one `get_tip` request over an established async outbound stream.
-async fn handle_outbound_request_tip(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-) -> Result<TipSummary, RequestError> {
-    send_async_message(writer, &WireMessage::GetTip)
-        .await
-        .map_err(RequestError::Send)?;
-    let reply = receive_async_message(reader)
-        .await
-        .map_err(RequestError::Receive)?;
-    let WireMessage::Tip(summary) = reply else {
-        return Err(RequestError::UnexpectedResponse(reply));
+/// Receives one optional command from the live peer control channel.
+async fn recv_peer_command(
+    command_rx: &mut Option<UnboundedReceiver<PeerCommand>>,
+) -> Option<PeerCommand> {
+    let Some(command_rx) = command_rx.as_mut() else {
+        return None;
     };
-    Ok(summary)
+    command_rx.recv().await
 }
 
-/// Executes one `get_block` request over an established async outbound stream.
-async fn handle_outbound_request_block(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    block_hash: BlockHash,
-) -> Result<Option<Block>, RequestError> {
-    send_async_message(writer, &WireMessage::GetBlock { block_hash })
-        .await
-        .map_err(RequestError::Send)?;
-    let reply = receive_async_message(reader)
-        .await
-        .map_err(RequestError::Receive)?;
-    let WireMessage::Block { block } = reply else {
-        return Err(RequestError::UnexpectedResponse(reply));
+/// Sleeps until the current pending request deadline fires.
+async fn sleep_until_deadline(deadline: Option<Instant>) {
+    let Some(deadline) = deadline else {
+        std::future::pending::<()>().await;
+        unreachable!();
     };
-    Ok(block)
+    tokio::time::sleep_until(deadline).await;
+}
+
+/// Fails one pending request because the peer session encountered an I/O error.
+fn fail_pending_request(
+    pending_request: &mut Option<PendingRequest>,
+    err: io::Error,
+    kind: Option<io::ErrorKind>,
+) {
+    let request_err = RequestError::Receive(match kind {
+        Some(kind) => io::Error::new(kind, err.to_string()),
+        None => err,
+    });
+    fail_pending_request_with_error(pending_request, request_err);
+}
+
+/// Delivers one explicit request error to the current pending waiter, if any.
+fn fail_pending_request_with_error(
+    pending_request: &mut Option<PendingRequest>,
+    err: RequestError,
+) {
+    let Some(pending) = pending_request.take() else {
+        return;
+    };
+    match pending {
+        PendingRequest::Tip { reply } => {
+            let _ = reply.send(Err(err));
+        }
+        PendingRequest::Block { reply } => {
+            let _ = reply.send(Err(err));
+        }
+    }
 }
 
 /// Sends one wire message over an async writer with the standard peer timeout.
@@ -295,64 +532,16 @@ pub(crate) async fn serve_peer_stream(
     handle: ServerHandle,
     stream: tokio::net::TcpStream,
 ) {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut line = String::new();
-    let mut origin = RelayOrigin::default();
-
-    loop {
-        line.clear();
-        let bytes_read = match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
-            Ok(bytes_read) => bytes_read,
-            Err(_) => break,
-        };
-        if bytes_read == 0 {
-            break;
-        }
-        let message = match WireMessage::from_json_line(&line) {
-            Ok(message) => message,
-            Err(_) => break,
-        };
-        let mut hello_for_follow_up_sync = None;
-        let mut tip_for_follow_up_sync = None;
-        if let WireMessage::Hello(remote_hello) = &message {
-            origin = RelayOrigin {
-                advertised_addr: remote_hello.advertised_addr.clone(),
-                node_name: remote_hello.node_name.clone(),
-            };
-            hello_for_follow_up_sync = Some(remote_hello.clone());
-        } else if let WireMessage::AnnounceTip(summary) = &message {
-            tip_for_follow_up_sync = Some(summary.clone());
-        }
-        let replies = match handle
-            .request_peer_message(peer_id.clone(), Some(origin.clone()), message)
-            .await
-        {
-            Ok(Ok(replies)) => replies,
-            Ok(Err(_)) | Err(_) => break,
-        };
-        for reply in replies {
-            let line = match reply.to_json_line() {
-                Ok(line) => line,
-                Err(_) => return,
-            };
-            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
-                .await
-                .is_err()
-            {
-                return;
-            }
-            if tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err() {
-                return;
-            }
-        }
-        if let Some(remote_hello) = hello_for_follow_up_sync {
-            let _ = handle.notify_hello_sync(remote_hello).await;
-        }
-        if let Some(summary) = tip_for_follow_up_sync {
-            let _ = handle.notify_tip_sync(origin.clone(), summary).await;
-        }
-    }
+    let (reader, writer) = stream.into_split();
+    run_peer_task(
+        peer_id,
+        Some(handle),
+        tokio::io::BufReader::new(reader),
+        writer,
+        None,
+        RelayOrigin::default(),
+    )
+    .await;
 }
 
 /// Opens a short-lived outbound relay connection, completes the handshake, and
