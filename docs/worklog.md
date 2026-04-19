@@ -8,15 +8,24 @@ Derived from local git history.
 
 | Date       | # Commits | Hours | Line Changes     |
 | ---------- | --------: | ----: | ---------------- |
+| 2026-04-18 |         3 |   0.6 | +709 / -89       |
 | 2026-04-12 |        21 |   5.8 | +4,002 / -510    |
 | 2026-04-11 |        56 |   9.3 | +11,667 / -3,252 |
 | 2026-04-10 |        44 |   4.2 | +7,924 / -487    |
 
 Current code size:
 
-- `src/`: `15,681` lines
-- `tests/`: `808` lines
+- `src/`: `15,487` lines
+- `tests/`: `895` lines
 - `scripts/`: `688` lines
+
+## 2026-04-18 Notes
+
+- Replaced the split async/runtime wrappers with a simpler async-first `Server` flow so startup, listeners, and event dispatch read more directly top-to-bottom.
+- Moved more protocol ownership back into `Server` and `Peer`, reducing leftover transitional abstractions from the earlier async scaffold.
+- Added a miner-facing candidate flow in `src/mining.rs` so the server can submit work, cancel stale work, and accept solved blocks through the event loop.
+- Added `announce_tip` handling and in-memory peer tip tracking so relays and sync triggers can avoid obvious duplicate work.
+- Tightened the server around direct SQLite-backed state ownership again, keeping concurrency concerns in the async transport rather than in a second persistence runtime.
 
 ## 2026-04-12 Notes
 
