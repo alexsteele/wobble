@@ -809,7 +809,7 @@ fn lagging_node_can_fetch_tip_and_missing_block_after_being_offline() {
 }
 
 #[test]
-fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
+fn lagging_live_node_syncs_after_learning_peer_tip_from_hello() {
     let _guard = TESTNET_LOCK.lock().unwrap();
     let sender = crypto::signing_key_from_bytes([41; 32]);
     let recipient = crypto::signing_key_from_bytes([42; 32]);
@@ -866,8 +866,8 @@ fn lagging_live_node_syncs_when_peer_hello_advertises_new_tip() {
     let observer = observer.stop();
     let miner_server = miner_server.stop();
 
-    // The handshake reply is sent before the best-effort sync runs, so it
-    // still reflects the observer's pre-sync local tip.
+    // The handshake reply still reflects the observer's pre-sync local tip;
+    // the periodic sync loop catches up only after the peer is learned.
     assert_eq!(reply.tip, Some(genesis_hash));
     assert_eq!(reply.height, Some(0));
     assert_eq!(observer.state().chain().best_tip(), Some(block_hash));

@@ -206,17 +206,6 @@ impl ServerHandle {
             .map_err(|_| ServerHandleError::SubmitClosed)
     }
 
-    /// Requests one follow-up sync check after a peer hello has been answered.
-    pub(crate) async fn notify_hello_sync(
-        &self,
-        remote_hello: HelloMessage,
-    ) -> Result<(), ServerHandleError> {
-        self.command_tx
-            .send(ServerEvent::HelloSync { remote_hello })
-            .await
-            .map_err(|_| ServerHandleError::SubmitClosed)
-    }
-
     /// Requests one follow-up sync check after a peer announces a better tip.
     pub(crate) async fn notify_tip_sync(
         &self,
@@ -321,13 +310,11 @@ enum ServerEvent {
         request: AdminRequest,
         reply: oneshot::Sender<AdminResponse>,
     },
-    HelloSync {
-        remote_hello: HelloMessage,
-    },
     TipSync {
         origin: RelayOrigin,
         summary: TipSummary,
     },
+    SyncTick,
     MinedCandidate {
         block: Block,
     },
@@ -418,6 +405,8 @@ const RELAY_CONNECT_ATTEMPTS: usize = 3;
 const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// Cooldown between configured-peer sync attempts to the same peer.
 const CONFIGURED_PEER_SYNC_COOLDOWN: Duration = Duration::from_secs(5);
+/// Periodic sync cadence for known peers while a server is running.
+const CONTINUOUS_SYNC_INTERVAL: Duration = Duration::from_millis(750);
 
 impl Server {
     pub fn new(config: ServerConfig, state: NodeState) -> Self {
@@ -549,6 +538,8 @@ impl Server {
 
         let mut peers: HashMap<String, LivePeerTask> = HashMap::new();
         let mut next_inbound_peer_id = 0_u64;
+        let mut sync_tick = tokio::time::interval(CONTINUOUS_SYNC_INTERVAL);
+        sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             if handle.is_stopped() {
@@ -565,6 +556,9 @@ impl Server {
                     if let Some(stream) = accept_result? {
                         spawn_admin_task(handle.clone(), stream);
                     }
+                }
+                _ = sync_tick.tick() => {
+                    let _ = handle.command_tx.try_send(ServerEvent::SyncTick);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {}
             }
@@ -608,7 +602,7 @@ impl Server {
         match event {
             ServerEvent::Bootstrap { reply } => {
                 if self.bootstrap_sync {
-                    self.sync_configured_peers_best_effort();
+                    self.sync_known_peers_best_effort();
                     self.bootstrap_sync = false;
                 }
                 self.refresh_mining_candidate();
@@ -638,12 +632,12 @@ impl Server {
                 let _ = reply.send(response);
                 true
             }
-            ServerEvent::HelloSync { remote_hello } => {
-                self.handle_hello_sync(remote_hello);
-                true
-            }
             ServerEvent::TipSync { origin, summary } => {
                 self.handle_tip_sync(origin, summary);
+                true
+            }
+            ServerEvent::SyncTick => {
+                self.handle_sync_tick();
                 true
             }
             ServerEvent::MinedCandidate { block } => {
@@ -714,14 +708,20 @@ impl Server {
         }
     }
 
-    /// Handles one incoming `hello`, persists any advertised peer metadata,
-    /// and optionally triggers a best-effort catch-up when the remote tip is
-    /// ahead of local state.
+    /// Handles one incoming `hello`, validates compatibility, and records any
+    /// advertised peer metadata.
+    ///
+    /// `hello` is now only a handshake and metadata signal. Ongoing catch-up
+    /// should come from periodic sync ticks and `announce_tip`, which keeps
+    /// connection setup quieter on busy nodes.
     fn handle_peer_hello(
         &mut self,
         remote_hello: HelloMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
-        let should_log_info = self.hello_advances_local_state(&remote_hello);
+        let should_log_info = self.tip_summary_advances_local_state(&TipSummary {
+            tip: remote_hello.tip,
+            height: remote_hello.height,
+        });
         let remote_node = remote_hello.node_name.as_deref().unwrap_or("unknown");
         let advertised_addr = remote_hello.advertised_addr.as_deref().unwrap_or("none");
         if should_log_info {
@@ -758,30 +758,6 @@ impl Server {
             &self.config,
             &self.state,
         ))])
-    }
-
-    /// Runs one follow-up sync after the peer hello reply has already been sent.
-    ///
-    /// This avoids a handshake deadlock where both sides wait on hello-related
-    /// work before either side can continue with the next protocol message.
-    fn handle_hello_sync(&mut self, remote_hello: HelloMessage) {
-        if !self.hello_advances_local_state(&remote_hello) {
-            return;
-        }
-        let previous_best_tip = self.state.chain().best_tip();
-        let previous_mempool_txids = mempool_txids(self.state.mempool());
-        let origin = RelayOrigin {
-            advertised_addr: remote_hello.advertised_addr.clone(),
-            node_name: remote_hello.node_name.clone(),
-        };
-        for block in self.sync_from_hello_best_effort(&remote_hello) {
-            info!(
-                block_hash = %format_hash(Some(block.header.block_hash())),
-                "relaying block learned during hello-triggered sync"
-            );
-            self.relay_best_effort(&WireMessage::AnnounceBlock { block }, Some(&origin));
-        }
-        self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
     }
 
     /// Runs one follow-up sync after a peer announces a better tip.
@@ -829,6 +805,18 @@ impl Server {
         }
         self.relay_new_best_tip_if_advanced(previous_best_tip, Some(&origin));
         self.maybe_refresh_mining(previous_best_tip, &previous_mempool_txids);
+    }
+
+    /// Runs one lightweight periodic sync pass against known peers.
+    ///
+    /// This replaces hello-triggered catch-up. Running on a timer keeps the
+    /// protocol quieter while still letting lagging nodes converge from the
+    /// peer metadata learned during handshake and `announce_tip`.
+    fn handle_sync_tick(&mut self) {
+        if self.bootstrap_sync {
+            return;
+        }
+        self.sync_known_peers_best_effort();
     }
 
     /// Handles one `get_tip` query by returning the current best-tip summary.
@@ -1241,13 +1229,16 @@ impl Server {
         }
     }
 
-    /// Attempts a one-time startup sync from each configured peer.
+    /// Attempts one best-effort sync pass across the currently known peer set.
     ///
     /// Failures are intentionally swallowed so a node can still come up and
     /// serve local traffic even if some peers are offline or return incomplete
     /// history. This also avoids reconnecting to peers that were contacted very
     /// recently or already advertised that they are not ahead of the local tip.
-    pub fn sync_configured_peers_best_effort(&mut self) {
+    ///
+    /// The candidate set includes both configured peers and peers learned from
+    /// inbound `hello`/`announce_tip` metadata.
+    pub fn sync_known_peers_best_effort(&mut self) {
         let peers = self.select_sync_peers();
         for peer in &peers {
             if let Err(err) = self.sync_from_peer(peer) {
@@ -1257,7 +1248,7 @@ impl Server {
         }
     }
 
-    /// Selects the best currently-known sync candidates from configured peers.
+    /// Selects the best currently-known sync candidates from known peers.
     ///
     /// The first version is intentionally conservative: it picks at most one
     /// peer whose advertised height is ahead of the local node, and it falls
@@ -1400,47 +1391,6 @@ impl Server {
             "completed sync from peer"
         );
         Ok(accepted_blocks)
-    }
-
-    /// Triggers a one-shot catch-up attempt when an inbound peer advertises a
-    /// tip this node does not yet know and includes a listener address we can
-    /// dial back for block fetches.
-    ///
-    /// This is best effort by design. A failed catch-up should not reject the
-    /// handshake or stop normal message handling on the current stream.
-    fn sync_from_hello_best_effort(&mut self, remote_hello: &HelloMessage) -> Vec<Block> {
-        let summary = TipSummary {
-            tip: remote_hello.tip,
-            height: remote_hello.height,
-        };
-        let Some(remote_tip) = summary.tip else {
-            return Vec::new();
-        };
-        if self.state.get_block(&remote_tip).is_some() {
-            return Vec::new();
-        }
-        let Some(peer_addr) = remote_hello.advertised_addr.as_deref() else {
-            debug!("remote hello advertised unknown tip without listener address");
-            return Vec::new();
-        };
-        info!(
-            peer_addr,
-            remote_tip = %format_hash(Some(remote_tip)),
-            remote_height = ?remote_hello.height,
-            "starting hello-triggered sync"
-        );
-        let peer = PeerEndpoint::new(peer_addr.to_string(), remote_hello.node_name.clone());
-        self.sync_to_advertised_tip(&peer, &summary).unwrap_or_default()
-    }
-
-    /// Returns whether one inbound hello advertises chain data this node does
-    /// not already know, which makes it worth logging at info level and trying
-    /// a follow-up sync.
-    fn hello_advances_local_state(&self, remote_hello: &HelloMessage) -> bool {
-        self.tip_summary_advances_local_state(&TipSummary {
-            tip: remote_hello.tip,
-            height: remote_hello.height,
-        })
     }
 
     /// Returns whether one tip summary advertises chain data this node does not
@@ -1621,24 +1571,31 @@ impl Server {
         peer_addr: Option<std::net::SocketAddr>,
         remote_hello: &HelloMessage,
     ) -> Result<(), SqliteStoreError> {
-        if self.sqlite_store.is_none() {
-            return Ok(());
-        }
         let addr = remote_hello
             .advertised_addr
             .clone()
             .or_else(|| peer_addr.map(|addr| addr.to_string()))
             .unwrap_or_else(|| "unknown".to_string());
-        self.update_persisted_peer(
-            &PeerEndpoint::new(addr, remote_hello.node_name.clone()),
-            PeerSource::Hello,
-            |peer| {
+        let endpoint = PeerEndpoint::new(addr, remote_hello.node_name.clone());
+        let now = now_timestamp_string();
+        if self.sqlite_store.is_some() {
+            return self.update_persisted_peer(&endpoint, PeerSource::Hello, |peer| {
                 peer.advertised_tip_hash = remote_hello.tip;
                 peer.advertised_height = remote_hello.height;
-                peer.last_hello_at = Some(now_timestamp_string());
-                peer.last_seen_at = Some(now_timestamp_string());
-            },
-        )
+                peer.last_hello_at = Some(now.clone());
+                peer.last_seen_at = Some(now.clone());
+            });
+        }
+
+        self.ensure_runtime_peer(&endpoint, PeerSource::Hello);
+        if let Some(runtime) = self.peers.get_mut(&endpoint.addr) {
+            runtime.endpoint = endpoint;
+            runtime.stored.advertised_tip_hash = remote_hello.tip;
+            runtime.stored.advertised_height = remote_hello.height;
+            runtime.stored.last_hello_at = Some(now.clone());
+            runtime.stored.last_seen_at = Some(now);
+        }
+        Ok(())
     }
 
     /// Records peer metadata learned from one inbound `announce_tip`.

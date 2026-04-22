@@ -48,18 +48,12 @@ initial handshake, but the implementation does not yet treat every connection
 class the same way.
 
 Connection classes:
-- sync connections may stay open across a short request sequence such as `get_tip` followed by one or more `get_block` requests
-- relay connections are currently best-effort one-shot connections
+- peer sessions may stay open across relay traffic plus short request sequences such as `get_tip` followed by one or more `get_block` requests
 - admin connections are separate from public peer connections and are localhost-only
 
-Why relay is still one-shot:
-- the current server handles one inbound peer stream at a time
-- leaving a relay socket open would keep the remote node inside that one stream handler
-- that would delay later inbound connections until the relay socket closed
-
 Planned direction:
-- move to an async runtime that can manage multiple live peer sockets concurrently
-- then allow a single long-lived peer connection to carry relay, sync, and request traffic safely
+- keep long-lived peer sessions for normal relay and sync traffic
+- continue to separate localhost admin traffic from public peer sessions
 
 ## Envelope
 
@@ -158,8 +152,7 @@ Receiver behavior:
 - if newly accepted, relay it to other peers
 
 Current session note:
-- outbound relay currently uses a one-shot connection for each high-level announcement
-- this is an implementation constraint, not a protocol requirement
+- normal relay may reuse one live peer session for multiple announcements
 
 Known limitation:
 - this sends full transactions immediately instead of announcing hashes first
@@ -238,10 +231,12 @@ Suggested flow:
 
 Current implementation notes:
 - startup sync may still poll `get_tip` when the node does not yet have useful peer metadata
-- hello-triggered and tip-triggered sync use the peer's advertised tip directly
+- `hello` updates peer metadata but does not immediately trigger catch-up
+- `announce_tip` still gives an immediate push-based sync hint when a peer advertises a better tip
+- a lightweight periodic sync loop rechecks learned peers and catches up lagging nodes without relying on repeated hello-driven syncs
 - the sync walk may reuse one outbound session per selected peer
 - the node requests only one peer at a time
-- a successful sync closes that short-lived sync session when the walk completes
+- a successful sync may keep the live peer session open for later relay or follow-up requests
 
 This is deliberately naive:
 - it may fetch blocks one at a time
