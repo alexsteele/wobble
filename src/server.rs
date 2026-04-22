@@ -2207,11 +2207,6 @@ mod tests {
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
-        net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream},
-    };
-
     use crate::{
         admin::{AdminRequest, AdminResponse},
         chain::ChainError,
@@ -2221,7 +2216,7 @@ mod tests {
         node_state::{NodeState, NodeStateError},
         peer::relay_to_peer,
         peers::{PeerSource, StoredPeer},
-        server::{PeerEndpoint, Server, ServerConfig, ServerHandle},
+        server::{PeerEndpoint, Server, ServerConfig},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
@@ -2386,8 +2381,8 @@ mod tests {
         tx
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_relays_announced_transaction_to_configured_peer() {
+    #[test]
+    fn server_relays_announced_transaction_to_configured_peer() {
         let sender = crypto::signing_key_from_bytes([61; 32]);
         let recipient = crypto::signing_key_from_bytes([62; 32]);
         let genesis = mine_block(
@@ -2403,43 +2398,21 @@ mod tests {
         let transaction = spend(spendable, &sender, &recipient.verifying_key(), 30, 1);
 
         let mut state = NodeState::new();
-        state.accept_block(genesis).unwrap();
+        state.accept_block(genesis.clone()).unwrap();
 
-        let remote_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let remote_addr = remote_listener.local_addr().unwrap();
-        let server_addr = TokioTcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let server = Server::new(
-            server_config(Some("alpha"))
-                .with_advertised_addr(server_addr.to_string())
-                .with_channel_capacity(4),
-            state,
-        )
-        .with_peers(vec![PeerEndpoint::new(
-            remote_addr.to_string(),
-            Some("remote".to_string()),
-        )]);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let serve_task = tokio::spawn(async move {
-            server
-                .serve_inner(Some(ready_tx))
-                .await
-                .unwrap()
-        });
+        let mut server = Server::new(server_config(Some("alpha")), state).with_peers(vec![
+            PeerEndpoint::new(remote_addr.to_string(), Some("remote".to_string())),
+        ]);
+        let _runtime = attach_runtime(&mut server);
 
-        let remote_task = tokio::spawn(async move {
-            let (stream, _) = remote_listener.accept().await.unwrap();
-            let mut reader = AsyncBufReader::new(stream);
-            let mut hello_line = String::new();
-            reader.read_line(&mut hello_line).await.unwrap();
-            let hello = WireMessage::from_json_line(&hello_line).unwrap();
+        let remote_task = thread::spawn(move || {
+            let (mut stream, _) = remote_listener.accept().unwrap();
+            let hello = net::receive_message(&mut stream).unwrap();
             let WireMessage::Hello(_) = hello else {
                 panic!("expected hello");
             };
-            let mut stream = reader.into_inner();
             let response = WireMessage::Hello(HelloMessage {
                 network: "wobble-local".to_string(),
                 version: PROTOCOL_VERSION,
@@ -2448,66 +2421,28 @@ mod tests {
                 tip: None,
                 height: None,
             });
-            stream
-                .write_all(response.to_json_line().unwrap().as_bytes())
-                .await
-                .unwrap();
-            stream.flush().await.unwrap();
-            let mut reader = AsyncBufReader::new(stream);
-            let mut tx_line = String::new();
-            reader.read_line(&mut tx_line).await.unwrap();
-            WireMessage::from_json_line(&tx_line).unwrap()
+            net::send_message(&mut stream, &response).unwrap();
+            net::receive_message(&mut stream).unwrap()
         });
 
-        let mut client = loop {
-            match TokioTcpStream::connect(server_addr).await {
-                Ok(stream) => break stream,
-                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        };
-        let hello = WireMessage::Hello(HelloMessage {
-            network: "wobble-local".to_string(),
-            version: PROTOCOL_VERSION,
-            node_name: Some("client".to_string()),
-            advertised_addr: None,
-            tip: None,
-            height: None,
-        });
-        client
-            .write_all(hello.to_json_line().unwrap().as_bytes())
-            .await
-            .unwrap();
-        client.flush().await.unwrap();
-        let mut reader = AsyncBufReader::new(client);
-        let mut hello_reply = String::new();
-        reader.read_line(&mut hello_reply).await.unwrap();
-        let mut client = reader.into_inner();
-        client
-            .write_all(
+        let replies = server
+            .handle_peer_message(
+                None,
                 WireMessage::AnnounceTx {
                     transaction: transaction.clone(),
-                }
-                .to_json_line()
-                .unwrap()
-                .as_bytes(),
+                },
             )
-            .await
             .unwrap();
-        client.flush().await.unwrap();
-        drop(client);
+        assert!(replies.is_empty());
 
-        let relayed = remote_task.await.unwrap();
+        let relayed = remote_task.join().unwrap();
         assert_eq!(
             relayed,
             WireMessage::AnnounceTx {
                 transaction: transaction.clone(),
             }
         );
-
-        let stop_handle: ServerHandle = ready_rx.recv().unwrap();
-        stop_handle.stop();
-        let final_state = serve_task.await.unwrap();
-        assert!(final_state.mempool().get(&transaction.txid()).is_some());
+        assert!(server.state().mempool().get(&transaction.txid()).is_some());
     }
 
     #[test]

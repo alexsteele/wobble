@@ -51,8 +51,22 @@ pub fn connect_and_handshake(
     peer_addr: &str,
     config: &ServerConfig,
 ) -> Result<(TcpStream, HelloMessage), ClientError> {
+    connect_and_handshake_with_timeout(peer_addr, config, OUTBOUND_PEER_IO_TIMEOUT)
+}
+
+/// Opens a TCP connection to `peer_addr`, performs the protocol handshake, and
+/// returns the connected stream plus the remote `hello` payload using one
+/// caller-supplied socket timeout.
+///
+/// This keeps the production client API simple while still letting tests use a
+/// much shorter timeout for explicitly slow-path scenarios.
+fn connect_and_handshake_with_timeout(
+    peer_addr: &str,
+    config: &ServerConfig,
+    timeout: Duration,
+) -> Result<(TcpStream, HelloMessage), ClientError> {
     let mut stream = net::connect(peer_addr).map_err(ClientError::Connect)?;
-    configure_outbound_stream(&stream).map_err(ClientError::Connect)?;
+    configure_outbound_stream(&stream, timeout).map_err(ClientError::Connect)?;
     let hello = WireMessage::Hello(HelloMessage {
         network: config.network.clone(),
         version: PROTOCOL_VERSION,
@@ -72,9 +86,9 @@ pub fn connect_and_handshake(
 }
 
 /// Applies a short read/write timeout to one-shot outbound peer streams.
-fn configure_outbound_stream(stream: &TcpStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(OUTBOUND_PEER_IO_TIMEOUT))?;
+fn configure_outbound_stream(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     Ok(())
 }
 
@@ -132,8 +146,8 @@ mod tests {
 
     use crate::{
         client::{
-            ClientError, OUTBOUND_PEER_IO_TIMEOUT, RequestError, announce_transaction,
-            connect_and_handshake, request_block, request_tip,
+            ClientError, RequestError, announce_transaction, connect_and_handshake,
+            connect_and_handshake_with_timeout, request_block, request_tip,
         },
         net,
         server::ServerConfig,
@@ -227,19 +241,26 @@ mod tests {
 
     #[test]
     fn connect_and_handshake_times_out_when_peer_never_replies() {
+        const TEST_TIMEOUT: Duration = Duration::from_millis(100);
         let (listener, addr) = connected_listener();
 
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            // Bound the harness side too so this test cannot hang forever if
+            // the client times out before the hello is fully observed here.
+            stream
+                .set_read_timeout(Some(TEST_TIMEOUT + Duration::from_millis(100)))
+                .unwrap();
             let _ = net::receive_message(&mut stream).unwrap();
-            thread::sleep(Duration::from_millis(
-                OUTBOUND_PEER_IO_TIMEOUT.as_millis() as u64 + 100,
-            ));
+            thread::sleep(TEST_TIMEOUT + Duration::from_millis(25));
         });
 
-        let err =
-            connect_and_handshake(&addr, &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"))
-                .unwrap_err();
+        let err = connect_and_handshake_with_timeout(
+            &addr,
+            &ServerConfig::new("wobble-local", None, "127.0.0.1:9000"),
+            TEST_TIMEOUT,
+        )
+        .unwrap_err();
         worker.join().unwrap();
 
         assert!(matches!(
