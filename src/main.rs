@@ -26,7 +26,7 @@ use wobble::{
     mining::MiningConfig,
     node_state::{NodeState, build_payment_transaction},
     peers,
-    server::{Server, ServerConfig},
+    server::{Server, ServerOptions},
     sqlite_store::SqliteStore,
     tx_index::{IndexedTransaction, IndexedTransactionStatus, TransactionKeyRole},
     types::{BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid},
@@ -517,19 +517,11 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     let config_file = home
         .load_config()
         .map_err(|err| format!("config load failed: {err:?}"))?;
-    let serve_runtime = resolve_serve_runtime(&config_file, &command);
+    let serve_config = resolve_serve_config(&config_file, &command);
     let sqlite_path = home.state_path();
     let state = SqliteStore::open(&sqlite_path)
         .and_then(|store| store.load_node_state())
         .map_err(|err| format!("sqlite bootstrap failed: {err:?}"))?;
-    let server_config = ServerConfig::new(
-        serve_runtime.network.clone(),
-        serve_runtime.node_name.clone(),
-        serve_runtime.listen_addr.clone(),
-    )
-    .with_advertised_addr(&serve_runtime.listen_addr)
-    .with_admin_addr(config_file.admin_addr.clone())
-    .with_channel_capacity(64);
     let peer_path = command
         .peers_path
         .clone()
@@ -538,20 +530,22 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
         .map_err(|err| format!("peer config load failed: {err:?}"))?;
     let mining_runtime = resolve_mining_runtime(&home, &config_file.mining, &command)?;
     let mining = build_mining_config(&mining_runtime)?;
-    let mut server = Server::new(server_config.clone(), state)
+    let mut server_options = ServerOptions::new(serve_config.clone(), state)
         .with_peers(peer_endpoints.clone())
         .with_sqlite_path(&sqlite_path)
-        .with_bootstrap_sync(true);
+        .with_bootstrap_sync(true)
+        .with_channel_capacity(64);
     if let Some(mining) = mining.clone() {
-        server = server.with_mining(mining);
+        server_options = server_options.with_mining(mining);
     }
+    let server = Server::new(server_options);
 
     info!(
         command = "serve",
         home = %home.root().display(),
         sqlite_path = %sqlite_path.display(),
-        listen_addr = serve_runtime.listen_addr,
-        network = serve_runtime.network,
+        listen_addr = serve_config.listen_addr,
+        network = serve_config.network,
         peer_count = peer_endpoints.len(),
         mining = mining.is_some(),
         serve_mode = "async",
@@ -563,9 +557,9 @@ fn run_serve(command: ServeCommand) -> Result<(), String> {
     println!("bootstrap source: sqlite");
     println!("config: {}", home.config_path().display());
     println!("logs dir: {}", home.logs_dir().display());
-    println!("listen addr: {}", serve_runtime.listen_addr);
+    println!("listen addr: {}", serve_config.listen_addr);
     println!("admin addr: {}", config_file.admin_addr);
-    println!("network: {}", serve_runtime.network);
+    println!("network: {}", serve_config.network);
     if let Some(name) = server.config().node_name.as_deref() {
         println!("node name: {name}");
     }
@@ -885,7 +879,7 @@ fn run_inspect(command: InspectCommand) -> Result<(), String> {
             Ok(())
         }
         InspectCommand::Tip(command) => {
-            let config = ServerConfig::new(command.network, command.node_name, "0.0.0.0:0");
+            let config = NodeConfig::new(command.network, command.node_name, "0.0.0.0:0");
             let (mut stream, remote_hello) =
                 client::connect_and_handshake(&command.peer_addr, &config)
                     .map_err(|err| format!("handshake failed: {err:?}"))?;
@@ -1067,7 +1061,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
                 command.sender_wallet.as_deref(),
             )?;
             let recipient_verifying_key = parse_public_key_or_alias(&command.recipient)?;
-            let config = ServerConfig::new(command.network, command.node_name, "0.0.0.0:0");
+            let config = NodeConfig::new(command.network, command.node_name, "0.0.0.0:0");
             let sender_wallet = wallet::load_wallet(&sender_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let mut local_state = load_sqlite_state(&sqlite_path)?;
@@ -1096,7 +1090,7 @@ fn run_debug(command: DebugCommand) -> Result<(), String> {
         DebugCommand::MinePendingRemote(command) => {
             let miner_wallet_path =
                 resolve_wallet_path(command.home.as_deref(), command.miner_wallet.as_deref())?;
-            let config = ServerConfig::new(command.network, command.node_name, "0.0.0.0:0");
+            let config = NodeConfig::new(command.network, command.node_name, "0.0.0.0:0");
             let miner_wallet = wallet::load_wallet(&miner_wallet_path)
                 .map_err(|err| format!("wallet load failed: {err:?}"))?;
             let (mut stream, _) = client::connect_and_handshake(&command.peer_addr, &config)
@@ -1222,14 +1216,6 @@ fn resolve_state_and_wallet_paths(
     ))
 }
 
-/// Effective serve settings after merging home config defaults with CLI overrides.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServeRuntime {
-    listen_addr: String,
-    network: String,
-    node_name: Option<String>,
-}
-
 /// Effective mining settings after merging home config defaults with CLI overrides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MiningRuntime {
@@ -1239,22 +1225,22 @@ struct MiningRuntime {
     bits: u32,
 }
 
-/// Resolves server runtime settings from node-home config plus CLI overrides.
-fn resolve_serve_runtime(config: &NodeConfig, command: &ServeCommand) -> ServeRuntime {
-    ServeRuntime {
-        listen_addr: command
-            .listen_addr
-            .clone()
-            .unwrap_or_else(|| config.listen_addr.clone()),
-        network: command
-            .network
-            .clone()
-            .unwrap_or_else(|| config.network.clone()),
-        node_name: command
-            .node_name
-            .clone()
-            .or_else(|| config.node_name.clone()),
+/// Resolves the effective server config from node-home config plus CLI overrides.
+fn resolve_serve_config(config: &NodeConfig, command: &ServeCommand) -> NodeConfig {
+    let mut resolved = config.clone();
+    if let Some(listen_addr) = command.listen_addr.clone() {
+        resolved.listen_addr = listen_addr;
     }
+    if let Some(network) = command.network.clone() {
+        resolved.network = network;
+    }
+    if let Some(node_name) = command.node_name.clone() {
+        resolved.node_name = Some(node_name);
+    }
+    if resolved.advertised_addr.is_none() {
+        resolved.advertised_addr = Some(resolved.listen_addr.clone());
+    }
+    resolved
 }
 
 /// Resolves integrated mining settings from node-home config plus CLI overrides.
@@ -1530,7 +1516,7 @@ mod tests {
     use super::{
         BootstrapCommand, Cli, Command, DebugCommand, HomeArg, InspectCommand, MinePendingCommand,
         NewKeyCommand, PayCommand, ServeCommand, WalletCommand, format_admin_error,
-        resolve_mining_runtime, resolve_serve_runtime, resolve_state_and_wallet_paths,
+        resolve_mining_runtime, resolve_serve_config, resolve_state_and_wallet_paths,
         resolve_peers_path, resolve_state_path, resolve_wallet_path, run_wallet_new_key,
         wallet_transaction_lines,
     };
@@ -1996,12 +1982,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_serve_runtime_prefers_cli_over_home_config() {
+    fn resolve_serve_config_prefers_cli_over_home_config() {
         let config = NodeConfig {
             listen_addr: "127.0.0.1:9001".to_string(),
             admin_addr: "127.0.0.1:9000".to_string(),
             network: "wobble-local".to_string(),
             node_name: Some("saved".to_string()),
+            advertised_addr: None,
             mining: MiningSection::default(),
         };
         let command = ServeCommand {
@@ -2019,11 +2006,12 @@ mod tests {
             mining_bits: None,
         };
 
-        let runtime = resolve_serve_runtime(&config, &command);
+        let runtime = resolve_serve_config(&config, &command);
 
         assert_eq!(runtime.listen_addr, "127.0.0.1:9010");
         assert_eq!(runtime.network, "wobble-local");
         assert_eq!(runtime.node_name.as_deref(), Some("override"));
+        assert_eq!(runtime.advertised_addr.as_deref(), Some("127.0.0.1:9010"));
     }
 
     #[test]

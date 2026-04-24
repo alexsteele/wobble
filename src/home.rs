@@ -43,7 +43,39 @@ pub struct NodeConfig {
     pub network: String,
     pub node_name: Option<String>,
     #[serde(default)]
+    pub advertised_addr: Option<String>,
+    #[serde(default)]
     pub mining: MiningSection,
+}
+
+impl NodeConfig {
+    /// Builds one node config from the server identity and listener defaults.
+    pub fn new(
+        network: impl Into<String>,
+        node_name: Option<String>,
+        listen_addr: impl Into<String>,
+    ) -> Self {
+        Self {
+            listen_addr: listen_addr.into(),
+            admin_addr: default_admin_addr(),
+            network: network.into(),
+            node_name,
+            advertised_addr: None,
+            mining: MiningSection::default(),
+        }
+    }
+
+    /// Records the listener address this node should advertise during handshake.
+    pub fn with_advertised_addr(mut self, advertised_addr: impl Into<String>) -> Self {
+        self.advertised_addr = Some(advertised_addr.into());
+        self
+    }
+
+    /// Records the localhost admin address this node should serve.
+    pub fn with_admin_addr(mut self, admin_addr: impl Into<String>) -> Self {
+        self.admin_addr = admin_addr.into();
+        self
+    }
 }
 
 /// Integrated miner defaults persisted in the node home config.
@@ -68,6 +100,7 @@ impl Default for NodeConfig {
             admin_addr: default_admin_addr(),
             network: default_network(),
             node_name: None,
+            advertised_addr: None,
             mining: MiningSection::default(),
         }
     }
@@ -354,6 +387,7 @@ mod tests {
             admin_addr: "127.0.0.1:9000".to_string(),
             network: "custom-net".to_string(),
             node_name: Some("alpha".to_string()),
+            advertised_addr: None,
             mining: MiningSection::default(),
         })
         .unwrap();
@@ -394,6 +428,7 @@ mod tests {
             admin_addr: "127.0.0.1:9011".to_string(),
             network: "custom-net".to_string(),
             node_name: Some("miner".to_string()),
+            advertised_addr: None,
             mining: MiningSection {
                 enabled: true,
                 reward_wallet: Some(PathBuf::from("miner-wallet.bin")),

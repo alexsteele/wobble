@@ -18,9 +18,10 @@ use std::{
 
 use crate::{
     client::{ClientError, RequestError},
+    home::NodeConfig,
     mempool::MempoolError,
     node_state::{NodeState, NodeStateError},
-    server::{RelayOrigin, ServerConfig, ServerHandle},
+    server::{PeerAddr, ServerHandle},
     types::{Block, BlockHash},
     wire::{HelloMessage, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage},
 };
@@ -45,13 +46,16 @@ pub enum PeerError {
 }
 
 /// Builds the local `hello` payload from configuration and current node state.
-pub fn local_hello(config: &ServerConfig, state: &NodeState) -> HelloMessage {
+pub fn local_hello(config: &NodeConfig, state: &NodeState) -> HelloMessage {
     let tip = state.tip_summary();
     HelloMessage {
         network: config.network.clone(),
         version: PROTOCOL_VERSION,
         node_name: config.node_name.clone(),
-        advertised_addr: config.advertised_addr.clone(),
+        advertised_addr: config
+            .advertised_addr
+            .clone()
+            .or_else(|| Some(config.listen_addr.clone())),
         tip: tip.tip,
         height: tip.height,
     }
@@ -134,7 +138,7 @@ pub(crate) fn connect_peer(
                     reader,
                     writer,
                     Some(command_rx),
-                    RelayOrigin {
+                    PeerAddr {
                         advertised_addr: remote_hello.advertised_addr.clone(),
                         node_name: remote_hello.node_name.clone(),
                     },
@@ -226,7 +230,7 @@ async fn run_peer_task(
     mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut command_rx: Option<UnboundedReceiver<PeerCommand>>,
-    mut origin: RelayOrigin,
+    mut origin: PeerAddr,
 ) {
     if let Some(handle) = handle.as_ref() {
         let _ = handle.notify_peer_connected(peer_id.clone()).await;
@@ -368,7 +372,7 @@ async fn handle_inbound_message(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     pending_request: &mut Option<PendingRequest>,
     pending_deadline: &mut Option<Instant>,
-    origin: &mut RelayOrigin,
+    origin: &mut PeerAddr,
     message: WireMessage,
 ) -> io::Result<()> {
     if try_complete_pending_request(pending_request, message.clone()) {
@@ -378,7 +382,7 @@ async fn handle_inbound_message(
 
     let mut tip_for_follow_up_sync = None;
     if let WireMessage::Hello(remote_hello) = &message {
-        *origin = RelayOrigin {
+        *origin = PeerAddr {
             advertised_addr: remote_hello.advertised_addr.clone(),
             node_name: remote_hello.node_name.clone(),
         };
@@ -534,7 +538,7 @@ pub(crate) async fn serve_peer_stream(
         tokio::io::BufReader::new(reader),
         writer,
         None,
-        RelayOrigin::default(),
+        PeerAddr::default(),
     )
     .await;
 }
@@ -544,7 +548,7 @@ pub(crate) async fn serve_peer_stream(
 #[cfg(test)]
 pub(crate) fn relay_to_peer(
     peer_addr: &str,
-    config: &ServerConfig,
+    config: &NodeConfig,
     state: &NodeState,
     message: &WireMessage,
 ) -> io::Result<()> {
@@ -567,7 +571,7 @@ pub(crate) fn relay_to_peer(
 #[cfg(test)]
 fn relay_to_peer_once(
     peer_addr: &str,
-    config: &ServerConfig,
+    config: &NodeConfig,
     state: &NodeState,
     message: &WireMessage,
 ) -> io::Result<()> {
@@ -600,7 +604,7 @@ const RELAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 /// Gap: this does not yet fan accepted objects out to other peers, track peer
 /// state, or request missing parents automatically.
 pub fn handle_message(
-    config: &ServerConfig,
+    config: &NodeConfig,
     state: &mut NodeState,
     message: WireMessage,
 ) -> Result<Vec<WireMessage>, PeerError> {
@@ -660,7 +664,7 @@ mod tests {
     use crate::{
         node_state::NodeState,
         peer::{PeerError, handle_message, local_hello},
-        server::ServerConfig,
+        home::NodeConfig,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{
             HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, TipSummary, WireMessage,
@@ -737,7 +741,7 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = ServerConfig::new(
+        let config = NodeConfig::new(
             "wobble-local",
             Some("alpha".to_string()),
             "127.0.0.1:9000",
@@ -761,7 +765,7 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(&config, &mut state, WireMessage::GetTip).unwrap();
 
@@ -781,7 +785,7 @@ mod tests {
         let genesis_hash = genesis.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis.clone()).unwrap();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(
             &config,
@@ -803,7 +807,7 @@ mod tests {
     #[test]
     fn hello_rejects_network_mismatch() {
         let mut state = NodeState::new();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let err = handle_message(
             &config,
@@ -831,7 +835,7 @@ mod tests {
     #[test]
     fn hello_rejects_unsupported_version() {
         let mut state = NodeState::new();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let err = handle_message(
             &config,
@@ -868,7 +872,7 @@ mod tests {
         let txid = tx.txid();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(
             &config,
@@ -894,7 +898,7 @@ mod tests {
         let child_hash = child.header.block_hash();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         let replies = handle_message(
             &config,
@@ -926,7 +930,7 @@ mod tests {
         let txid = tx.txid();
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let config = ServerConfig::new("wobble-local", None, "127.0.0.1:9000");
+        let config = NodeConfig::new("wobble-local", None, "127.0.0.1:9000");
 
         handle_message(
             &config,

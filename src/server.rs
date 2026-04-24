@@ -31,6 +31,7 @@ use crate::{
     chain::ChainError,
     client::{ClientError, RequestError},
     consensus::BLOCK_SUBSIDY,
+    home::NodeConfig,
     mempool::MempoolError,
     mining::{self, MiningConfig, Miner},
     node_state::{NodeState, NodeStateError},
@@ -60,45 +61,54 @@ impl PeerEndpoint {
     }
 }
 
-/// Server settings for one running node instance.
+/// Runtime-only inputs used to build one serving node instance.
 ///
-/// This is the single config object for the server. It carries both the local
-/// protocol identity advertised to peers and the runtime listener settings used
-/// when the process starts serving.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerConfig {
-    pub network: String,
-    pub node_name: Option<String>,
-    pub advertised_addr: Option<String>,
-    pub listen_addr: String,
-    pub admin_addr: Option<String>,
+/// `NodeConfig` remains the single source of server identity and listener
+/// configuration. `ServerOptions` carries the additional runtime wiring needed
+/// to start a concrete server process, such as loaded state, peer list,
+/// persistence path, and integrated mining.
+#[derive(Debug)]
+pub struct ServerOptions {
+    pub config: NodeConfig,
+    pub state: NodeState,
+    pub peers: Vec<PeerEndpoint>,
+    pub sqlite_path: Option<PathBuf>,
+    pub bootstrap_sync: bool,
+    pub mining: Option<MiningConfig>,
     pub channel_capacity: usize,
 }
 
-impl ServerConfig {
-    pub fn new(
-        network: impl Into<String>,
-        node_name: Option<String>,
-        listen_addr: impl Into<String>,
-    ) -> Self {
+impl ServerOptions {
+    /// Builds the runtime options for one serving node from config plus state.
+    pub fn new(config: NodeConfig, state: NodeState) -> Self {
         Self {
-            network: network.into(),
-            node_name,
-            advertised_addr: None,
-            listen_addr: listen_addr.into(),
-            admin_addr: None,
+            config,
+            state,
+            peers: Vec::new(),
+            sqlite_path: None,
+            bootstrap_sync: false,
+            mining: None,
             channel_capacity: 64,
         }
     }
 
-    /// Records the listener address this node should advertise during handshake.
-    pub fn with_advertised_addr(mut self, advertised_addr: impl Into<String>) -> Self {
-        self.advertised_addr = Some(advertised_addr.into());
+    pub fn with_peers(mut self, peers: Vec<PeerEndpoint>) -> Self {
+        self.peers = peers;
         self
     }
 
-    pub fn with_admin_addr(mut self, admin_addr: impl Into<String>) -> Self {
-        self.admin_addr = Some(admin_addr.into());
+    pub fn with_sqlite_path(mut self, sqlite_path: impl Into<PathBuf>) -> Self {
+        self.sqlite_path = Some(sqlite_path.into());
+        self
+    }
+
+    pub fn with_bootstrap_sync(mut self, enabled: bool) -> Self {
+        self.bootstrap_sync = enabled;
+        self
+    }
+
+    pub fn with_mining(mut self, mining: MiningConfig) -> Self {
+        self.mining = Some(mining);
         self
     }
 
@@ -148,7 +158,7 @@ impl ServerHandle {
     pub(crate) async fn request_peer_message(
         &self,
         peer_id: String,
-        origin: Option<RelayOrigin>,
+        origin: Option<PeerAddr>,
         message: WireMessage,
     ) -> Result<Result<Vec<WireMessage>, ServerError>, ServerHandleError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -209,7 +219,7 @@ impl ServerHandle {
     /// Requests one follow-up sync check after a peer announces a better tip.
     pub(crate) async fn notify_tip_sync(
         &self,
-        origin: RelayOrigin,
+        origin: PeerAddr,
         summary: TipSummary,
     ) -> Result<(), ServerHandleError> {
         self.command_tx
@@ -240,13 +250,14 @@ impl ServerHandle {
 
 #[derive(Debug)]
 pub struct Server {
-    config: ServerConfig,
+    config: NodeConfig,
     state: NodeState,
     peers: HashMap<String, RuntimePeer>,
     connected_peers: HashSet<String>,
     sqlite_store: Option<sqlite_store::SqliteStore>,
     runtime_handle: Option<TokioHandle>,
     server_handle: Option<ServerHandle>,
+    channel_capacity: usize,
     bootstrap_sync: bool,
     mining: Option<MiningConfig>,
     miner: Option<Miner>,
@@ -280,7 +291,7 @@ pub enum ServerHandleError {
 
 /// Origin identity learned from the remote `hello` on a live stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RelayOrigin {
+pub(crate) struct PeerAddr {
     pub(crate) advertised_addr: Option<String>,
     pub(crate) node_name: Option<String>,
 }
@@ -299,7 +310,7 @@ enum ServerEvent {
     },
     PeerMessage {
         peer_id: String,
-        origin: Option<RelayOrigin>,
+        origin: Option<PeerAddr>,
         message: WireMessage,
         reply: oneshot::Sender<Result<Vec<WireMessage>, ServerError>>,
     },
@@ -311,7 +322,7 @@ enum ServerEvent {
         reply: oneshot::Sender<AdminResponse>,
     },
     TipSync {
-        origin: RelayOrigin,
+        origin: PeerAddr,
         summary: TipSummary,
     },
     SyncTick,
@@ -409,25 +420,10 @@ const CONFIGURED_PEER_SYNC_COOLDOWN: Duration = Duration::from_secs(5);
 const CONTINUOUS_SYNC_INTERVAL: Duration = Duration::from_millis(750);
 
 impl Server {
-    pub fn new(config: ServerConfig, state: NodeState) -> Self {
-        Self {
-            config,
-            state,
-            peers: HashMap::new(),
-            connected_peers: HashSet::new(),
-            sqlite_store: None,
-            runtime_handle: None,
-            server_handle: None,
-            bootstrap_sync: false,
-            mining: None,
-            miner: None,
-            control: ServerControl::default(),
-        }
-    }
-
-    /// Configures the peer addresses that should receive relayed transactions and blocks.
-    pub fn with_peers(mut self, peers: Vec<PeerEndpoint>) -> Self {
-        self.peers = peers
+    /// Builds one serving node from persisted config plus runtime-only options.
+    pub fn new(options: ServerOptions) -> Self {
+        let peers = options
+            .peers
             .into_iter()
             .map(|peer| {
                 (
@@ -442,39 +438,24 @@ impl Server {
                 )
             })
             .collect();
-        self
-    }
-
-    /// Configures the server to persist accepted blocks and chain metadata to SQLite.
-    ///
-    /// This stores the live server state in SQLite for restart and sync.
-    pub fn with_sqlite_path(mut self, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let store = sqlite_store::SqliteStore::open(&path)
-            .expect("server sqlite store should open before serving");
-        self.sqlite_store = Some(store);
-        self
-    }
-
-    /// Enables configured-peer sync attempts while serving.
-    ///
-    /// This is intended for cold start or restart of a node that may have
-    /// missed blocks while offline. Sync remains best effort: the server tries
-    /// once at startup and then retries periodically while the serve loop is
-    /// running.
-    pub fn with_bootstrap_sync(mut self, enabled: bool) -> Self {
-        self.bootstrap_sync = enabled;
-        self
-    }
-
-    /// Enables the integrated testnet miner for this serving node.
-    ///
-    /// The integrated miner is intentionally simple: while serving, it polls
-    /// for inbound connections and mines only when the local mempool is
-    /// non-empty.
-    pub fn with_mining(mut self, mining: MiningConfig) -> Self {
-        self.mining = Some(mining);
-        self
+        let sqlite_store = options.sqlite_path.map(|path| {
+            sqlite_store::SqliteStore::open(&path)
+                .expect("server sqlite store should open before serving")
+        });
+        Self {
+            config: options.config,
+            state: options.state,
+            peers,
+            connected_peers: HashSet::new(),
+            sqlite_store,
+            runtime_handle: None,
+            server_handle: None,
+            channel_capacity: options.channel_capacity,
+            bootstrap_sync: options.bootstrap_sync,
+            mining: options.mining,
+            miner: None,
+            control: ServerControl::default(),
+        }
     }
 
     /// Starts the server and runs it until shutdown.
@@ -508,14 +489,11 @@ impl Server {
         ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
     ) -> io::Result<NodeState> {
         let peer_listener = tokio::net::TcpListener::bind(&self.config.listen_addr).await?;
-        let admin_listener = match self.config.admin_addr.as_deref() {
-            Some(admin_addr) => Some(tokio::net::TcpListener::bind(admin_addr).await?),
-            None => None,
-        };
+        let admin_listener = Some(tokio::net::TcpListener::bind(&self.config.admin_addr).await?);
         self.runtime_handle = Some(tokio::runtime::Handle::current());
         let bootstrap_pending = self.bootstrap_sync;
         let stop_requested = Arc::new(AtomicBool::new(false));
-        let (command_tx, command_rx) = mpsc::channel(self.config.channel_capacity);
+        let (command_tx, command_rx) = mpsc::channel(self.channel_capacity);
         let handle = ServerHandle {
             command_tx,
             stop_requested: stop_requested.clone(),
@@ -652,13 +630,13 @@ impl Server {
     fn handle_peer_event(
         &mut self,
         _peer_id: &str,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
         message: WireMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
         self.handle_peer_message(origin, message)
     }
 
-    pub fn config(&self) -> &ServerConfig {
+    pub fn config(&self) -> &NodeConfig {
         &self.config
     }
 
@@ -689,7 +667,7 @@ impl Server {
     /// follow as the protocol grows.
     fn handle_peer_message(
         &mut self,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
         message: WireMessage,
     ) -> Result<Vec<WireMessage>, ServerError> {
         match message {
@@ -764,7 +742,7 @@ impl Server {
     ///
     /// This keeps `announce_tip` lightweight on the wire while still letting
     /// peers push catch-up hints promptly over long-lived connections.
-    fn handle_tip_sync(&mut self, origin: RelayOrigin, summary: TipSummary) {
+    fn handle_tip_sync(&mut self, origin: PeerAddr, summary: TipSummary) {
         if !self.tip_summary_advances_local_state(&summary) {
             return;
         }
@@ -842,7 +820,7 @@ impl Server {
     fn handle_peer_announce_tip(
         &mut self,
         summary: TipSummary,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
     ) -> Result<Vec<WireMessage>, ServerError> {
         debug!(
             remote_tip = %format_hash(summary.tip),
@@ -859,7 +837,7 @@ impl Server {
     fn handle_peer_announce_tx(
         &mut self,
         transaction: crate::types::Transaction,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
     ) -> Result<Vec<WireMessage>, ServerError> {
         self.handle_state_mutating_peer_message(
             WireMessage::AnnounceTx { transaction },
@@ -873,7 +851,7 @@ impl Server {
     fn handle_peer_announce_block(
         &mut self,
         block: Block,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
     ) -> Result<Vec<WireMessage>, ServerError> {
         let message = WireMessage::AnnounceBlock { block };
         if let Some(recovered) = self.try_handle_announced_block_with_sync(&message, origin)? {
@@ -892,7 +870,7 @@ impl Server {
     fn handle_peer_mine_pending(
         &mut self,
         request: crate::wire::MinePendingRequest,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
     ) -> Result<Vec<WireMessage>, ServerError> {
         let message = WireMessage::MinePending(request.clone());
         log_inbound_message(&message, &self.state);
@@ -936,7 +914,7 @@ impl Server {
     fn handle_state_mutating_peer_message(
         &mut self,
         message: WireMessage,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
         save_block_hash: Option<BlockHash>,
     ) -> Result<Vec<WireMessage>, ServerError> {
         log_inbound_message(&message, &self.state);
@@ -989,7 +967,7 @@ impl Server {
     fn try_handle_announced_block_with_sync(
         &mut self,
         message: &WireMessage,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
     ) -> Result<Option<Vec<WireMessage>>, ServerError> {
         let WireMessage::AnnounceBlock { block } = message else {
             return Ok(None);
@@ -1459,7 +1437,7 @@ impl Server {
 
     /// Announces an accepted object to configured peers except the one that
     /// originated it on the current stream, when that peer identity is known.
-    fn relay_best_effort(&mut self, message: &WireMessage, origin: Option<&RelayOrigin>) {
+    fn relay_best_effort(&mut self, message: &WireMessage, origin: Option<&PeerAddr>) {
         for peer in self.peer_endpoints() {
             if peer_matches_origin(&peer, origin) {
                 debug!(peer_addr = %peer.addr, "skipping relay to origin peer");
@@ -1526,7 +1504,7 @@ impl Server {
     fn relay_new_best_tip_if_advanced(
         &mut self,
         previous_best_tip: Option<BlockHash>,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
     ) {
         if self.state.chain().best_tip() == previous_best_tip {
             return;
@@ -1554,7 +1532,7 @@ impl Server {
     /// The advertised listener address is preferred because it is the most
     /// direct way to reconnect to the exact peer that sent the object. When
     /// absent, a configured peer entry with the same node name is used.
-    fn sync_peer_from_origin(&self, origin: &RelayOrigin) -> Option<PeerEndpoint> {
+    fn sync_peer_from_origin(&self, origin: &PeerAddr) -> Option<PeerEndpoint> {
         if let Some(addr) = origin.advertised_addr.as_ref() {
             return Some(PeerEndpoint::new(addr.clone(), origin.node_name.clone()));
         }
@@ -1601,7 +1579,7 @@ impl Server {
     /// Records peer metadata learned from one inbound `announce_tip`.
     fn record_inbound_tip(
         &mut self,
-        origin: Option<&RelayOrigin>,
+        origin: Option<&PeerAddr>,
         summary: &TipSummary,
     ) -> Result<(), SqliteStoreError> {
         let Some(endpoint) = origin
@@ -2041,7 +2019,7 @@ fn parse_timestamp_string(value: &str) -> Option<u64> {
     value.strip_prefix("unix:")?.parse().ok()
 }
 
-fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&RelayOrigin>) -> bool {
+fn peer_matches_origin(peer: &PeerEndpoint, origin: Option<&PeerAddr>) -> bool {
     let Some(origin) = origin else {
         return false;
     };
@@ -2215,14 +2193,15 @@ mod tests {
         net,
         node_state::{NodeState, NodeStateError},
         peer::relay_to_peer,
+        home::NodeConfig,
         peers::{PeerSource, StoredPeer},
-        server::{PeerEndpoint, Server, ServerConfig},
+        server::{PeerEndpoint, Server, ServerOptions},
         sqlite_store::SqliteStore,
         types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
         wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
-    use super::{RelayOrigin, current_unix_seconds, format_timestamp_string, peer_matches_origin};
+    use super::{PeerAddr, current_unix_seconds, format_timestamp_string, peer_matches_origin};
 
     fn temp_sqlite_path() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -2238,16 +2217,20 @@ mod tests {
         path
     }
 
-    fn server_config(node_name: Option<&str>) -> ServerConfig {
+    fn server_config(node_name: Option<&str>) -> NodeConfig {
         server_config_at(node_name, "127.0.0.1:9000")
     }
 
-    fn server_config_at(node_name: Option<&str>, listen_addr: &str) -> ServerConfig {
-        ServerConfig::new(
+    fn server_config_at(node_name: Option<&str>, listen_addr: &str) -> NodeConfig {
+        NodeConfig::new(
             "wobble-local",
             node_name.map(|name| name.to_string()),
             listen_addr,
         )
+    }
+
+    fn server_options(config: NodeConfig, state: NodeState) -> ServerOptions {
+        ServerOptions::new(config, state)
     }
 
     struct TestRuntime {
@@ -2402,9 +2385,12 @@ mod tests {
 
         let remote_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let remote_addr = remote_listener.local_addr().unwrap();
-        let mut server = Server::new(server_config(Some("alpha")), state).with_peers(vec![
-            PeerEndpoint::new(remote_addr.to_string(), Some("remote".to_string())),
-        ]);
+        let mut server = Server::new(
+            server_options(server_config(Some("alpha")), state).with_peers(vec![PeerEndpoint::new(
+                remote_addr.to_string(),
+                Some("remote".to_string()),
+            )]),
+        );
         let _runtime = attach_runtime(&mut server);
 
         let remote_task = thread::spawn(move || {
@@ -2448,13 +2434,12 @@ mod tests {
     #[test]
     fn announced_tip_updates_runtime_peer_metadata() {
         let remote_tip = BlockHash::new([0x77; 32]);
-        let mut server = Server::new(server_config(Some("local")), NodeState::new()).with_peers(
-            vec![PeerEndpoint::new(
-                "127.0.0.1:9001",
-                Some("remote".to_string()),
-            )],
+        let mut server = Server::new(
+            server_options(server_config(Some("local")), NodeState::new()).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("remote".to_string())),
+            ]),
         );
-        let origin = RelayOrigin {
+        let origin = PeerAddr {
             advertised_addr: Some("127.0.0.1:9001".to_string()),
             node_name: Some("remote".to_string()),
         };
@@ -2481,11 +2466,10 @@ mod tests {
             tip: Some(BlockHash::new([0x88; 32])),
             height: Some(5),
         };
-        let mut server = Server::new(server_config(Some("local")), NodeState::new()).with_peers(
-            vec![PeerEndpoint::new(
-                "127.0.0.1:9001",
-                Some("remote".to_string()),
-            )],
+        let mut server = Server::new(
+            server_options(server_config(Some("local")), NodeState::new()).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("remote".to_string())),
+            ]),
         );
 
         server.remember_tip_sync_hint("127.0.0.1:9001", &summary);
@@ -2535,8 +2519,10 @@ mod tests {
 
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let mut server = Server::new(server_config(Some("local")), state)
-            .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]);
+        let mut server = Server::new(
+            server_options(server_config(Some("local")), state)
+                .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]),
+        );
         let _runtime = attach_runtime(&mut server);
 
         server.relay_new_best_tip_if_advanced(None, None);
@@ -2555,7 +2541,7 @@ mod tests {
     fn bootstrap_uniqueness_advances_with_existing_height() {
         let owner = crypto::signing_key_from_bytes([8; 32]);
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
-        let mut server = Server::new(server_config(None), NodeState::new());
+        let mut server = Server::new(server_options(server_config(None), NodeState::new()));
         server.state_mut().accept_block(genesis).unwrap();
 
         let response = server.handle_admin_request(AdminRequest::Bootstrap {
@@ -2596,7 +2582,9 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(server_config(None), state).with_sqlite_path(&sqlite_path);
+        let mut server = Server::new(
+            server_options(server_config(None), state).with_sqlite_path(&sqlite_path),
+        );
 
         server
             .handle_message(WireMessage::AnnounceTx { transaction })
@@ -2619,8 +2607,9 @@ mod tests {
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
         let genesis_hash = genesis.header.block_hash();
         let sqlite_path = temp_sqlite_path();
-        let mut server =
-            Server::new(server_config(None), NodeState::new()).with_sqlite_path(&sqlite_path);
+        let mut server = Server::new(
+            server_options(server_config(None), NodeState::new()).with_sqlite_path(&sqlite_path),
+        );
 
         server
             .handle_message(WireMessage::AnnounceBlock {
@@ -2661,8 +2650,9 @@ mod tests {
         let harder_child = mine_block(genesis_hash, 0x201f_ffff, &miner_b.verifying_key(), 2);
         let harder_child_hash = harder_child.header.block_hash();
         let sqlite_path = temp_sqlite_path();
-        let mut server =
-            Server::new(server_config(None), NodeState::new()).with_sqlite_path(&sqlite_path);
+        let mut server = Server::new(
+            server_options(server_config(None), NodeState::new()).with_sqlite_path(&sqlite_path),
+        );
 
         server
             .handle_message(WireMessage::AnnounceBlock { block: genesis })
@@ -2730,7 +2720,9 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(pending.clone()).unwrap();
-        let mut server = Server::new(server_config(None), state).with_sqlite_path(&sqlite_path);
+        let mut server = Server::new(
+            server_options(server_config(None), state).with_sqlite_path(&sqlite_path),
+        );
         server.save_full_state().unwrap();
 
         server
@@ -2769,11 +2761,13 @@ mod tests {
                 0,
             ))
             .unwrap();
-        let mut server = Server::new(server_config(None), state).with_peers(vec![
-            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
-            PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
-        ]);
+        let mut server = Server::new(
+            server_options(server_config(None), state).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+                PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
+            ]),
+        );
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             addr: "127.0.0.1:9001".to_string(),
             node_name: Some("alpha".to_string()),
@@ -2817,10 +2811,12 @@ mod tests {
 
     #[test]
     fn select_sync_peers_falls_back_to_first_configured_peer_without_tip_metadata() {
-        let server = Server::new(server_config(None), NodeState::new()).with_peers(vec![
-            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
-        ]);
+        let server = Server::new(
+            server_options(server_config(None), NodeState::new()).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+            ]),
+        );
 
         let selected = server.select_sync_peers();
 
@@ -2831,11 +2827,11 @@ mod tests {
 
     #[test]
     fn select_sync_peers_skips_recently_contacted_unknown_peer() {
-        let mut server =
-            Server::new(server_config(None), NodeState::new()).with_peers(vec![PeerEndpoint::new(
-                "127.0.0.1:9001",
-                Some("alpha".to_string()),
-            )]);
+        let mut server = Server::new(
+            server_options(server_config(None), NodeState::new()).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+            ]),
+        );
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             last_connect_at: Some(format_timestamp_string(current_unix_seconds())),
             ..StoredPeer::from_endpoint(
@@ -2867,7 +2863,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction.clone()).unwrap();
-        let server = Server::new(server_config(None), state);
+        let server = Server::new(server_options(server_config(None), state));
 
         let relay = server.relay_message_before_handle(&WireMessage::AnnounceTx { transaction });
 
@@ -2876,10 +2872,12 @@ mod tests {
 
     #[test]
     fn relay_best_effort_skips_origin_peer_by_node_name() {
-        let server = Server::new(server_config(Some("alpha")), NodeState::new()).with_peers(vec![
-            PeerEndpoint::new("127.0.0.1:1", Some("beta".to_string())),
-            PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string())),
-        ]);
+        let server = Server::new(
+            server_options(server_config(Some("alpha")), NodeState::new()).with_peers(vec![
+                PeerEndpoint::new("127.0.0.1:1", Some("beta".to_string())),
+                PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string())),
+            ]),
+        );
 
         let selected: Vec<_> = server
             .peers
@@ -2895,7 +2893,7 @@ mod tests {
     #[test]
     fn peer_match_prefers_advertised_addr_over_node_name() {
         let peer = PeerEndpoint::new("127.0.0.1:2", Some("gamma".to_string()));
-        let origin = RelayOrigin {
+        let origin = PeerAddr {
             advertised_addr: Some("127.0.0.1:2".to_string()),
             node_name: Some("beta".to_string()),
         };
@@ -2922,7 +2920,7 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction.clone()).unwrap();
-        let mut server = Server::new(server_config(None), state);
+        let mut server = Server::new(server_options(server_config(None), state));
 
         let replies = server
             .handle_message(WireMessage::MinePending(crate::wire::MinePendingRequest {
@@ -3009,7 +3007,7 @@ mod tests {
 
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let mut server = Server::new(server_config(Some("local")), state);
+        let mut server = Server::new(server_options(server_config(Some("local")), state));
         let _runtime = attach_runtime(&mut server);
 
         server
@@ -3071,7 +3069,7 @@ mod tests {
 
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
-        let mut server = Server::new(server_config(Some("local")), state);
+        let mut server = Server::new(server_options(server_config(Some("local")), state));
         let _runtime = attach_runtime(&mut server);
 
         let err = server
@@ -3155,9 +3153,9 @@ mod tests {
             .unwrap();
         });
 
-        let mut server = Server::new(server_config(Some("local")), NodeState::new());
+        let mut server = Server::new(server_options(server_config(Some("local")), NodeState::new()));
         let _runtime = attach_runtime(&mut server);
-        let origin = RelayOrigin {
+        let origin = PeerAddr {
             advertised_addr: Some(peer_addr),
             node_name: Some("remote".to_string()),
         };
@@ -3201,8 +3199,8 @@ mod tests {
         );
         let mut state = NodeState::new();
         state.accept_block(local_genesis).unwrap();
-        let mut server = Server::new(server_config(Some("local")), state);
-        let origin = RelayOrigin {
+        let mut server = Server::new(server_options(server_config(Some("local")), state));
+        let origin = PeerAddr {
             advertised_addr: Some("127.0.0.1:9999".to_string()),
             node_name: Some("remote".to_string()),
         };
@@ -3303,8 +3301,10 @@ mod tests {
             ));
         });
 
-        let mut server = Server::new(server_config(Some("local")), NodeState::new())
-            .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]);
+        let mut server = Server::new(
+            server_options(server_config(Some("local")), NodeState::new())
+                .with_peers(vec![PeerEndpoint::new(addr, Some("remote".to_string()))]),
+        );
         let _runtime = attach_runtime(&mut server);
         let transaction = coinbase(
             50,
@@ -3345,8 +3345,10 @@ mod tests {
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction).unwrap();
 
-        let mut server = Server::new(server_config(None), state).with_mining(
-            MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
+        let mut server = Server::new(
+            server_options(server_config(None), state).with_mining(
+                MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
+            ),
         );
 
         let candidate = server
@@ -3367,8 +3369,11 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             Server::new(
-                server_config_at(None, "127.0.0.1:0").with_channel_capacity(4),
-                NodeState::new(),
+                server_options(
+                    server_config_at(None, "127.0.0.1:0").with_admin_addr("127.0.0.1:0"),
+                    NodeState::new(),
+                )
+                .with_channel_capacity(4),
             )
             .start(Some(ready_tx))
             .unwrap()

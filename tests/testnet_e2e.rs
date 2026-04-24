@@ -21,8 +21,9 @@ use std::{
 use wobble::{
     admin::{AdminRequest, AdminResponse, StatusSummary},
     crypto, net,
+    home::NodeConfig,
     node_state::NodeState,
-    server::{PeerEndpoint, Server, ServerConfig, ServerHandle},
+    server::{PeerEndpoint, Server, ServerHandle, ServerOptions},
     sqlite_store::SqliteStore,
     types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
     wire::{HelloMessage, MinePendingRequest, MinedBlock, PROTOCOL_VERSION, WireMessage},
@@ -251,17 +252,19 @@ impl TestNet {
                 (state, Some(sqlite_path))
             }
         };
-        let mut server = Server::new(
-            ServerConfig::new("wobble-local", Some(node.name.clone()), addr.clone())
+        let mut options = ServerOptions::new(
+            NodeConfig::new("wobble-local", Some(node.name.clone()), addr.clone())
                 .with_advertised_addr(&addr)
-                .with_channel_capacity(64),
+                .with_admin_addr("127.0.0.1:0"),
             state,
         )
         .with_peers(peer_endpoints)
-        .with_bootstrap_sync(bootstrap_sync);
+        .with_bootstrap_sync(bootstrap_sync)
+        .with_channel_capacity(64);
         if let Some(sqlite_path) = sqlite_path.as_deref() {
-            server = server.with_sqlite_path(sqlite_path);
+            options = options.with_sqlite_path(sqlite_path);
         }
+        let server = Server::new(options);
         let (control_tx, control_rx) = mpsc::channel();
 
         let running = RunningNode {
