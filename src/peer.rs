@@ -266,7 +266,6 @@ async fn run_peer_task(
                     }
                 };
                 if handle_inbound_message(
-                    &peer_id,
                     handle.as_ref(),
                     &mut writer,
                     &mut pending_request,
@@ -367,7 +366,6 @@ async fn handle_peer_command(
 /// peer messages are forwarded into the server event loop so `Server` remains
 /// the only protocol/state authority.
 async fn handle_inbound_message(
-    peer_id: &str,
     handle: Option<&ServerHandle>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     pending_request: &mut Option<PendingRequest>,
@@ -395,7 +393,7 @@ async fn handle_inbound_message(
     };
 
     let replies = handle
-        .request_peer_message(peer_id.to_string(), Some(origin.clone()), message)
+        .request_peer_message(Some(origin.clone()), message)
         .await
         .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, format!("{err:?}")))?
         .map_err(|err| io::Error::other(format!("{err:?}")))?;

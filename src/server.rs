@@ -234,14 +234,12 @@ impl ServerHandle {
     /// Sends one peer message into the server event loop and waits for replies.
     pub(crate) async fn request_peer_message(
         &self,
-        peer_id: String,
         origin: Option<PeerAddr>,
         message: WireMessage,
     ) -> Result<Result<Vec<WireMessage>, ServerError>, ServerHandleError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(ServerEvent::PeerMessage {
-                peer_id,
                 origin,
                 message,
                 reply: reply_tx,
@@ -383,7 +381,6 @@ enum ServerEvent {
         peer_id: String,
     },
     PeerMessage {
-        peer_id: String,
         origin: Option<PeerAddr>,
         message: WireMessage,
         reply: oneshot::Sender<Result<Vec<WireMessage>, ServerError>>,
@@ -615,12 +612,11 @@ impl Server {
                 true
             }
             ServerEvent::PeerMessage {
-                peer_id,
                 origin,
                 message,
                 reply,
             } => {
-                let result = self.handle_peer_event(&peer_id, origin.as_ref(), message);
+                let result = self.handle_peer_message(origin.as_ref(), message);
                 let _ = reply.send(result);
                 true
             }
@@ -647,16 +643,6 @@ impl Server {
             }
             ServerEvent::Stop => false,
         }
-    }
-
-    /// Handles one async peer event against the authoritative server state.
-    fn handle_peer_event(
-        &mut self,
-        _peer_id: &str,
-        origin: Option<&PeerAddr>,
-        message: WireMessage,
-    ) -> Result<Vec<WireMessage>, ServerError> {
-        self.handle_peer_message(origin, message)
     }
 
     /// Handles one decoded wire message against the server's current node state.
@@ -1360,13 +1346,13 @@ impl Server {
 
         let mut accepted_blocks = Vec::new();
         for block in missing_blocks.into_iter().rev() {
-            if let Some(block) = self.accept_synced_block(block)? {
+            let previous_best_tip = self.state.chain().best_tip();
+            let previous_mempool_txids = mempool_txids(self.state.mempool());
+            if let Some(block) =
+                self.accept_synced_block(block, previous_best_tip, &previous_mempool_txids)?
+            {
                 accepted_blocks.push(block);
             }
-        }
-
-        if !accepted_blocks.is_empty() {
-            self.save_full_state().map_err(SyncError::SqlitePersist)?;
         }
 
         info!(
@@ -1387,8 +1373,14 @@ impl Server {
             || summary.height.unwrap_or(0) > self.state.tip_summary().height.unwrap_or(0)
     }
 
-    /// Applies one fetched block if it is not already indexed locally.
-    fn accept_synced_block(&mut self, block: Block) -> Result<Option<Block>, SyncError> {
+    /// Applies one fetched block if it is not already indexed locally and
+    /// persists the resulting block-state changes incrementally.
+    fn accept_synced_block(
+        &mut self,
+        block: Block,
+        previous_best_tip: Option<BlockHash>,
+        previous_mempool_txids: &HashSet<Txid>,
+    ) -> Result<Option<Block>, SyncError> {
         let block_hash = block.header.block_hash();
         if self.state.get_block(&block_hash).is_some() {
             return Ok(None);
@@ -1396,6 +1388,8 @@ impl Server {
         self.state
             .accept_block(block.clone())
             .map_err(SyncError::AcceptBlock)?;
+        self.save_accepted_block_state(block_hash, previous_best_tip, previous_mempool_txids)
+            .map_err(SyncError::SqlitePersist)?;
         Ok(Some(block))
     }
 
@@ -1420,26 +1414,46 @@ impl Server {
             store.save_mempool(self.state.mempool())?;
             return Ok(());
         };
-        if block_save_requires_full_snapshot(
+        if block_save_requires_mempool_index_refresh(
             &self.state,
             block_hash,
             previous_best_tip,
             previous_mempool_txids,
         ) {
-            // Reorgs and tip changes that prune unrelated mempool entries are
-            // still subtle enough that we prefer the authoritative full save.
-            return self.save_full_state();
+            return self.save_accepted_block_state(
+                block_hash,
+                previous_best_tip,
+                previous_mempool_txids,
+            );
         }
         // Simple best-tip extension: save just the accepted block effects.
         store.save_accepted_block(&self.state, block_hash)
     }
 
-    /// Persists the full current node state when a bulk sync changed local history.
-    fn save_full_state(&self) -> Result<(), SqliteStoreError> {
+    /// Persists one accepted block and any broader mempool/index fallout
+    /// without rewriting the whole SQLite snapshot.
+    fn save_accepted_block_state(
+        &self,
+        block_hash: BlockHash,
+        previous_best_tip: Option<BlockHash>,
+        previous_mempool_txids: &HashSet<Txid>,
+    ) -> Result<(), SqliteStoreError> {
         let Some(store) = self.sqlite_store.as_ref() else {
             return Ok(());
         };
-        store.save_node_state(&self.state)
+        store.save_accepted_block(&self.state, block_hash)?;
+        if block_save_requires_mempool_index_refresh(
+            &self.state,
+            block_hash,
+            previous_best_tip,
+            previous_mempool_txids,
+        ) {
+            // Reorgs and block-driven mempool pruning can change wallet-style
+            // transaction status beyond the newly accepted block itself, so we
+            // refresh only the mempool-facing and transaction-index tables.
+            store.save_mempool_state(&self.state)?;
+        }
+        Ok(())
     }
 
     /// Announces an accepted object to configured peers except the one that
@@ -2029,8 +2043,8 @@ fn saved_block_hash(message: &WireMessage) -> Option<BlockHash> {
     }
 }
 
-/// Returns whether one accepted block should fall back to a full-state save.
-fn block_save_requires_full_snapshot(
+/// Returns whether one accepted block needs a broader mempool/index refresh.
+fn block_save_requires_mempool_index_refresh(
     state: &NodeState,
     block_hash: BlockHash,
     previous_best_tip: Option<BlockHash>,
@@ -2048,7 +2062,8 @@ fn block_save_requires_full_snapshot(
         _ => false,
     };
     if !extends_previous_tip {
-        // Switching to a different branch is still handled by the full snapshot path.
+        // Switching to a different branch can change transaction confirmation
+        // status across the wallet index, not just for this one block.
         return true;
     }
     let Some(block) = state.get_block(&block_hash) else {
@@ -2066,7 +2081,7 @@ fn block_save_requires_full_snapshot(
         .map(|transaction| transaction.txid())
         .collect();
     // If the tip change pruned anything beyond the block's own confirmed
-    // transactions, fall back to the broader save path.
+    // transactions, refresh the broader mempool/index state too.
     removed_txids != included_txids
 }
 
@@ -2621,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn reorg_block_falls_back_to_full_snapshot_save() {
+    fn reorg_block_refreshes_mempool_index_incrementally() {
         let miner_a = crypto::signing_key_from_bytes([11; 32]);
         let miner_b = crypto::signing_key_from_bytes([12; 32]);
         let genesis = mine_block(
@@ -2676,7 +2691,7 @@ mod tests {
     }
 
     #[test]
-    fn block_that_prunes_unrelated_mempool_tx_falls_back_to_full_snapshot_save() {
+    fn block_that_prunes_unrelated_mempool_tx_refreshes_mempool_index_incrementally() {
         let sender = crypto::signing_key_from_bytes([21; 32]);
         let recipient_a = crypto::signing_key_from_bytes([22; 32]);
         let recipient_b = crypto::signing_key_from_bytes([23; 32]);
@@ -2708,7 +2723,10 @@ mod tests {
         state.submit_transaction(pending.clone()).unwrap();
         let mut server =
             Server::new(server_options(server_config(None), state).with_sqlite_path(&sqlite_path));
-        server.save_full_state().unwrap();
+        SqliteStore::open(&sqlite_path)
+            .unwrap()
+            .save_node_state(server.state())
+            .unwrap();
 
         server
             .handle_message(WireMessage::AnnounceBlock { block: child })
@@ -3003,8 +3021,89 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_peer_errors_when_remote_tip_block_is_missing() {
+    fn sync_from_peer_persists_accepted_blocks_without_full_snapshot_save() {
         let owner = crypto::signing_key_from_bytes([10; 32]);
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
+        let child = mine_block(
+            genesis.header.block_hash(),
+            0x207f_ffff,
+            &owner.verifying_key(),
+            1,
+        );
+        let child_hash = child.header.block_hash();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer_addr = addr.clone();
+        let served_child = child.clone();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = net::receive_message(&mut stream).unwrap();
+            assert!(matches!(hello, WireMessage::Hello(_)));
+            net::send_message(
+                &mut stream,
+                &WireMessage::Hello(HelloMessage {
+                    network: "wobble-local".to_string(),
+                    version: PROTOCOL_VERSION,
+                    node_name: Some("remote".to_string()),
+                    advertised_addr: Some(addr.clone()),
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut stream).unwrap();
+            assert_eq!(request, WireMessage::GetTip);
+            net::send_message(
+                &mut stream,
+                &WireMessage::Tip(TipSummary {
+                    tip: Some(child_hash),
+                    height: Some(1),
+                }),
+            )
+            .unwrap();
+            let request = net::receive_message(&mut stream).unwrap();
+            let WireMessage::GetBlock { block_hash } = request else {
+                panic!("expected get_block request");
+            };
+            assert_eq!(block_hash, child_hash);
+            net::send_message(
+                &mut stream,
+                &WireMessage::Block {
+                    block: Some(served_child),
+                },
+            )
+            .unwrap();
+        });
+
+        let sqlite_path = temp_sqlite_path();
+        let mut state = NodeState::new();
+        state.accept_block(genesis).unwrap();
+        SqliteStore::open(&sqlite_path)
+            .unwrap()
+            .save_node_state(&state)
+            .unwrap();
+        let mut server = Server::new(
+            server_options(server_config(Some("local")), state).with_sqlite_path(&sqlite_path),
+        );
+        let _runtime = attach_runtime(&mut server);
+
+        server
+            .sync_from_peer(&PeerEndpoint::new(peer_addr, Some("remote".to_string())))
+            .unwrap();
+        worker.join().unwrap();
+
+        let reloaded = SqliteStore::open(&sqlite_path).unwrap().load_node_state().unwrap();
+        fs::remove_file(&sqlite_path).unwrap();
+
+        assert_eq!(server.state().chain().best_tip(), Some(child_hash));
+        assert_eq!(reloaded.chain().best_tip(), Some(child_hash));
+        assert!(reloaded.get_block(&child_hash).is_some());
+    }
+
+    #[test]
+    fn sync_from_peer_errors_when_remote_tip_block_is_missing() {
+        let owner = crypto::signing_key_from_bytes([11; 32]);
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
         let missing_hash = BlockHash::new([0x44; 32]);
 
@@ -3065,7 +3164,7 @@ mod tests {
 
     #[test]
     fn announced_block_syncs_missing_parent_then_retries_acceptance() {
-        let owner = crypto::signing_key_from_bytes([11; 32]);
+        let owner = crypto::signing_key_from_bytes([12; 32]);
         let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &owner.verifying_key(), 0);
         let child = mine_block(
             genesis.header.block_hash(),
@@ -3169,8 +3268,8 @@ mod tests {
 
     #[test]
     fn announced_competing_genesis_still_returns_original_rejection() {
-        let local_owner = crypto::signing_key_from_bytes([12; 32]);
-        let remote_owner = crypto::signing_key_from_bytes([13; 32]);
+        let local_owner = crypto::signing_key_from_bytes([13; 32]);
+        let remote_owner = crypto::signing_key_from_bytes([14; 32]);
         let local_genesis = mine_block(
             BlockHash::default(),
             0x207f_ffff,

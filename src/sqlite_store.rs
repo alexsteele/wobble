@@ -22,8 +22,9 @@
 //! - best-tip block extensions use `save_accepted_block`, which updates the new
 //!   block record, active UTXO view, stale mempool rows, and confirmed
 //!   transaction rows for that block
-//! - bulk sync, rebuild, and reorg fallback still use `save_node_state` as the
-//!   authoritative full-snapshot path when incremental updates are not enough
+//! - `save_node_state` remains available as the authoritative full-snapshot
+//!   path for initialization, rebuilds, and test seeding when incremental
+//!   updates are not enough
 
 use std::{io, path::Path};
 
@@ -962,8 +963,8 @@ impl SqliteStore {
     ///
     /// EXPENSIVE: rewrites the full persisted node snapshot.
     pub fn save_node_state(&self, state: &NodeState) -> Result<(), SqliteStoreError> {
-        // TODO: Replace this full snapshot rewrite with incremental updates so
-        // steady-state block acceptance does not resave the entire database.
+        // TODO: Keep shrinking the remaining callers of this full snapshot
+        // path as more initialization and repair flows get narrower saves.
         let tx = self.connection.unchecked_transaction()?;
         tx.execute_batch(
             "DELETE FROM blocks;
