@@ -1241,7 +1241,11 @@ impl Server {
                 .then_with(|| left.addr.cmp(&right.addr))
         });
         if let Some(best) = candidates.into_iter().find(|peer| {
-            peer.advertised_height.unwrap_or(0) > local_height && self.peer_is_ready_for_sync(peer)
+            self.peer_is_ready_for_sync(peer)
+                && (peer.advertised_height.unwrap_or(0) > local_height
+                    || peer
+                        .advertised_tip_hash
+                        .is_some_and(|tip| self.state.get_block(&tip).is_none()))
         }) {
             return vec![best.endpoint()];
         }
@@ -2808,6 +2812,51 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].addr, "127.0.0.1:9002");
         assert_eq!(selected[0].node_name.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn select_sync_peers_keeps_retrying_unknown_tip_at_same_height() {
+        let local_owner = crypto::signing_key_from_bytes([31; 32]);
+        let remote_owner = crypto::signing_key_from_bytes([32; 32]);
+        let local_genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &local_owner.verifying_key(),
+            0,
+        );
+        let remote_genesis = mine_block(
+            BlockHash::default(),
+            0x207f_ffff,
+            &remote_owner.verifying_key(),
+            1,
+        );
+        let remote_tip = remote_genesis.header.block_hash();
+
+        let mut state = NodeState::new();
+        state.accept_block(local_genesis).unwrap();
+        let mut server = Server::new(
+            server_options(server_config(None), state).with_peers(vec![PeerEndpoint::new(
+                "127.0.0.1:9001",
+                Some("alpha".to_string()),
+            )]),
+        );
+        server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
+            addr: "127.0.0.1:9001".to_string(),
+            node_name: Some("alpha".to_string()),
+            source: PeerSource::Seed,
+            advertised_tip_hash: Some(remote_tip),
+            advertised_height: Some(0),
+            ..StoredPeer::from_endpoint(
+                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+                PeerSource::Seed,
+            )
+        };
+
+        let selected = server.select_sync_peers();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].addr, "127.0.0.1:9001");
+        assert_eq!(selected[0].node_name.as_deref(), Some("alpha"));
     }
 
     #[test]

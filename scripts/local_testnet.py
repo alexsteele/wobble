@@ -337,7 +337,6 @@ class LocalTestNet:
         seed_follower = self.nodes[0]
         self.start_node(seed_follower, mining=self.args.mining_node == 0)
         self.wait_for_running_server(seed_follower)
-        self.wait_for_first_tip(seed_follower, self.seed_peer)
 
         for index, node in enumerate(self.nodes[1:], start=1):
             self.start_node(node, mining=index == self.args.mining_node)
@@ -345,24 +344,25 @@ class LocalTestNet:
             self.wait_for_running_server(node)
 
     def wait_for_first_tip(self, node: NodeHandle, source: str | None) -> None:
-        """Polls until one node persists its first tip from bootstrap or seed sync."""
+        """Polls until one node reports its first tip from bootstrap or seed sync."""
         deadline = time.time() + 30
         next_progress_log = time.time()
         while time.time() < deadline:
             self.ensure_nodes_running()
             status = self.status_info(node)
-            if status.get("best tip") != "<none>":
+            tip, height = self.effective_tip_fields(status)
+            if tip != "<none>":
                 self.log(
                     f"{node.name} synced first tip from {source or 'bootstrap'} "
-                    f"height={status.get('height')} tip={status.get('best tip')}"
+                    f"height={height} tip={tip}"
                 )
                 return
             if time.time() >= next_progress_log:
-                self.log(f"waiting for {node.name} to persist its first tip")
+                self.log(f"waiting for {node.name} to report its first tip")
                 next_progress_log = time.time() + 10
             time.sleep(0.5)
         raise RuntimeError(
-            f"{node.name} did not persist a tip while syncing from {source or 'bootstrap'}"
+            f"{node.name} did not report a tip while syncing from {source or 'bootstrap'}"
         )
 
     def wait_for_running_server(self, node: NodeHandle) -> None:
@@ -430,6 +430,15 @@ class LocalTestNet:
             raise RuntimeError(f"status probe failed for {node.name}: {details}")
         return self.parse_fields(result.stdout)
 
+    def effective_tip_fields(self, status: dict[str, str]) -> tuple[str, str]:
+        """Returns the best available tip and height from one status snapshot."""
+        if status.get("server") == "running":
+            live_tip = status.get("live best tip", "<none>")
+            live_height = status.get("live height", "<none>")
+            if live_tip != "<none>":
+                return live_tip, live_height
+        return status.get("best tip", "<none>"), status.get("height", "<none>")
+
     def seed_tip_info(self) -> dict[str, str]:
         """Returns the seeded peer's advertised tip summary."""
         assert self.seed_peer is not None
@@ -495,21 +504,20 @@ class LocalTestNet:
         self.wait_for_cluster_sync(self.nodes[0])
 
     def wait_for_cluster_sync(self, reference: NodeHandle) -> None:
-        """Polls until every node reports the same persisted tip and height."""
+        """Polls until every node reports the same best available tip and height."""
         next_progress_log = time.time()
         missing_tip_deadline = time.time() + 30 if self.seed_peer else None
         while True:
             self.ensure_nodes_running()
             reference_status = self.status_info(reference)
-            reference_tip = reference_status["best tip"]
-            reference_height = reference_status["height"]
+            reference_tip, reference_height = self.effective_tip_fields(reference_status)
             if reference_tip == "<none>":
                 if missing_tip_deadline is not None and time.time() >= missing_tip_deadline:
                     raise RuntimeError(
-                        f"{reference.name} did not persist a tip while syncing from seed {self.seed_peer}"
+                        f"{reference.name} did not report a tip while syncing from seed {self.seed_peer}"
                     )
                 if time.time() >= next_progress_log:
-                    self.log("waiting for reference node to report a persisted tip")
+                    self.log("waiting for reference node to report a tip")
                     next_progress_log = time.time() + 10
                 time.sleep(0.5)
                 continue
@@ -518,13 +526,14 @@ class LocalTestNet:
             mismatches: list[str] = []
             for node in self.nodes:
                 node_status = self.status_info(node)
+                node_tip, node_height = self.effective_tip_fields(node_status)
                 if (
-                    node_status.get("best tip") != reference_tip
-                    or node_status.get("height") != reference_height
+                    node_tip != reference_tip
+                    or node_height != reference_height
                 ):
                     all_match = False
                     mismatches.append(
-                        f"{node.name}(height={node_status.get('height')} tip={node_status.get('best tip')})"
+                        f"{node.name}(height={node_height} tip={node_tip})"
                     )
             if all_match:
                 self.log(f"cluster synced at height={reference_height} best_tip={reference_tip}")
@@ -644,6 +653,29 @@ class LocalTestNet:
             node.process.kill()
             node.process.wait(timeout=5)
 
+    def log_recent_server_output(self, lines: int = 40) -> None:
+        """Prints the tail of each node stdout and structured server log."""
+        for node in self.nodes:
+            if not node.log_path.exists():
+                stdout_tail = ""
+            else:
+                self.log(f"last {lines} lines from {node.name} stdout log:")
+                text = node.log_path.read_text(encoding="utf-8", errors="replace")
+                stdout_tail = "\n".join(text.splitlines()[-lines:])
+                if stdout_tail:
+                    self.append_output(stdout_tail)
+
+            structured_logs = sorted((node.home / "logs").glob("server.log*"))
+            if structured_logs:
+                structured_log = structured_logs[-1]
+                self.log(
+                    f"last {lines} lines from {node.name} structured log ({structured_log.name}):"
+                )
+                text = structured_log.read_text(encoding="utf-8", errors="replace")
+                tail = "\n".join(text.splitlines()[-lines:])
+                if tail:
+                    self.append_output(tail)
+
     def cleanup(self) -> None:
         """Stops all managed servers and closes their log files."""
         for node in self.nodes:
@@ -668,6 +700,7 @@ class LocalTestNet:
             return 0
         except Exception as err:
             self.log(f"local testnet failed: {err}")
+            self.log_recent_server_output()
             self.log(f"artifacts left in {self.run_dir}")
             return 1
         finally:
