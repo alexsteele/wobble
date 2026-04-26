@@ -33,7 +33,7 @@ use crate::{
     consensus::BLOCK_SUBSIDY,
     home::NodeConfig,
     mempool::MempoolError,
-    mining::{self, MiningConfig, Miner},
+    mining::{self, Miner, MiningConfig},
     node_state::{NodeState, NodeStateError},
     peer::{self, PeerError},
     peers::{PeerSource, StoredPeer},
@@ -59,6 +59,83 @@ impl PeerEndpoint {
             node_name,
         }
     }
+}
+
+/// One runtime peer record combining endpoint identity, learned metadata, and
+/// any live outbound session state.
+///
+/// This is the server's single runtime record for one known peer address. It
+/// carries persisted metadata, the optional live session handle used for
+/// long-lived sync and relay traffic, and the sync bookkeeping that suppresses
+/// duplicate catch-up work.
+#[derive(Debug)]
+struct RuntimePeer {
+    endpoint: PeerEndpoint,
+    stored: StoredPeer,
+    session: Option<PeerSession>,
+    /// Last pushed tip hint this node already acted on for follow-up sync.
+    last_tip_sync_hint: Option<TipSummary>,
+    sync_state: PeerSyncState,
+}
+
+/// One active outbound peer session owned by the server runtime.
+///
+/// The underlying async peer task owns the TCP stream itself. The server keeps
+/// this higher-level session record so protocol code can reuse one live peer
+/// handle across sync and relay operations without reopening sockets.
+#[derive(Debug)]
+struct PeerSession {
+    handle: peer::PeerHandle,
+}
+
+/// Sync lifecycle for one runtime peer.
+///
+/// `Idle` means no catch-up work is currently active. `Syncing` suppresses
+/// overlapping hello- and tip-triggered sync walks against the same peer until
+/// the current attempt finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSyncState {
+    Idle,
+    Syncing,
+}
+
+impl RuntimePeer {
+    /// Returns the active outbound session for this peer, if connected.
+    fn session(&self) -> Option<&PeerSession> {
+        self.session.as_ref()
+    }
+
+    /// Attaches one newly connected outbound session to this peer.
+    fn attach_session(&mut self, session: PeerSession) {
+        self.session = Some(session);
+    }
+
+    /// Disconnects the active outbound session, if any.
+    fn disconnect(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.handle.shutdown();
+        }
+    }
+
+    /// Returns whether this peer is already serving one active sync walk.
+    fn sync_in_progress(&self) -> bool {
+        self.sync_state == PeerSyncState::Syncing
+    }
+
+    /// Marks this peer as actively serving one sync walk.
+    fn begin_sync(&mut self) {
+        self.sync_state = PeerSyncState::Syncing;
+    }
+
+    /// Marks this peer as idle again after one sync walk completes.
+    fn finish_sync(&mut self) {
+        self.sync_state = PeerSyncState::Idle;
+    }
+}
+
+/// One spawned async peer transport task.
+struct LivePeerTask {
+    worker: JoinHandle<()>,
 }
 
 /// Runtime-only inputs used to build one serving node instance.
@@ -223,10 +300,7 @@ impl ServerHandle {
         summary: TipSummary,
     ) -> Result<(), ServerHandleError> {
         self.command_tx
-            .send(ServerEvent::TipSync {
-                origin,
-                summary,
-            })
+            .send(ServerEvent::TipSync { origin, summary })
             .await
             .map_err(|_| ServerHandleError::SubmitClosed)
     }
@@ -332,83 +406,6 @@ enum ServerEvent {
     Stop,
 }
 
-/// One runtime peer record combining endpoint identity, learned metadata, and
-/// any live outbound session state.
-///
-/// This is the server's single runtime record for one known peer address. It
-/// carries persisted metadata, the optional live session handle used for
-/// long-lived sync and relay traffic, and the sync bookkeeping that suppresses
-/// duplicate catch-up work.
-#[derive(Debug)]
-struct RuntimePeer {
-    endpoint: PeerEndpoint,
-    stored: StoredPeer,
-    session: Option<PeerSession>,
-    /// Last pushed tip hint this node already acted on for follow-up sync.
-    last_tip_sync_hint: Option<TipSummary>,
-    sync_state: PeerSyncState,
-}
-
-/// One active outbound peer session owned by the server runtime.
-///
-/// The underlying async peer task owns the TCP stream itself. The server keeps
-/// this higher-level session record so protocol code can reuse one live peer
-/// handle across sync and relay operations without reopening sockets.
-#[derive(Debug)]
-struct PeerSession {
-    handle: peer::PeerHandle,
-}
-
-/// Sync lifecycle for one runtime peer.
-///
-/// `Idle` means no catch-up work is currently active. `Syncing` suppresses
-/// overlapping hello- and tip-triggered sync walks against the same peer until
-/// the current attempt finishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerSyncState {
-    Idle,
-    Syncing,
-}
-
-impl RuntimePeer {
-    /// Returns the active outbound session for this peer, if connected.
-    fn session(&self) -> Option<&PeerSession> {
-        self.session.as_ref()
-    }
-
-    /// Attaches one newly connected outbound session to this peer.
-    fn attach_session(&mut self, session: PeerSession) {
-        self.session = Some(session);
-    }
-
-    /// Disconnects the active outbound session, if any.
-    fn disconnect(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.handle.shutdown();
-        }
-    }
-
-    /// Returns whether this peer is already serving one active sync walk.
-    fn sync_in_progress(&self) -> bool {
-        self.sync_state == PeerSyncState::Syncing
-    }
-
-    /// Marks this peer as actively serving one sync walk.
-    fn begin_sync(&mut self) {
-        self.sync_state = PeerSyncState::Syncing;
-    }
-
-    /// Marks this peer as idle again after one sync walk completes.
-    fn finish_sync(&mut self) {
-        self.sync_state = PeerSyncState::Idle;
-    }
-}
-
-/// One spawned async peer transport task.
-struct LivePeerTask {
-    worker: JoinHandle<()>,
-}
-
 /// Retry budget for best-effort outbound relay dialing.
 const RELAY_CONNECT_ATTEMPTS: usize = 3;
 /// Small pause between relay dial attempts so listeners finishing a prior
@@ -458,13 +455,33 @@ impl Server {
         }
     }
 
+    pub fn config(&self) -> &NodeConfig {
+        &self.config
+    }
+
+    pub fn state(&self) -> &NodeState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut NodeState {
+        &mut self.state
+    }
+
+    /// Returns a cloneable control handle for this running server.
+    pub fn control(&self) -> ServerControl {
+        self.control.clone()
+    }
+
     /// Starts the server and runs it until shutdown.
     ///
     /// - creates tokio runtime
     /// - binds socket listeners
     /// - starts mining
     /// - runs the server event loop
-    pub fn start(self, ready: Option<std::sync::mpsc::Sender<ServerHandle>>) -> io::Result<NodeState> {
+    pub fn start(
+        self,
+        ready: Option<std::sync::mpsc::Sender<ServerHandle>>,
+    ) -> io::Result<NodeState> {
         info!(listen_addr = self.config.listen_addr, "Server::start");
         let tokio_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -473,9 +490,18 @@ impl Server {
         tokio_runtime.block_on(async move { self.serve_inner(ready).await })
     }
 
-    /// Returns a cloneable control handle for this running server.
-    pub fn control(&self) -> ServerControl {
-        self.control.clone()
+    /// Disconnects this server from all currently cached outbound peers.
+    ///
+    /// This gives callers an explicit way to tear down long-lived peer
+    /// sessions without relying on server drop timing. The current testnet
+    /// harness uses it to make multi-node teardown deterministic.
+    pub fn disconnect(&mut self) {
+        if let Some(miner) = self.miner.take() {
+            let _ = miner.stop();
+        }
+        for runtime_peer in self.peers.values_mut() {
+            runtime_peer.disconnect();
+        }
     }
 
     /// Binds the peer listener and optional admin listener, then runs the
@@ -519,6 +545,7 @@ impl Server {
         let mut sync_tick = tokio::time::interval(CONTINUOUS_SYNC_INTERVAL);
         sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        debug!("start server loop");
         loop {
             if handle.is_stopped() {
                 break;
@@ -542,6 +569,7 @@ impl Server {
             }
             peers.retain(|_, peer| !peer.worker.is_finished());
         }
+        debug!("stop server loop");
 
         let _ = handle.command_tx.try_send(ServerEvent::Stop);
         peers.clear();
@@ -571,11 +599,6 @@ impl Server {
         self
     }
 
-    /// Dispatches one server event to the appropriate handler.
-    ///
-    /// The event loop stays intentionally small: it pulls one event from the
-    /// channel, routes it here, and lets the dedicated handler deal with peer
-    /// messages, admin requests, peer lifecycle, mining ticks, or shutdown.
     fn handle_event(&mut self, event: ServerEvent) -> bool {
         match event {
             ServerEvent::Bootstrap { reply } => {
@@ -636,23 +659,7 @@ impl Server {
         self.handle_peer_message(origin, message)
     }
 
-    pub fn config(&self) -> &NodeConfig {
-        &self.config
-    }
-
-    pub fn state(&self) -> &NodeState {
-        &self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut NodeState {
-        &mut self.state
-    }
-
     /// Handles one decoded wire message against the server's current node state.
-    ///
-    /// If the message mutates the live chain or mempool and SQLite persistence
-    /// is enabled, the updated `NodeState` is saved after the protocol action
-    /// succeeds.
     pub fn handle_message(
         &mut self,
         message: WireMessage,
@@ -660,11 +667,6 @@ impl Server {
         self.handle_peer_message(None, message)
     }
 
-    /// Dispatches one decoded peer message to the appropriate server handler.
-    ///
-    /// Each supported wire message has a dedicated handler so handshake,
-    /// queries, announcements, mining, relay, and sync behavior stay easy to
-    /// follow as the protocol grows.
     fn handle_peer_message(
         &mut self,
         origin: Option<&PeerAddr>,
@@ -774,7 +776,9 @@ impl Server {
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
             runtime_peer.begin_sync();
         }
-        let accepted_blocks = self.sync_to_advertised_tip(&peer, &summary).unwrap_or_default();
+        let accepted_blocks = self
+            .sync_to_advertised_tip(&peer, &summary)
+            .unwrap_or_default();
         if let Some(runtime_peer) = self.peers.get_mut(&peer.addr) {
             runtime_peer.finish_sync();
         }
@@ -1173,11 +1177,14 @@ impl Server {
         let total_fees = pending
             .iter()
             .try_fold(0_u64, |total, tx| {
-                self.state.active_utxos().transaction_fee(tx).and_then(|fee| {
-                    total
-                        .checked_add(fee)
-                        .ok_or(crate::state::ValidationError::InputValueOverflow)
-                })
+                self.state
+                    .active_utxos()
+                    .transaction_fee(tx)
+                    .and_then(|fee| {
+                        total
+                            .checked_add(fee)
+                            .ok_or(crate::state::ValidationError::InputValueOverflow)
+                    })
             })
             .ok()?;
         let miner_key = crate::crypto::parse_verifying_key(&request.miner_public_key)?;
@@ -1924,20 +1931,6 @@ impl Server {
         peers.sort_by(|left, right| left.addr.cmp(&right.addr));
         peers
     }
-
-    /// Disconnects this server from all currently cached outbound peers.
-    ///
-    /// This gives callers an explicit way to tear down long-lived peer
-    /// sessions without relying on server drop timing. The current testnet
-    /// harness uses it to make multi-node teardown deterministic.
-    pub fn disconnect(&mut self) {
-        if let Some(miner) = self.miner.take() {
-            let _ = miner.stop();
-        }
-        for runtime_peer in self.peers.values_mut() {
-            runtime_peer.disconnect();
-        }
-    }
 }
 
 /// Runs one async admin transport and forwards requests into the server event loop.
@@ -2178,27 +2171,27 @@ fn format_hash(hash: Option<BlockHash>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        admin::{AdminRequest, AdminResponse},
+        chain::ChainError,
+        crypto,
+        home::NodeConfig,
+        mining::MiningConfig,
+        net,
+        node_state::{NodeState, NodeStateError},
+        peer::relay_to_peer,
+        peers::{PeerSource, StoredPeer},
+        server::{PeerEndpoint, Server, ServerOptions},
+        sqlite_store::SqliteStore,
+        types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
+        wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
+    };
     use std::{
         fs, io,
         net::TcpListener,
         path::PathBuf,
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
-    };
-    use crate::{
-        admin::{AdminRequest, AdminResponse},
-        chain::ChainError,
-        crypto,
-        mining::MiningConfig,
-        net,
-        node_state::{NodeState, NodeStateError},
-        peer::relay_to_peer,
-        home::NodeConfig,
-        peers::{PeerSource, StoredPeer},
-        server::{PeerEndpoint, Server, ServerOptions},
-        sqlite_store::SqliteStore,
-        types::{Block, BlockHash, BlockHeader, OutPoint, Transaction, TxIn, TxOut},
-        wire::{HelloMessage, PROTOCOL_VERSION, TipSummary, WireMessage},
     };
 
     use super::{PeerAddr, current_unix_seconds, format_timestamp_string, peer_matches_origin};
@@ -2386,10 +2379,9 @@ mod tests {
         let remote_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let remote_addr = remote_listener.local_addr().unwrap();
         let mut server = Server::new(
-            server_options(server_config(Some("alpha")), state).with_peers(vec![PeerEndpoint::new(
-                remote_addr.to_string(),
-                Some("remote".to_string()),
-            )]),
+            server_options(server_config(Some("alpha")), state).with_peers(vec![
+                PeerEndpoint::new(remote_addr.to_string(), Some("remote".to_string())),
+            ]),
         );
         let _runtime = attach_runtime(&mut server);
 
@@ -2487,12 +2479,7 @@ mod tests {
     #[test]
     fn relay_new_best_tip_announces_tip_summary_to_configured_peer() {
         let miner = crypto::signing_key_from_bytes([73; 32]);
-        let genesis = mine_block(
-            BlockHash::default(),
-            0x207f_ffff,
-            &miner.verifying_key(),
-            0,
-        );
+        let genesis = mine_block(BlockHash::default(), 0x207f_ffff, &miner.verifying_key(), 0);
         let expected_tip = genesis.header.block_hash();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -2582,9 +2569,8 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         let sqlite_path = temp_sqlite_path();
-        let mut server = Server::new(
-            server_options(server_config(None), state).with_sqlite_path(&sqlite_path),
-        );
+        let mut server =
+            Server::new(server_options(server_config(None), state).with_sqlite_path(&sqlite_path));
 
         server
             .handle_message(WireMessage::AnnounceTx { transaction })
@@ -2720,9 +2706,8 @@ mod tests {
         let mut state = NodeState::new();
         state.accept_block(genesis).unwrap();
         state.submit_transaction(pending.clone()).unwrap();
-        let mut server = Server::new(
-            server_options(server_config(None), state).with_sqlite_path(&sqlite_path),
-        );
+        let mut server =
+            Server::new(server_options(server_config(None), state).with_sqlite_path(&sqlite_path));
         server.save_full_state().unwrap();
 
         server
@@ -2761,13 +2746,11 @@ mod tests {
                 0,
             ))
             .unwrap();
-        let mut server = Server::new(
-            server_options(server_config(None), state).with_peers(vec![
-                PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
-                PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
-                PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
-            ]),
-        );
+        let mut server = Server::new(server_options(server_config(None), state).with_peers(vec![
+            PeerEndpoint::new("127.0.0.1:9001", Some("alpha".to_string())),
+            PeerEndpoint::new("127.0.0.1:9002", Some("beta".to_string())),
+            PeerEndpoint::new("127.0.0.1:9003", Some("gamma".to_string())),
+        ]));
         server.peers.get_mut("127.0.0.1:9001").unwrap().stored = StoredPeer {
             addr: "127.0.0.1:9001".to_string(),
             node_name: Some("alpha".to_string()),
@@ -3153,7 +3136,10 @@ mod tests {
             .unwrap();
         });
 
-        let mut server = Server::new(server_options(server_config(Some("local")), NodeState::new()));
+        let mut server = Server::new(server_options(
+            server_config(Some("local")),
+            NodeState::new(),
+        ));
         let _runtime = attach_runtime(&mut server);
         let origin = PeerAddr {
             advertised_addr: Some(peer_addr),
@@ -3345,11 +3331,9 @@ mod tests {
         state.accept_block(genesis).unwrap();
         state.submit_transaction(transaction).unwrap();
 
-        let mut server = Server::new(
-            server_options(server_config(None), state).with_mining(
-                MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
-            ),
-        );
+        let mut server = Server::new(server_options(server_config(None), state).with_mining(
+            MiningConfig::new(miner.verifying_key()).with_interval(Duration::from_millis(1)),
+        ));
 
         let candidate = server
             .build_mining_candidate()

@@ -1,4 +1,4 @@
-//! Canonical on-disk layout for one local wobble node home.
+//! Wobble node home folder management.
 //!
 //! A node home groups the files a single node typically needs under one
 //! directory so CLI commands do not have to pass each path separately. The

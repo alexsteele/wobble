@@ -1,9 +1,7 @@
 //! Integrated local mining policy and cancellable mining worker.
 //!
 //! This module owns the mining-side runtime concerns: candidate solving,
-//! cancellation, and background worker lifecycle. The server still owns chain
-//! state, mempool policy, and candidate selection, then submits unsolved block
-//! candidates here for proof-of-work search.
+//! cancellation, and background worker lifecycle.
 
 use std::{
     sync::{
@@ -197,13 +195,13 @@ pub fn build_candidate(
     bits: u32,
     mut transactions: Vec<Transaction>,
 ) -> Candidate {
-    let mut full_transactions = Vec::with_capacity(transactions.len() + 1);
-    full_transactions.push(coinbase_transaction(
+    let mut txns = Vec::with_capacity(transactions.len() + 1);
+    txns.push(coinbase_transaction(
         reward,
         miner_verifying_key,
         uniqueness,
     ));
-    full_transactions.append(&mut transactions);
+    txns.append(&mut transactions);
 
     let mut block = Block {
         header: BlockHeader {
@@ -214,7 +212,7 @@ pub fn build_candidate(
             bits,
             nonce: 0,
         },
-        transactions: full_transactions,
+        transactions: txns,
     };
     block.header.merkle_root = block.merkle_root();
 
